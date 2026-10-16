@@ -83,7 +83,7 @@ pub fn list() -> Result<Vec<Job>> {
             out.push(job);
         }
     }
-    out.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+    out.sort_by_key(|j| std::cmp::Reverse(j.submitted_at));
     Ok(out)
 }
 
