@@ -15,6 +15,9 @@ pub fn run(cfg: &Config) -> Result<i32> {
         dead.len()
     };
     let dropped = history::trim(&paths::history_file(), cfg.history_keep)?;
-    println!("reaped {reaped} dead entries, trimmed {dropped} history records");
+    let jobs = crate::cmd::job::gc(cfg.jobs_keep_days)?;
+    println!(
+        "reaped {reaped} dead entries, trimmed {dropped} history records, removed {jobs} old jobs"
+    );
     Ok(0)
 }

@@ -44,3 +44,23 @@ pub fn lease_file(id: &str) -> PathBuf {
 pub fn history_file() -> PathBuf {
     state_dir().join("history.jsonl")
 }
+
+pub fn jobs_dir() -> PathBuf {
+    state_dir().join("jobs")
+}
+
+pub fn job_json(id: &str) -> PathBuf {
+    jobs_dir().join(format!("{id}.json"))
+}
+
+pub fn job_log(id: &str) -> PathBuf {
+    jobs_dir().join(format!("{id}.log"))
+}
+
+pub fn job_waiter(id: &str) -> PathBuf {
+    jobs_dir().join(format!("{id}.waiter"))
+}
+
+pub fn job_exit(id: &str) -> PathBuf {
+    jobs_dir().join(format!("{id}.exit"))
+}

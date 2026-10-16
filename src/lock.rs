@@ -88,6 +88,27 @@ pub fn lease_is_held(id: &str) -> bool {
     }
 }
 
+/// Take a *shared* lock on `path` (several holders allowed), held until drop.
+pub fn take_shared(path: &Path) -> Result<Lock> {
+    let file = open_lock_file(path)?;
+    file.lock_shared()?;
+    Ok(Lock { file })
+}
+
+/// True when at least one shared or exclusive holder exists for `path`.
+pub fn is_held(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+    }
+}
+
 /// Remove ledger entries whose lease is not held, and their lease files.
 /// Returns the ids removed. Caller holds the ledger lock.
 pub fn reap_dead(ledger: &mut Ledger) -> Vec<String> {

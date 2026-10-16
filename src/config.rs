@@ -29,6 +29,11 @@ pub struct Config {
     pub memory_reserve_mib: u64,
     /// Hold the next start while global CPU busy % is above this.
     pub cpu_threshold_percent: f64,
+    /// `gc` removes finished job files older than this.
+    pub jobs_keep_days: u64,
+    /// A job with no `wait`er is cancelled once this many seconds have
+    /// passed since submit (unless submitted with `--detach`).
+    pub jobs_orphan_grace_secs: u64,
     #[serde(rename = "pattern", skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<Pattern>,
 }
@@ -48,6 +53,8 @@ impl Default for Config {
             progress_interval_secs: 5,
             memory_reserve_mib: 2048,
             cpu_threshold_percent: 85.0,
+            jobs_keep_days: 7,
+            jobs_orphan_grace_secs: 30,
             patterns: Vec::new(),
         }
     }

@@ -1,4 +1,4 @@
 # Only the pure decision modules are gated; everything else is covered by
 # the end-to-end tests in tests/cli.rs, where mutation runs would mostly
 # measure timing and process plumbing.
-examine_globs = ["src/admit.rs", "src/weight.rs", "src/key.rs"]
+examine_globs = ["src/admit.rs", "src/weight.rs", "src/key.rs", "src/eta.rs"]

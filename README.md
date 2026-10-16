@@ -9,8 +9,11 @@ weight. No daemon, no process supervision, one JSON ledger per user.
 ```sh
 canirun exec -- npm test                 # waits for budget, then runs
 canirun exec --front -- npm run lint     # a human is waiting: jump the queue
-canirun status                           # who is running, who is waiting, why
+canirun status                           # who is running, who is waiting, why, and when
 canirun history                          # what each command measured, next weight
+
+id=$(canirun submit -- npm run test:e2e) # async: returns a job id and a rough ETA
+canirun wait "$id"                       # keeps the job alive, prints its log, mirrors its exit
 ```
 
 ## What & why
@@ -46,6 +49,13 @@ saturated.
   lets a human at the keyboard jump ahead.
 - **Nesting-safe.** A gated command that itself calls `canirun exec`
   inherits the outer lease instead of deadlocking.
+- **Async jobs that die with their waiter.** `submit` returns a job id at
+  once; `wait` collects the log and exit code later. A job nobody is
+  waiting on is cancelled after a grace period, so a crashed caller never
+  leaves a test suite burning CPU. `--detach` opts out.
+- **Rough ETAs.** From learned wall times and the current queue, every
+  waiting entry gets a "start in / done in" estimate on `submit`, in the
+  progress line, and in `status` / `jobs`.
 
 ## Install
 
@@ -119,6 +129,40 @@ webapp: npm run test:e2e
   10-16 20:12  wall   190.7s  cpu   640.1s  x3.4  rss   3.2 GiB  exit 0   w2
 ```
 
+### `canirun submit` / `wait` / `jobs` / `cancel`
+
+```
+canirun submit [--detach] [--weight N] [--front] [--key K] -- <command> [args...]
+canirun wait [--no-output] <job-id>...
+canirun jobs [--json]
+canirun cancel <job-id>...
+```
+
+`submit` writes a job descriptor, starts a detached runner (own session,
+stdin from `/dev/null`, stdout and stderr merged into the job log,
+environment and cwd inherited) and prints the job id on stdout, with a
+rough estimate on stderr:
+
+```
+$ id=$(canirun submit -- npm run test:e2e)
+canirun: job 3f9c… start in ~1:10, done in ~4:20
+```
+
+`wait` blocks until every named job has finished, prints a header and the
+log for each in the order given, and exits with the first non-zero code
+(`143` for a cancelled job). While `wait` runs it holds a shared lock on
+the job; **a job with no holder is cancelled once `jobs_orphan_grace_secs`
+(default 30) have passed since submit**, so the usual `submit` → `wait`
+pair keeps it alive and a caller that dies takes its jobs down with it.
+`--detach` keeps a job running regardless. `jobs` lists every job with
+its state (`queued` / `running` / `done N` / `orphaned N` / `lost`) and
+ETA; `cancel` sends SIGTERM to the runner, or marks a not-yet-started job
+cancelled.
+
+The runner is the same admission path as `exec`: weights, guards, history
+and liveness all apply. Job files live in `jobs/` under the state
+directory; `gc` removes those finished more than `jobs_keep_days` ago.
+
 ### `canirun config [--path]` and `canirun gc`
 
 `config` prints the effective configuration (defaults merged with the
@@ -138,6 +182,8 @@ history_keep = 200          # records kept per command key
 progress_interval_secs = 5
 memory_reserve_mib = 2048   # keep this much available before admitting
 cpu_threshold_percent = 85  # hold the next start while CPU is busier
+jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
+jobs_keep_days = 7          # `gc` removes finished job files older than this
 
 [[pattern]]                 # glob over the argv string, first match wins
 match = "*stryker*"
@@ -176,6 +222,11 @@ the reserve and CPU usage must be under the threshold. When nothing
 managed is running the live guards are skipped, so a machine kept busy by
 processes canirun does not manage cannot hold the queue forever.
 
+Estimates are a plain simulation of that queue against the budget using
+each entry's learned wall time (max of its last five usable runs; 60 s and
+a trailing `?` when unknown). The live guards are not modelled, so an
+estimate is a lower bound.
+
 Weights are learned per `(repository, argv)`. The repository is the main
 worktree (`git rev-parse --git-common-dir`), so every linked worktree of a
 project shares one history.
@@ -204,9 +255,12 @@ fi
 
 ### Agent / CI-runner scripts
 
-Prefix every unit with `canirun exec --`. A unit may now wait minutes
-before it starts, so run units in the background or under a monitor
-rather than inside a foreground step with a short hard timeout.
+Prefix every unit with `canirun exec --`, or `submit` the independent
+units and `wait` for them all in one call. A unit may wait minutes
+before it starts; with `exec` run it in the background or under a
+monitor rather than inside a foreground step with a short hard timeout.
+Keep the `wait` alive for as long as you care about the result: if your
+process dies, so do its jobs.
 
 ## Platform support
 
@@ -221,16 +275,16 @@ machines.
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
-./scripts/coverage-gate.sh      # 100% lines on admit / weight / key
-cargo mutants --file src/admit.rs --file src/weight.rs --file src/key.rs
+./scripts/coverage-gate.sh      # 100% lines on admit / weight / key / eta
+cargo mutants --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs
 ```
 
 On a Homebrew Rust toolchain (no `llvm-tools-preview`), point `cargo llvm-cov`
 at Homebrew's LLVM: `LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata
 LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov ./scripts/coverage-gate.sh`.
 
-The admission decision, weight derivation and command key are pure
-modules with 100% line coverage and a zero-survivor mutation gate in CI.
+The admission decision, weight derivation, command key and estimate are
+pure modules with 100% line coverage and a zero-survivor mutation gate in CI.
 `tests/cli.rs` drives the binary end-to-end with isolated XDG directories.
 
 ## License

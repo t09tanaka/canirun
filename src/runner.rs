@@ -99,6 +99,14 @@ pub fn run(argv: &[String], lease: &str) -> Result<Outcome> {
             Error::Spawn(format!("cannot run {prog:?}: {e}"))
         })?;
     let pid = child.id() as libc::pid_t;
+    // A signal delivered between handler installation and spawn is
+    // forwarded now rather than waiting for the next EINTR.
+    let early = take_pending();
+    if early != 0 {
+        unsafe {
+            libc::kill(pid, early);
+        }
+    }
 
     let mut status: libc::c_int = 0;
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };

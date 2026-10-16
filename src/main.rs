@@ -5,8 +5,10 @@ mod cmd;
 mod config;
 mod display;
 mod error;
+mod eta;
 mod gitctx;
 mod history;
+mod jobs;
 mod key;
 mod ledger;
 mod live;
@@ -73,6 +75,40 @@ enum Cmd {
     },
     /// Reap dead ledger entries and trim history
     Gc,
+    /// Start a job in the background and print its id
+    Submit {
+        /// Keep running even when nobody `wait`s on the job
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        weight: Option<u32>,
+        #[arg(long)]
+        front: bool,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Wait for jobs, print their logs, exit with the first failure
+    Wait {
+        /// Print only the result line per job, not the log
+        #[arg(long)]
+        no_output: bool,
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// List submitted jobs
+    Jobs {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop queued or running jobs
+    Cancel {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    #[command(hide = true, name = "__run-job")]
+    RunJob { id: String },
 }
 
 fn main() {
@@ -121,5 +157,25 @@ fn run(cli: Cli) -> error::Result<i32> {
         ),
         Cmd::Config { path } => cmd::config::run(&cfg, path),
         Cmd::Gc => cmd::gc::run(&cfg),
+        Cmd::Submit {
+            detach,
+            weight,
+            front,
+            key,
+            command,
+        } => cmd::job::submit(
+            &cfg,
+            cmd::exec::Opts {
+                weight,
+                front,
+                key,
+                argv: command,
+            },
+            detach,
+        ),
+        Cmd::Wait { no_output, ids } => cmd::job::wait(&ids, no_output),
+        Cmd::Jobs { json } => cmd::job::list(&cfg, json),
+        Cmd::Cancel { ids } => cmd::job::cancel(&ids),
+        Cmd::RunJob { id } => cmd::job::run_job(&cfg, &id),
     }
 }

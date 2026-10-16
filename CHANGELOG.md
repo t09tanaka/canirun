@@ -5,6 +5,27 @@ All notable changes to canirun are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.2.0] - 2026-10-16
+
+### Added
+
+- `canirun submit [--detach] [--weight N] [--front] [--key K] -- <command>`:
+  start a job in a detached runner and print its id. The runner follows
+  the same admission, measurement and liveness path as `exec`; its merged
+  log, descriptor and exit code live under `jobs/` in the state directory.
+- `canirun wait [--no-output] <id>...`: block until the jobs finish, print
+  each log in the order given, exit with the first non-zero code. `wait`
+  holds a shared lock per job; a job with no holder is cancelled by its
+  runner once `jobs_orphan_grace_secs` (default 30) have passed since
+  submit, unless submitted with `--detach`.
+- `canirun jobs [--json]` and `canirun cancel <id>...`.
+- Rough completion estimates from learned wall times and the current
+  queue: shown by `submit`, in the `exec` progress line, and in `status` and
+  `jobs`. Unknown commands count as 60 s and are marked with `?`.
+- `jobs_keep_days` (default 7): `gc` removes older finished job files.
+- A signal that arrives between the last queue check and admission, or
+  between handler installation and spawn, is no longer lost.
+
 ## [0.1.0] - 2026-10-16
 
 First release.

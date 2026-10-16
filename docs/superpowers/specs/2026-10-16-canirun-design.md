@@ -423,3 +423,120 @@ examples/          a tiny project with fake "lint"/"test" scripts
   than a leaked child pinning the ledger (builder-check question 2).
 - Coverage and mutation gates run as blocking CI jobs (question 3).
 - "Last 5" means last 5 usable records, filtered first (question 4).
+
+---
+
+# v0.2 addendum — asynchronous jobs (2026-10-16)
+
+- **Status:** Approved in chat, implementing.
+- **Scope:** `submit` / `wait` / `jobs` / `cancel`. A thin layer over the
+  v0.1 admission path; the ledger, weights, guards and liveness are
+  unchanged. `exec` stays the right tool for interactive callers.
+
+## Why
+
+An agent dispatching several CI units wants to throw them at the machine
+and collect results later, without one worker (or one foreground tool
+call with a hard timeout) pinned to each unit while it waits in the
+queue. `exec` already queues and runs; what it cannot do is outlive the
+caller or be collected in a batch.
+
+## Commands
+
+```
+canirun submit [--weight N] [--front] [--key K] -- <command> [args...]
+canirun wait [--no-output] <job-id>...
+canirun jobs [--json]
+canirun cancel <job-id>...
+```
+
+### `submit`
+
+Creates a job and returns immediately, printing the job id on stdout.
+
+1. `id` = a fresh lease id (the job id **is** the ledger entry id).
+2. Writes `jobs/<id>.json`: id, argv, cwd (the submitter's), weight
+   flags, `submitted_at`, `submitter_pid`.
+3. Spawns a detached **runner**: `canirun __run-job <id>` in its own
+   session (`setsid`), stdin from `/dev/null`, stdout and stderr both
+   appended to `jobs/<id>.log`, environment inherited from the
+   submitter, cwd = the job's cwd.
+4. Exits 0 without waiting.
+
+The runner performs exactly the v0.1 `exec` path (register, wait, run,
+measure, record history), then writes `jobs/<id>.exit` containing the
+shell-style exit code (128+N for a signal death) and `finished_at` into
+the job file. A runner that dies by signal while waiting or running
+writes the exit file before re-raising, so `wait` never hangs on a
+cancelled job.
+
+### `wait`
+
+Polls (500 ms) until every named job has an exit file. For each job, in
+the order given, prints a header line and the log (unless
+`--no-output`), then exits with the first non-zero exit code, or 0. A job
+whose runner has died without writing an exit file (no ledger entry, no
+lease held, no exit file for 2 polls) is reported as `lost` with exit
+code 2.
+
+### `jobs`
+
+Lists jobs from `jobs/*.json` newest first: id, state
+(`queued` / `running` / `done <code>` / `lost`), submitted and finished
+times, repo:argv. State is derived from the exit file and the ledger.
+
+### `cancel`
+
+For each id: if an exit file exists, nothing to do; otherwise send
+SIGTERM to the runner pid from the ledger entry (the runner forwards it
+to its child or, if still waiting, removes itself). If no ledger entry
+exists and no exit file, mark the job `lost`.
+
+### `gc`
+
+Also removes job files (`.json`, `.log`, `.exit`) finished more than
+`jobs_keep_days` (default 7) ago.
+
+## Jobs die with their waiter (user decision, 2026-10-16)
+
+A load-control tool must not leave work running after the party that
+wanted it is gone. `wait` therefore holds a shared `flock` on
+`jobs/<id>.waiter` for every job it waits on. The runner checks once a
+second: when `jobs_orphan_grace_secs` (default 30) have passed since
+submit and nobody holds the waiter lock, it marks the job `orphaned` and
+sends itself SIGTERM, which the wait-phase handler or the run-phase
+forwarding turns into exit 143 with the exit file written. The grace
+covers the gap between `submit` and the first `wait`. `submit --detach`
+opts out for genuinely fire-and-forget work.
+
+`cancel` on a job whose runner has not registered yet writes the exit
+file (143); the runner treats an existing exit file as a cancellation
+request on start and on every poll. `jobs` reports "queued" rather than
+"lost" for the first 5 s after submit, when the runner may still be
+starting.
+
+## Estimates (user request, 2026-10-16)
+
+Each ledger entry carries `expected_secs`, the max wall time over the
+command's last five usable runs (None when unknown). `eta::estimate` is
+a pure event simulation: running entries finish at
+`max(0, expected − elapsed)`, waiting entries are taken in admission
+order, the head reserves until it fits, and each waiting entry starts
+when the budget allows and finishes `expected` later. Unknown entries
+count as 60 s and mark the result `rough`, shown as a trailing `?`. Live
+guards are not modelled, so the estimate is a lower bound. It is printed
+by `submit` (stderr), in every `exec` progress line, and per entry in
+`status` and `jobs`.
+
+## Not in v0.2
+
+- No dependency between jobs, no priorities beyond `--front`.
+- No streaming of a running job's log by `wait`; use `tail -f jobs/<id>.log`.
+
+## Integration
+
+The local-CI skill's Phase 2 worker may `submit` the independent steps
+of its unit and `wait` for them in one call, instead of one background
+`exec` per step. Collapsing the N workers into a parent that submits
+everything is a larger skill redesign (the workers also interpret the
+workflow YAML and services) and is left for later.

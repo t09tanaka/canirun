@@ -19,6 +19,9 @@ pub struct Entry {
     pub front: bool,
     pub weight: u32,
     pub predicted_rss: u64,
+    /// Learned wall time, for estimates. None when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_secs: Option<f64>,
     pub repo: String,
     pub argv: String,
     pub key: String,
@@ -113,6 +116,7 @@ mod tests {
             front: false,
             weight: 1,
             predicted_rss: 0,
+            expected_secs: None,
             repo: String::new(),
             argv: "x".into(),
             key: "k".into(),

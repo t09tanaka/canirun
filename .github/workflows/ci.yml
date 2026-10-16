@@ -55,7 +55,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      - name: 100% line coverage on admit / weight / key
+      - name: 100% line coverage on admit / weight / key / eta
         run: ./scripts/coverage-gate.sh
 
   mutants:
@@ -66,5 +66,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-mutants
       - uses: Swatinem/rust-cache@v2
-      - name: zero survivors in admit / weight / key
-        run: cargo mutants --file src/admit.rs --file src/weight.rs --file src/key.rs --no-shuffle -- --bin canirun
+      - name: zero survivors in admit / weight / key / eta
+        run: cargo mutants --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs --no-shuffle -- --bin canirun

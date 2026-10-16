@@ -29,6 +29,12 @@ pub fn run(cfg: &Config, json: bool) -> Result<i32> {
         .collect();
     running.sort_by_key(|e| e.started_at);
     let order = admit::queue_order(&queue);
+    let timed = crate::cmd::exec::timed_queue(&ledger);
+    let eta_of = |id: &str| {
+        crate::eta::estimate(&timed, cfg.budget, id)
+            .map(|e| format!("  ({})", crate::cmd::exec::fmt_estimate(&e)))
+            .unwrap_or_default()
+    };
 
     println!("budget {used}/{} used", cfg.budget);
     if let Some(s) = live::snapshot() {
@@ -44,11 +50,12 @@ pub fn run(cfg: &Config, json: bool) -> Result<i32> {
         let since = e.started_at.unwrap_or(e.enqueued_at);
         let elapsed = (now - since).to_std().unwrap_or_default();
         println!(
-            "  {:>7}  w{:<2} {:>8}  {}",
+            "  {:>7}  w{:<2} {:>8}  {}{}",
             e.pid,
             e.weight,
             fmt_duration(elapsed),
-            truncate(&label(&e.repo, &e.argv), 70)
+            truncate(&label(&e.repo, &e.argv), 70),
+            eta_of(&e.id)
         );
     }
     println!();
@@ -59,12 +66,13 @@ pub fn run(cfg: &Config, json: bool) -> Result<i32> {
         };
         let waited = (now - e.enqueued_at).to_std().unwrap_or_default();
         println!(
-            "  {:>7}  w{:<2} {:>8}  {}{}",
+            "  {:>7}  w{:<2} {:>8}  {}{}{}",
             e.pid,
             e.weight,
             fmt_duration(waited),
             if e.front { "[front] " } else { "" },
-            truncate(&label(&e.repo, &e.argv), 70)
+            truncate(&label(&e.repo, &e.argv), 70),
+            eta_of(&e.id)
         );
     }
     Ok(0)
