@@ -191,6 +191,18 @@ mod tests {
     }
 
     #[test]
+    fn later_running_entry_still_occupies_budget_after_earlier_finishes() {
+        let items = [
+            t("r1", State::Running, 2, 1, 0.0, Some(5.0)),
+            t("r2", State::Running, 2, 2, 0.0, Some(20.0)),
+            t("w", State::Waiting, 3, 3, 0.0, Some(1.0)),
+        ];
+        // At t=5 only 2 of 4 are free; w (3) must wait for r2 at t=20.
+        let e = estimate(&items, 4, "w").unwrap();
+        assert_eq!((e.start_in, e.finish_in), (20.0, 21.0));
+    }
+
+    #[test]
     fn unknown_history_uses_default_and_marks_rough() {
         let items = [
             t("r", State::Running, 4, 1, 0.0, None),
