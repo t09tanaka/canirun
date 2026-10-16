@@ -76,10 +76,14 @@ pub fn estimate(items: &[Timed], budget: u32, target: &str) -> Option<Estimate> 
             rough = true;
         }
         let w = q.weight.min(budget).max(1);
-        // Advance time until the head fits.
-        loop {
+        // Advance time until the head fits. Each pass retires at least the
+        // earliest-finishing entry, so `len + 1` passes always suffice; a
+        // loop that needs more cannot make progress and yields None.
+        let mut fits = false;
+        for _ in 0..=running.len() {
             let used: u32 = running.iter().map(|(_, w, _)| *w).sum();
             if used + w <= budget {
+                fits = true;
                 break;
             }
             let (next, _, _) = running
@@ -87,13 +91,9 @@ pub fn estimate(items: &[Timed], budget: u32, target: &str) -> Option<Estimate> 
                 .cloned()
                 .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))?;
             now = now.max(next);
-            let before = running.len();
             running.retain(|(f, _, _)| *f > now);
-            if running.len() == before {
-                // No entry finished: the queue cannot make progress.
-                return None;
-            }
         }
+        fits.then_some(())?;
         let finish = now + dur(t);
         if q.id == target {
             return Some(Estimate {
