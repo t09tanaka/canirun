@@ -221,9 +221,13 @@ machines.
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
-cargo llvm-cov --fail-under-lines 100 -- admit:: weight:: key::   # pure modules
+./scripts/coverage-gate.sh      # 100% lines on admit / weight / key
 cargo mutants --file src/admit.rs --file src/weight.rs --file src/key.rs
 ```
+
+On a Homebrew Rust toolchain (no `llvm-tools-preview`), point `cargo llvm-cov`
+at Homebrew's LLVM: `LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata
+LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov ./scripts/coverage-gate.sh`.
 
 The admission decision, weight derivation and command key are pure
 modules with 100% line coverage and a zero-survivor mutation gate in CI.

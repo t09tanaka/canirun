@@ -213,8 +213,10 @@ The reason the head is waiting (`budget`, `memory`, `cpu`) is part of
 the admission result so `status` and the progress line can show it.
 
 Pure function signature:
-`admit(ledger_state, candidate, live: Option<LiveSnapshot>) -> Admitted | Wait(reason)`
-where `live` is `None` when the starvation rule applies.
+`admit(ledger_state, candidate, live: Option<LiveSnapshot>) -> Admitted | Wait(reason)`.
+The starvation rule is applied inside `admit` (so it is unit-tested); `live`
+is `None` only when the OS could not be read, and the guards are then
+skipped.
 
 Weight floor is 1. Weight ceiling is the budget.
 
