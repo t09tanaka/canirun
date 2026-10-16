@@ -35,7 +35,11 @@ The two outcomes that define success:
 - Every admitted command has a weight; the sum of running weights never
   exceeds the budget.
 - Weights are learned automatically from measured CPU usage of previous
-  runs of the same command in the same repository.
+  runs of the same command in the same repository; peak memory is learned
+  the same way.
+- Admission also looks at the machine as it is right now (available
+  memory, load average) so the ledger's budget is a plan, not the only
+  brake.
 - Waiting callers see progress (what is running, how long they have
   waited). A killed or interrupted caller — running *or* waiting —
   disappears from the ledger without any cleanup step.
@@ -50,9 +54,8 @@ The two outcomes that define success:
 
 - No daemon, no background process, no proxying.
 - No killing, pausing, renicing, or reprioritising running processes.
-- No memory-based admission. Memory is recorded, not enforced.
-- No dynamic adjustment from live CPU load. Admission uses declared or
-  learned weights only.
+- No reaction to live conditions *after* admission: once a command is
+  running it is never paused or stopped, however the machine looks.
 - No per-repository config file. One user-level config.
 - No cross-user or cross-machine coordination (same scope rule as
   portool: one OS user + `XDG_STATE_HOME`).
@@ -151,7 +154,8 @@ is accurate without a daemon.
 ### `canirun history`
 
 Shows recent runs for a key (or all keys): wall time, CPU time, derived
-parallelism, max RSS, exit code, and the weight that will be used next.
+parallelism, max RSS, exit code, and the weight and predicted memory
+that will be used next.
 
 ### `canirun config`
 
@@ -178,6 +182,35 @@ Pure function: `admit(ledger_state, candidate) -> Admitted | Wait`.
   ones. Throughput loss from this is accepted in v0.1.
 - Exception: a candidate whose weight exceeds the budget is clamped to
   the budget, so it runs alone eventually rather than never.
+
+### Live guards
+
+The head is admitted only if, in addition to the budget check, the
+machine looks able to take it *now*:
+
+- `available_memory ≥ predicted_rss + memory_reserve`, where
+  `predicted_rss` is the max `max_rss` over the last 5 usable history
+  records for the key (0 when unknown) and `memory_reserve` defaults to
+  2 GiB.
+- `load_avg_1min / logical_cpus ≤ load_threshold` (default 1.5).
+
+Both are read from the OS on every poll (the `sysinfo` crate; on macOS
+"available" = free + inactive pages). They are brakes, not the budget:
+the budget decides how much canirun *plans* to run, the guards delay the
+next start when something outside canirun (an IDE, a browser, a Docker
+VM) is already using the machine.
+
+**Starvation rule:** if no canirun-managed entry is currently `running`,
+the live guards are skipped and the head is admitted on the budget check
+alone. Otherwise a machine kept busy by processes canirun does not
+manage would hold the queue forever, violating the first anti-goal.
+
+The reason the head is waiting (`budget`, `memory`, `load`) is part of
+the admission result so `status` and the progress line can show it.
+
+Pure function signature:
+`admit(ledger_state, candidate, live: Option<LiveSnapshot>) -> Admitted | Wait(reason)`
+where `live` is `None` when the starvation rule applies.
 
 Weight floor is 1. Weight ceiling is the budget.
 
@@ -240,6 +273,8 @@ budget = 12               # default: logical CPU count
 default_weight = 2
 history_keep = 200        # records per key
 progress_interval_secs = 5
+memory_reserve_mib = 2048 # keep this much available before admitting
+load_threshold = 1.5      # load_avg_1min / cpus above this: hold
 
 [[pattern]]
 match = "*stryker*"       # glob over the argv string
@@ -293,7 +328,8 @@ shell therefore gates normally instead of bypassing.
 While waiting, once every `progress_interval_secs`, to stderr:
 
 ```
-canirun: waiting 0:42 — running 3 (10/12 used), ahead of you 2
+canirun: waiting 0:42 (budget) — running 3 (10/12 used), ahead of you 2
+canirun: waiting 1:07 (memory 1.1 GiB available, need 3.4 GiB) — running 2 (6/12 used)
 ```
 
 Nothing is printed when admitted immediately. Nothing is ever printed to
@@ -350,6 +386,8 @@ examples/          a tiny project with fake "lint"/"test" scripts
   budget completes; an inner call with a bogus `CANIRUN_LEASE` waits.
 - `tests/signals.rs`: SIGINT to `canirun exec` reaches the child; exit
   status mirrors the child's.
+- `admit` unit tests cover each live-guard reason and the starvation
+  rule with synthetic `LiveSnapshot`s (the OS is never read in tests).
 
 ## Left to the builder
 
@@ -363,7 +401,10 @@ examples/          a tiny project with fake "lint"/"test" scripts
 
 - Max of last 5 measurements, floor 1, ceiling = budget.
 - Default weight 2 when nothing is known.
-- Memory is recorded but never used for admission.
+- Memory and load are live brakes on the next start, never a reason to
+  touch a running process. Defaults: 2 GiB reserve, load/cpus ≤ 1.5.
+- Live guards are skipped when canirun has nothing running (starvation
+  rule).
 - Head-of-queue reservation (strict FIFO), accepting some idle CPU.
 - `min_weight` as the v0.1 answer to Docker-hosted load being invisible
   to rusage.
