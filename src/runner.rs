@@ -32,7 +32,10 @@ fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
 /// loop can remove its entry and exit.
 pub fn install_wait_handlers() {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        set_handler(sig, on_signal as libc::sighandler_t);
+        set_handler(
+            sig,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
 }
 
@@ -42,7 +45,10 @@ fn install_run_handlers() {
     set_handler(libc::SIGINT, libc::SIG_IGN);
     set_handler(libc::SIGQUIT, libc::SIG_IGN);
     for sig in [libc::SIGTERM, libc::SIGHUP] {
-        set_handler(sig, on_signal as libc::sighandler_t);
+        set_handler(
+            sig,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
 }
 

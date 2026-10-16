@@ -2,7 +2,7 @@
 name = "canirun"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Can I run? A local admission controller that gates heavy commands behind a shared CPU budget and learns their weight"
 license = "MIT"
 repository = "https://github.com/t09tanaka/canirun"
