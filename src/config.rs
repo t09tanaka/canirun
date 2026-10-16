@@ -1,0 +1,186 @@
+//! `config.toml` loading with defaults (spec "Configuration").
+
+use crate::error::{Error, Result};
+use crate::weight::PatternHint;
+use globset::{Glob, GlobMatcher};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Pattern {
+    /// Glob over the argv string.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_weight: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_weight: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Config {
+    pub budget: u32,
+    pub default_weight: u32,
+    pub history_keep: usize,
+    pub progress_interval_secs: u64,
+    pub memory_reserve_mib: u64,
+    /// Hold the next start while global CPU busy % is above this.
+    pub cpu_threshold_percent: f64,
+    #[serde(rename = "pattern", skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<Pattern>,
+}
+
+pub fn logical_cpus() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            budget: logical_cpus(),
+            default_weight: 2,
+            history_keep: 200,
+            progress_interval_secs: 5,
+            memory_reserve_mib: 2048,
+            cpu_threshold_percent: 85.0,
+            patterns: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Config> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => return Err(e.into()),
+        };
+        Config::parse(&text)
+    }
+
+    pub fn parse(text: &str) -> Result<Config> {
+        let cfg: Config = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.budget == 0 {
+            return Err(Error::Config("budget must be at least 1".into()));
+        }
+        if !(self.cpu_threshold_percent > 0.0 && self.cpu_threshold_percent <= 100.0) {
+            return Err(Error::Config(
+                "cpu_threshold_percent must be in (0, 100]".into(),
+            ));
+        }
+        for p in &self.patterns {
+            if p.weight.is_some() && (p.min_weight.is_some() || p.initial_weight.is_some()) {
+                return Err(Error::Config(format!(
+                    "pattern {:?}: weight is exclusive with min_weight/initial_weight",
+                    p.pattern
+                )));
+            }
+            Glob::new(&p.pattern)
+                .map_err(|e| Error::Config(format!("pattern {:?}: {e}", p.pattern)))?;
+        }
+        Ok(())
+    }
+
+    /// First matching pattern, top to bottom.
+    pub fn hint_for(&self, argv: &str) -> PatternHint {
+        for p in &self.patterns {
+            let m: GlobMatcher = match Glob::new(&p.pattern) {
+                Ok(g) => g.compile_matcher(),
+                Err(_) => continue,
+            };
+            if m.is_match(argv) {
+                return PatternHint {
+                    weight: p.weight,
+                    min_weight: p.min_weight,
+                    initial_weight: p.initial_weight,
+                };
+            }
+        }
+        PatternHint::default()
+    }
+
+    pub fn cpu_threshold(&self) -> f64 {
+        self.cpu_threshold_percent / 100.0
+    }
+
+    pub fn memory_reserve_bytes(&self) -> u64 {
+        self.memory_reserve_mib.saturating_mul(1024 * 1024)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_when_empty() {
+        let c = Config::parse("").unwrap();
+        assert_eq!(c.default_weight, 2);
+        assert_eq!(c.budget, logical_cpus());
+        assert!(c.patterns.is_empty());
+    }
+
+    #[test]
+    fn first_match_wins() {
+        let c = Config::parse(
+            r#"
+[[pattern]]
+match = "*stryker*"
+min_weight = 6
+[[pattern]]
+match = "*"
+weight = 1
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.hint_for("npx stryker run").min_weight, Some(6));
+        assert_eq!(c.hint_for("npx stryker run").weight, None);
+        assert_eq!(c.hint_for("npm run lint").weight, Some(1));
+    }
+
+    #[test]
+    fn glob_star_crosses_spaces_and_slashes() {
+        let c = Config::parse("[[pattern]]\nmatch = \"*test:e2e*\"\nmin_weight = 4\n").unwrap();
+        assert_eq!(
+            c.hint_for("npm run test:e2e -- --project a/b").min_weight,
+            Some(4)
+        );
+        assert_eq!(c.hint_for("npm run test:unit").min_weight, None);
+    }
+
+    #[test]
+    fn rejects_weight_with_min_weight() {
+        let e = Config::parse("[[pattern]]\nmatch = \"x\"\nweight = 1\nmin_weight = 2\n");
+        assert!(e.is_err());
+    }
+
+    #[test]
+    fn rejects_zero_budget_and_bad_threshold() {
+        assert!(Config::parse("budget = 0").is_err());
+        assert!(Config::parse("cpu_threshold_percent = 0").is_err());
+        assert!(Config::parse("cpu_threshold_percent = 101").is_err());
+        assert!(Config::parse("cpu_threshold_percent = 100").is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_glob() {
+        assert!(Config::parse("[[pattern]]\nmatch = \"[\"\n").is_err());
+    }
+
+    #[test]
+    fn missing_file_is_default() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config::load(&d.path().join("nope.toml")).unwrap();
+        assert_eq!(c, Config::default());
+    }
+}

@@ -192,7 +192,11 @@ machine looks able to take it *now*:
   `predicted_rss` is the max `max_rss` over the last 5 usable history
   records for the key (0 when unknown) and `memory_reserve` defaults to
   2 GiB.
-- `load_avg_1min / logical_cpus ≤ load_threshold` (default 1.5).
+- `cpu_busy ≤ cpu_threshold_percent` (default 85%), where `cpu_busy` is
+  the global CPU usage between two samples 300 ms apart, taken on this
+  poll. The 1-minute load average was tried first and rejected: on macOS
+  it runs far above the number of cores even with a third of the CPU
+  idle, so a per-core threshold would hold the queue almost always.
 
 Both are read from the OS on every poll (the `sysinfo` crate; on macOS
 "available" = free + inactive pages). They are brakes, not the budget:
@@ -205,7 +209,7 @@ the live guards are skipped and the head is admitted on the budget check
 alone. Otherwise a machine kept busy by processes canirun does not
 manage would hold the queue forever, violating the first anti-goal.
 
-The reason the head is waiting (`budget`, `memory`, `load`) is part of
+The reason the head is waiting (`budget`, `memory`, `cpu`) is part of
 the admission result so `status` and the progress line can show it.
 
 Pure function signature:
@@ -274,7 +278,7 @@ default_weight = 2
 history_keep = 200        # records per key
 progress_interval_secs = 5
 memory_reserve_mib = 2048 # keep this much available before admitting
-load_threshold = 1.5      # load_avg_1min / cpus above this: hold
+cpu_threshold_percent = 85 # global CPU busy above this: hold
 
 [[pattern]]
 match = "*stryker*"       # glob over the argv string
@@ -401,8 +405,8 @@ examples/          a tiny project with fake "lint"/"test" scripts
 
 - Max of last 5 measurements, floor 1, ceiling = budget.
 - Default weight 2 when nothing is known.
-- Memory and load are live brakes on the next start, never a reason to
-  touch a running process. Defaults: 2 GiB reserve, load/cpus ≤ 1.5.
+- Memory and CPU usage are live brakes on the next start, never a reason
+  to touch a running process. Defaults: 2 GiB reserve, CPU ≤ 85% busy.
 - Live guards are skipped when canirun has nothing running (starvation
   rule).
 - Head-of-queue reservation (strict FIFO), accepting some idle CPU.

@@ -1,0 +1,6 @@
+budget = 6
+progress_interval_secs = 1
+
+[[pattern]]
+match = "*lint*"
+weight = 1
