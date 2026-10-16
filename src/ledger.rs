@@ -23,6 +23,8 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_secs: Option<f64>,
     pub repo: String,
+    #[serde(default)]
+    pub subdir: String,
     pub argv: String,
     pub key: String,
     pub seq: u64,
@@ -118,6 +120,7 @@ mod tests {
             predicted_rss: 0,
             expected_secs: None,
             repo: String::new(),
+            subdir: String::new(),
             argv: "x".into(),
             key: "k".into(),
             seq,

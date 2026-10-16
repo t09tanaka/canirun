@@ -54,7 +54,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<i32> {
             e.pid,
             e.weight,
             fmt_duration(elapsed),
-            truncate(&label(&e.repo, &e.argv), 70),
+            truncate(&label(&e.repo, &e.subdir, &e.argv), 70),
             eta_of(&e.id)
         );
     }
@@ -71,21 +71,17 @@ pub fn run(cfg: &Config, json: bool) -> Result<i32> {
             e.weight,
             fmt_duration(waited),
             if e.front { "[front] " } else { "" },
-            truncate(&label(&e.repo, &e.argv), 70),
+            truncate(&label(&e.repo, &e.subdir, &e.argv), 70),
             eta_of(&e.id)
         );
     }
     Ok(0)
 }
 
-pub fn label(repo: &str, argv: &str) -> String {
+pub fn label(repo: &str, subdir: &str, argv: &str) -> String {
     if repo.is_empty() {
         argv.to_string()
     } else {
-        let name = std::path::Path::new(repo)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| repo.to_string());
-        format!("{name}: {argv}")
+        format!("{}: {argv}", crate::key::project_label(repo, subdir))
     }
 }

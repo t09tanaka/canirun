@@ -29,6 +29,8 @@ pub struct Config {
     pub memory_reserve_mib: u64,
     /// Hold the next start while global CPU busy % is above this.
     pub cpu_threshold_percent: f64,
+    /// After waiting this long the CPU guard stops holding the head.
+    pub cpu_guard_max_wait_secs: u64,
     /// `gc` removes finished job files older than this.
     pub jobs_keep_days: u64,
     /// A job with no `wait`er is cancelled once this many seconds have
@@ -53,6 +55,7 @@ impl Default for Config {
             progress_interval_secs: 5,
             memory_reserve_mib: 2048,
             cpu_threshold_percent: 85.0,
+            cpu_guard_max_wait_secs: 120,
             jobs_keep_days: 7,
             jobs_orphan_grace_secs: 30,
             patterns: Vec::new(),

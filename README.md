@@ -33,13 +33,17 @@ saturated.
 - **Learned weights.** Every run is measured (`wait4` rusage: CPU time,
   wall time, peak RSS). A command's weight is the ceiling of the highest
   CPU-parallelism it showed in its last five usable runs, scoped to the
-  repository it ran in. Nothing to hand-tune; `config.toml` holds only
-  hints and exceptions.
+  repository and subdirectory it ran in. Runs that started on a saturated
+  machine are marked `contended` and ignored while calmer runs exist,
+  because contention makes parallelism read low. Nothing to hand-tune;
+  `config.toml` holds only hints and exceptions.
 - **Live brakes.** Before the head of the queue starts, canirun also
   checks the machine as it is right now: available memory must cover the
   command's learned peak RSS plus a reserve, and global CPU usage must be
   under a threshold. These delay the *next* start; a running command is
-  never paused or killed.
+  never paused or killed. `--front` entries skip the CPU brake, and any
+  head gives up on it after `cpu_guard_max_wait_secs`, so load that does
+  not go through canirun cannot hold the queue indefinitely.
 - **Crash-safe queue.** Each waiting or running entry holds an `flock` on
   its own lease file. A Ctrl-C'd, SIGKILLed, or crashed `canirun` — waiting
   or running — vanishes from the ledger on the next poll. No cleanup step,
@@ -182,6 +186,7 @@ history_keep = 200          # records kept per command key
 progress_interval_secs = 5
 memory_reserve_mib = 2048   # keep this much available before admitting
 cpu_threshold_percent = 85  # hold the next start while CPU is busier
+cpu_guard_max_wait_secs = 120 # ...but never for longer than this
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
 
@@ -227,9 +232,11 @@ each entry's learned wall time (max of its last five usable runs; 60 s and
 a trailing `?` when unknown). The live guards are not modelled, so an
 estimate is a lower bound.
 
-Weights are learned per `(repository, argv)`. The repository is the main
-worktree (`git rev-parse --git-common-dir`), so every linked worktree of a
-project shares one history.
+Weights are learned per `(repository, subdirectory, argv)`. The
+repository is the main worktree (`git rev-parse --git-common-dir`), so
+every linked worktree of a project shares one history; the subdirectory
+(`git rev-parse --show-prefix`) keeps `api/` and `client/` of one monorepo
+apart.
 
 ### Known blind spot
 
@@ -252,6 +259,13 @@ else
   npm test
 fi
 ```
+
+### What not to wrap
+
+Only commands that burn CPU for tens of seconds or more: test suites,
+builds, mutation testing, integration and e2e runs. Do not wrap `sleep`,
+`git`, dependency installs, formatters, or one-second checks: each wrapped
+command takes a slot (default weight 2) and queues behind heavier work.
 
 ### Agent / CI-runner scripts
 

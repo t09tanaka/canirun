@@ -4,6 +4,20 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// `cwd` relative to the worktree root ("" at the root, "api/" below it),
+/// or "" outside git. Lets subprojects of one repository learn separately.
+pub fn subdir(cwd: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .unwrap_or_default()
+}
+
 pub fn main_worktree(cwd: &Path) -> Option<String> {
     let out = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])

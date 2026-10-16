@@ -276,6 +276,11 @@ pub fn list(cfg: &Config, json: bool) -> Result<i32> {
             state.label()
         };
         let repo = crate::gitctx::main_worktree(&j.cwd).unwrap_or_default();
+        let subdir = if repo.is_empty() {
+            String::new()
+        } else {
+            crate::gitctx::subdir(&j.cwd)
+        };
         let eta = match state {
             JobState::Queued | JobState::Running => crate::eta::estimate(&timed, cfg.budget, &j.id)
                 .map(|e| format!("  ({})", exec::fmt_estimate(&e)))
@@ -287,7 +292,10 @@ pub fn list(cfg: &Config, json: bool) -> Result<i32> {
             j.id,
             state_label,
             j.submitted_at.with_timezone(&Local).format("%m-%d %H:%M"),
-            truncate(&label(&repo, &crate::key::argv_string(&j.argv)), 70)
+            truncate(
+                &label(&repo, &subdir, &crate::key::argv_string(&j.argv)),
+                70
+            )
         );
     }
     Ok(0)

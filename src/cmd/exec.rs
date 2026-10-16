@@ -78,9 +78,14 @@ pub struct Plan {
 pub fn plan(cfg: &Config, opts: &Opts) -> Result<Plan> {
     let cwd = std::env::current_dir()?;
     let repo = gitctx::main_worktree(&cwd);
+    let subdir = if repo.is_some() {
+        gitctx::subdir(&cwd)
+    } else {
+        String::new()
+    };
     let key = match &opts.key {
-        Some(k) => make_override_key(repo.as_deref(), k, &opts.argv),
-        None => make_key(repo.as_deref(), &opts.argv),
+        Some(k) => make_override_key(repo.as_deref(), &subdir, k, &opts.argv),
+        None => make_key(repo.as_deref(), &subdir, &opts.argv),
     };
     let recs = history::for_key(&paths::history_file(), &key.hash)?;
     let records: Vec<Measurement> = recs.iter().map(Record::measurement).collect();
@@ -153,6 +158,7 @@ pub fn run_gated(
         budget: cfg.budget,
         memory_reserve: cfg.memory_reserve_bytes(),
         cpu_threshold: cfg.cpu_threshold(),
+        cpu_guard_max_wait_secs: cfg.cpu_guard_max_wait_secs as f64,
     };
 
     // Register as waiting. The lease is taken before the ledger entry so
@@ -173,6 +179,7 @@ pub fn run_gated(
             predicted_rss,
             expected_secs,
             repo: key.repo.clone(),
+            subdir: key.subdir.clone(),
             argv: key.argv.clone(),
             key: key.hash.clone(),
             seq,
@@ -208,7 +215,14 @@ pub fn run_gated(
             let queue = ledger.queue();
             let est = eta::estimate(&timed_queue(&ledger), cfg.budget, id);
             (
-                admit::admit(&queue, id, predicted_rss, limits, None),
+                admit::admit(
+                    &queue,
+                    id,
+                    predicted_rss,
+                    enqueued.elapsed().as_secs_f64(),
+                    limits,
+                    None,
+                ),
                 queue,
                 est,
             )
@@ -227,7 +241,14 @@ pub fn run_gated(
                 let mut ledger = Ledger::load(&paths::ledger_file())?;
                 lock::reap_dead(&mut ledger);
                 let queue = ledger.queue();
-                let decision = admit::admit(&queue, id, predicted_rss, limits, snapshot);
+                let decision = admit::admit(
+                    &queue,
+                    id,
+                    predicted_rss,
+                    enqueued.elapsed().as_secs_f64(),
+                    limits,
+                    snapshot,
+                );
                 if decision == Decision::Admitted {
                     if let Some(e) = ledger.find_mut(id) {
                         e.state = State::Running;
@@ -276,6 +297,11 @@ pub fn run_gated(
         before_exit(128 + sig);
         runner::reraise(sig);
     }
+    // One sample right before the start: a run that begins on a saturated
+    // machine is recorded as contended so its parallelism is not learned.
+    let contended = live::snapshot()
+        .map(|l| l.cpu_busy > limits.cpu_threshold)
+        .unwrap_or(false);
     let started_at = Utc::now();
     let out = runner::run(&opts.argv, id);
     remove_entry(id);
@@ -285,6 +311,7 @@ pub fn run_gated(
         &Record {
             key: key.hash,
             repo: key.repo,
+            subdir: key.subdir,
             argv: key.argv,
             started_at,
             wall_secs: out.wall_secs,
@@ -292,6 +319,7 @@ pub fn run_gated(
             max_rss_bytes: out.max_rss_bytes,
             exit_code: out.exit.code(),
             weight_used: w,
+            contended,
         },
     );
     Ok(out.exit)

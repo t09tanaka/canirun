@@ -12,6 +12,8 @@ use std::path::Path;
 pub struct Record {
     pub key: String,
     pub repo: String,
+    #[serde(default)]
+    pub subdir: String,
     pub argv: String,
     pub started_at: DateTime<Utc>,
     pub wall_secs: f64,
@@ -19,6 +21,9 @@ pub struct Record {
     pub max_rss_bytes: u64,
     pub exit_code: i32,
     pub weight_used: u32,
+    /// CPU was above the threshold when the run started.
+    #[serde(default)]
+    pub contended: bool,
 }
 
 impl Record {
@@ -27,6 +32,7 @@ impl Record {
             wall_secs: self.wall_secs,
             cpu_secs: self.cpu_secs,
             max_rss_bytes: self.max_rss_bytes,
+            contended: self.contended,
         }
     }
 }
@@ -110,6 +116,7 @@ mod tests {
         Record {
             key: key.into(),
             repo: String::new(),
+            subdir: String::new(),
             argv: "x".into(),
             started_at: Utc::now(),
             wall_secs: wall,
@@ -117,6 +124,7 @@ mod tests {
             max_rss_bytes: 1,
             exit_code: 0,
             weight_used: 1,
+            contended: false,
         }
     }
 

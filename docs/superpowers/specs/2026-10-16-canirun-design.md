@@ -540,3 +540,34 @@ of its unit and `wait` for them in one call, instead of one background
 `exec` per step. Collapsing the N workers into a parent that submits
 everything is a larger skill redesign (the workers also interpret the
 workflow YAML and services) and is left for later.
+
+
+---
+
+# v0.2.1 addendum — first-day feedback (2026-10-16)
+
+Another session reported, after a day of mixed use (most load still not
+going through canirun):
+
+1. **Unmanaged load starved managed `--front` entries.** The budget was
+   2/12 used, CPU 100% from processes outside canirun, and a human's
+   pre-push waited over a minute on the CPU guard. Decision: `--front`
+   skips the CPU guard (memory guard stays), and every head gives up on
+   the CPU guard after `cpu_guard_max_wait_secs` (default 120). Both are
+   pure-function inputs (`waited_secs`, `front`) covered by unit tests.
+2. **Weights learned under contention read low** (a 6-worker mutation run
+   measured x1.8). Decision: one CPU sample right before the start marks
+   the record `contended` when busy > threshold; `usable_window` drops
+   contended records whenever a calm one exists, before taking the last
+   five. Config `min_weight` remains the floor for Docker-hosted load.
+3. Hooks outside canirun: addressed by the six pre-push PRs.
+4. Light commands wrapped (`sleep`, `npm ci`, `git commit`): README and
+   the user's global instructions now list what not to wrap; no tool
+   change.
+5. Records with 0 CPU over 2–4 s were the rollout agents' sleeping `npm`
+   shims, not a measurement gap.
+
+A further finding from the rollout: `api/`, `client/` and `admin/` of one
+monorepo shared a key because the key ignored cwd. Keys now include the
+subdirectory relative to the worktree root; root-level keys hash as
+before so existing history carries over.

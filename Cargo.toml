@@ -1,6 +1,6 @@
 [package]
 name = "canirun"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.89"
 description = "Can I run? A local admission controller that gates heavy commands behind a shared CPU budget and learns their weight"

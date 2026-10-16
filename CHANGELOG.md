@@ -5,6 +5,29 @@ All notable changes to canirun are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.2.1] - 2026-10-16
+
+Feedback from the first day of use on a machine where most load did not go
+through canirun yet.
+
+### Changed
+
+- **`--front` entries skip the CPU guard** (the memory guard still applies).
+  A human waiting on a hook must not be held by load canirun does not
+  manage.
+- **The CPU guard gives up after `cpu_guard_max_wait_secs`** (default 120):
+  once the head has waited that long it is admitted on the budget and
+  memory checks alone.
+- **Runs that start on a saturated machine are recorded as `contended`**
+  (one CPU sample right before the start) and are left out of weight and
+  memory learning whenever a calm run exists. Under contention
+  `cpu / wall` under-reports parallelism, which would admit too much.
+  `history` marks such runs.
+- **Keys include the subdirectory within the repository**
+  (`git rev-parse --show-prefix`), so `api/` and `client/` of one monorepo
+  learn separately. Root-level keys hash exactly as before, so their
+  history carries over. `status` / `jobs` / `history` show `repo/subdir`.
+
 ## [0.2.0] - 2026-10-16
 
 ### Added

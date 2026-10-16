@@ -38,6 +38,8 @@ pub struct Limits {
     pub memory_reserve: u64,
     /// Hold the next start while `cpu_busy` is above this (0.0..=1.0).
     pub cpu_threshold: f64,
+    /// After waiting this long, the CPU guard no longer holds the head.
+    pub cpu_guard_max_wait_secs: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,13 +91,18 @@ pub fn used_budget(entries: &[QueueEntry]) -> u32 {
 /// Decide whether the waiting entry `me` may start now.
 ///
 /// `predicted_rss` is the memory the candidate is expected to need (0 when
-/// unknown). `live` may be `None` when the caller could not read the OS; the
-/// guards are then skipped. The starvation rule (skip guards when nothing
-/// managed is running) is applied here so it is covered by unit tests.
+/// unknown). `waited_secs` is how long the candidate has been queued. `live`
+/// may be `None` when the caller could not read the OS; the guards are then
+/// skipped. The starvation rule (skip guards when nothing managed is
+/// running) is applied here so it is covered by unit tests. The CPU guard
+/// is skipped for `--front` entries (a human is waiting, and load canirun
+/// does not manage must not hold them) and once `cpu_guard_max_wait_secs`
+/// has elapsed; the memory guard always applies.
 pub fn admit(
     entries: &[QueueEntry],
     me: &str,
     predicted_rss: u64,
+    waited_secs: f64,
     limits: Limits,
     live: Option<LiveSnapshot>,
 ) -> Decision {
@@ -131,7 +138,8 @@ pub fn admit(
             need,
         });
     }
-    if live.cpu_busy > limits.cpu_threshold {
+    let cpu_guard_applies = !candidate.front && waited_secs < limits.cpu_guard_max_wait_secs;
+    if cpu_guard_applies && live.cpu_busy > limits.cpu_threshold {
         return Decision::Wait(Reason::Cpu {
             busy: live.cpu_busy,
             threshold: limits.cpu_threshold,
@@ -157,6 +165,7 @@ mod tests {
         budget: 12,
         memory_reserve: 2 << 30,
         cpu_threshold: 0.85,
+        cpu_guard_max_wait_secs: 120.0,
     };
     fn calm() -> LiveSnapshot {
         LiveSnapshot {
@@ -168,14 +177,17 @@ mod tests {
     #[test]
     fn empty_queue_admits_head() {
         let q = [e("a", State::Waiting, false, 4, 1)];
-        assert_eq!(admit(&q, "a", 0, LIMITS, Some(calm())), Decision::Admitted);
+        assert_eq!(
+            admit(&q, "a", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
     }
 
     #[test]
     fn unknown_id_waits() {
         let q = [e("a", State::Waiting, false, 4, 1)];
         assert_eq!(
-            admit(&q, "zz", 0, LIMITS, None),
+            admit(&q, "zz", 0, 0.0, LIMITS, None),
             Decision::Wait(Reason::NotHead { ahead: usize::MAX })
         );
     }
@@ -186,9 +198,9 @@ mod tests {
             e("b", State::Waiting, false, 1, 2),
             e("a", State::Waiting, false, 1, 1),
         ];
-        assert_eq!(admit(&q, "a", 0, LIMITS, None), Decision::Admitted);
+        assert_eq!(admit(&q, "a", 0, 0.0, LIMITS, None), Decision::Admitted);
         assert_eq!(
-            admit(&q, "b", 0, LIMITS, None),
+            admit(&q, "b", 0, 0.0, LIMITS, None),
             Decision::Wait(Reason::NotHead { ahead: 1 })
         );
     }
@@ -202,9 +214,9 @@ mod tests {
         ];
         let ids: Vec<&str> = queue_order(&q).iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["f1", "f2", "a"]);
-        assert_eq!(admit(&q, "f1", 0, LIMITS, None), Decision::Admitted);
+        assert_eq!(admit(&q, "f1", 0, 0.0, LIMITS, None), Decision::Admitted);
         assert_eq!(
-            admit(&q, "a", 0, LIMITS, None),
+            admit(&q, "a", 0, 0.0, LIMITS, None),
             Decision::Wait(Reason::NotHead { ahead: 2 })
         );
     }
@@ -217,7 +229,7 @@ mod tests {
             e("light", State::Waiting, false, 1, 3),
         ];
         assert_eq!(
-            admit(&q, "heavy", 0, LIMITS, Some(calm())),
+            admit(&q, "heavy", 0, 0.0, LIMITS, Some(calm())),
             Decision::Wait(Reason::Budget {
                 used: 10,
                 budget: 12
@@ -225,7 +237,7 @@ mod tests {
         );
         // light would fit, but it is not the head.
         assert_eq!(
-            admit(&q, "light", 0, LIMITS, Some(calm())),
+            admit(&q, "light", 0, 0.0, LIMITS, Some(calm())),
             Decision::Wait(Reason::NotHead { ahead: 1 })
         );
     }
@@ -236,19 +248,25 @@ mod tests {
             e("r", State::Running, false, 8, 1),
             e("w", State::Waiting, false, 4, 2),
         ];
-        assert_eq!(admit(&q, "w", 0, LIMITS, Some(calm())), Decision::Admitted);
+        assert_eq!(
+            admit(&q, "w", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
     }
 
     #[test]
     fn oversized_weight_is_clamped_to_budget() {
         let q = [e("w", State::Waiting, false, 99, 1)];
-        assert_eq!(admit(&q, "w", 0, LIMITS, Some(calm())), Decision::Admitted);
+        assert_eq!(
+            admit(&q, "w", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
         let q = [
             e("r", State::Running, false, 1, 1),
             e("w", State::Waiting, false, 99, 2),
         ];
         assert_eq!(
-            admit(&q, "w", 0, LIMITS, Some(calm())),
+            admit(&q, "w", 0, 0.0, LIMITS, Some(calm())),
             Decision::Wait(Reason::Budget {
                 used: 1,
                 budget: 12
@@ -263,7 +281,7 @@ mod tests {
             e("w", State::Waiting, false, 0, 2),
         ];
         assert_eq!(
-            admit(&q, "w", 0, LIMITS, None),
+            admit(&q, "w", 0, 0.0, LIMITS, None),
             Decision::Wait(Reason::Budget {
                 used: 12,
                 budget: 12
@@ -282,7 +300,7 @@ mod tests {
             ..calm()
         };
         assert_eq!(
-            admit(&q, "w", 3 << 30, LIMITS, Some(live)),
+            admit(&q, "w", 3 << 30, 0.0, LIMITS, Some(live)),
             Decision::Wait(Reason::Memory {
                 available: 1 << 30,
                 need: 5 << 30
@@ -301,14 +319,17 @@ mod tests {
             ..calm()
         };
         assert!(matches!(
-            admit(&q, "w", 0, LIMITS, Some(live)),
+            admit(&q, "w", 0, 0.0, LIMITS, Some(live)),
             Decision::Wait(Reason::Memory { .. })
         ));
         let live = LiveSnapshot {
             available_memory: 2 << 30,
             ..calm()
         };
-        assert_eq!(admit(&q, "w", 0, LIMITS, Some(live)), Decision::Admitted);
+        assert_eq!(
+            admit(&q, "w", 0, 0.0, LIMITS, Some(live)),
+            Decision::Admitted
+        );
     }
 
     #[test]
@@ -322,7 +343,7 @@ mod tests {
             ..calm()
         };
         assert_eq!(
-            admit(&q, "w", 0, LIMITS, Some(live)),
+            admit(&q, "w", 0, 0.0, LIMITS, Some(live)),
             Decision::Wait(Reason::Cpu {
                 busy: 0.9,
                 threshold: 0.85
@@ -332,7 +353,54 @@ mod tests {
             cpu_busy: 0.85,
             ..calm()
         };
-        assert_eq!(admit(&q, "w", 0, LIMITS, Some(live)), Decision::Admitted);
+        assert_eq!(
+            admit(&q, "w", 0, 0.0, LIMITS, Some(live)),
+            Decision::Admitted
+        );
+    }
+
+    #[test]
+    fn front_skips_cpu_guard_but_not_memory_guard() {
+        let q = [
+            e("r", State::Running, false, 2, 1),
+            e("f", State::Waiting, true, 2, 2),
+        ];
+        let busy = LiveSnapshot {
+            cpu_busy: 1.0,
+            ..calm()
+        };
+        assert_eq!(
+            admit(&q, "f", 0, 0.0, LIMITS, Some(busy)),
+            Decision::Admitted
+        );
+        let low_mem = LiveSnapshot {
+            available_memory: 0,
+            cpu_busy: 1.0,
+        };
+        assert!(matches!(
+            admit(&q, "f", 0, 0.0, LIMITS, Some(low_mem)),
+            Decision::Wait(Reason::Memory { .. })
+        ));
+    }
+
+    #[test]
+    fn cpu_guard_gives_up_after_max_wait() {
+        let q = [
+            e("r", State::Running, false, 2, 1),
+            e("w", State::Waiting, false, 2, 2),
+        ];
+        let busy = LiveSnapshot {
+            cpu_busy: 1.0,
+            ..calm()
+        };
+        assert!(matches!(
+            admit(&q, "w", 0, 119.9, LIMITS, Some(busy)),
+            Decision::Wait(Reason::Cpu { .. })
+        ));
+        assert_eq!(
+            admit(&q, "w", 0, 120.0, LIMITS, Some(busy)),
+            Decision::Admitted
+        );
     }
 
     #[test]
@@ -343,7 +411,7 @@ mod tests {
             cpu_busy: 1.0,
         };
         assert_eq!(
-            admit(&q, "w", 8 << 30, LIMITS, Some(live)),
+            admit(&q, "w", 8 << 30, 0.0, LIMITS, Some(live)),
             Decision::Admitted
         );
     }
@@ -354,7 +422,10 @@ mod tests {
             e("r", State::Running, false, 2, 1),
             e("w", State::Waiting, false, 2, 2),
         ];
-        assert_eq!(admit(&q, "w", 8 << 30, LIMITS, None), Decision::Admitted);
+        assert_eq!(
+            admit(&q, "w", 8 << 30, 0.0, LIMITS, None),
+            Decision::Admitted
+        );
     }
 
     #[test]
@@ -368,7 +439,7 @@ mod tests {
             ..calm()
         };
         assert!(matches!(
-            admit(&q, "w", 0, LIMITS, Some(live)),
+            admit(&q, "w", 0, 0.0, LIMITS, Some(live)),
             Decision::Wait(Reason::Budget { .. })
         ));
     }

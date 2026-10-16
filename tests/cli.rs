@@ -467,6 +467,55 @@ fn worktrees_share_a_key() {
 }
 
 #[test]
+fn subprojects_of_one_repo_learn_separately() {
+    let env = TestEnv::new();
+    let repo = env.dir.path().join("mono");
+    fs::create_dir_all(repo.join("api")).unwrap();
+    fs::create_dir_all(repo.join("client")).unwrap();
+    let git = |args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    env.cmd()
+        .current_dir(repo.join("api"))
+        .args(["exec", "--", "true"])
+        .output()
+        .unwrap();
+    env.cmd()
+        .current_dir(repo.join("client"))
+        .args(["exec", "--", "true"])
+        .output()
+        .unwrap();
+    env.cmd()
+        .current_dir(&repo)
+        .args(["exec", "--", "true"])
+        .output()
+        .unwrap();
+    let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
+    let recs: Vec<serde_json::Value> = hist
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(recs.len(), 3);
+    assert_ne!(recs[0]["key"], recs[1]["key"]);
+    assert_ne!(recs[1]["key"], recs[2]["key"]);
+    assert_eq!(recs[0]["subdir"], "api");
+    assert_eq!(recs[2]["subdir"], "");
+    let out = env
+        .cmd()
+        .current_dir(repo.join("api"))
+        .args(["history"])
+        .output()
+        .unwrap();
+    assert!(stdout(&out).contains("mono/api: true"), "{}", stdout(&out));
+}
+
+#[test]
 fn config_and_gc_commands() {
     let env = TestEnv::new().with_config("budget = 3\nhistory_keep = 1\n");
     let out = env.run(&["config"]);

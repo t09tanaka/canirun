@@ -6,6 +6,9 @@ pub struct Measurement {
     pub wall_secs: f64,
     pub cpu_secs: f64,
     pub max_rss_bytes: u64,
+    /// The machine was already saturated when the run started, so
+    /// `cpu_secs / wall_secs` under-reports the command's parallelism.
+    pub contended: bool,
 }
 
 /// The part of a matched config pattern that influences the weight.
@@ -35,16 +38,20 @@ pub enum Source {
 }
 
 /// The most recent `WINDOW` usable records, newest last. `records` must be
-/// ordered oldest first.
+/// ordered oldest first. Runs measured on a saturated machine are left out
+/// whenever at least one calm run exists, because their parallelism reads
+/// low and would admit too much.
 pub fn usable_window(records: &[Measurement]) -> Vec<Measurement> {
-    let mut usable: Vec<Measurement> = records
+    let usable: Vec<Measurement> = records
         .iter()
         .copied()
         .filter(|m| m.wall_secs >= MIN_USABLE_WALL_SECS)
         .collect();
-    let drop = usable.len().saturating_sub(WINDOW);
-    usable.drain(..drop);
-    usable
+    let calm: Vec<Measurement> = usable.iter().copied().filter(|m| !m.contended).collect();
+    let mut chosen = if calm.is_empty() { usable } else { calm };
+    let drop = chosen.len().saturating_sub(WINDOW);
+    chosen.drain(..drop);
+    chosen
 }
 
 /// Learned parallelism: ceil of the max cpu/wall over the window, or None
@@ -103,6 +110,13 @@ mod tests {
             wall_secs: wall,
             cpu_secs: cpu,
             max_rss_bytes: rss,
+            contended: false,
+        }
+    }
+    fn c(wall: f64, cpu: f64, rss: u64) -> Measurement {
+        Measurement {
+            contended: true,
+            ..m(wall, cpu, rss)
         }
     }
     const NONE: PatternHint = PatternHint {
@@ -126,6 +140,32 @@ mod tests {
         assert_eq!(w.len(), 5);
         assert_eq!(w[0].cpu_secs, 3.0);
         assert_eq!(w[4].cpu_secs, 7.0);
+    }
+
+    #[test]
+    fn contended_runs_are_ignored_when_a_calm_run_exists() {
+        // Six parallel workers on a saturated machine look like x1.8.
+        let r = [m(10.0, 60.0, 5), c(20.0, 36.0, 9), c(20.0, 38.0, 9)];
+        assert_eq!(usable_window(&r), vec![m(10.0, 60.0, 5)]);
+        assert_eq!(learned_weight(&r), Some(6));
+        assert_eq!(predicted_rss(&r), 5);
+    }
+
+    #[test]
+    fn contended_runs_are_used_when_nothing_else_exists() {
+        let r = [c(20.0, 36.0, 9), c(0.5, 1.0, 1)];
+        assert_eq!(usable_window(&r), vec![c(20.0, 36.0, 9)]);
+        assert_eq!(learned_weight(&r), Some(2));
+    }
+
+    #[test]
+    fn window_is_taken_after_dropping_contended() {
+        let mut r: Vec<Measurement> = (1..=6).map(|i| m(2.0, i as f64, i)).collect();
+        r.push(c(2.0, 100.0, 100));
+        let w = usable_window(&r);
+        assert_eq!(w.len(), 5);
+        assert_eq!(w[0].cpu_secs, 2.0);
+        assert_eq!(w[4].cpu_secs, 6.0);
     }
 
     #[test]

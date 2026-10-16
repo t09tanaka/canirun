@@ -20,9 +20,14 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
     let filter_hash = if opts.key.is_some() || !opts.argv.is_empty() {
         let cwd = std::env::current_dir()?;
         let repo = gitctx::main_worktree(&cwd);
+        let subdir = if repo.is_some() {
+            gitctx::subdir(&cwd)
+        } else {
+            String::new()
+        };
         Some(match &opts.key {
-            Some(k) => make_override_key(repo.as_deref(), k, &opts.argv).hash,
-            None => make_key(repo.as_deref(), &opts.argv).hash,
+            Some(k) => make_override_key(repo.as_deref(), &subdir, k, &opts.argv).hash,
+            None => make_key(repo.as_deref(), &subdir, &opts.argv).hash,
         })
     } else {
         None
@@ -51,7 +56,7 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
             weight::derive_weight(None, hint, &ms, cfg.default_weight, cfg.budget);
         println!(
             "{}\n  next: weight {next_w} ({source:?}), memory {}",
-            truncate(&label(&last.repo, &last.argv), 90),
+            truncate(&label(&last.repo, &last.subdir, &last.argv), 90),
             fmt_bytes(weight::predicted_rss(&ms))
         );
         let skip = recs.len().saturating_sub(opts.limit);
@@ -62,7 +67,7 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
                 0.0
             };
             println!(
-                "  {}  wall {:>7.1}s  cpu {:>7.1}s  x{:<4.1} rss {:>9}  exit {:<3} w{}",
+                "  {}  wall {:>7.1}s  cpu {:>7.1}s  x{:<4.1} rss {:>9}  exit {:<3} w{}{}",
                 r.started_at
                     .with_timezone(&chrono::Local)
                     .format("%m-%d %H:%M"),
@@ -71,7 +76,8 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
                 par,
                 fmt_bytes(r.max_rss_bytes),
                 r.exit_code,
-                r.weight_used
+                r.weight_used,
+                if r.contended { "  (contended)" } else { "" }
             );
         }
     }
