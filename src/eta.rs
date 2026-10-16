@@ -87,7 +87,12 @@ pub fn estimate(items: &[Timed], budget: u32, target: &str) -> Option<Estimate> 
                 .cloned()
                 .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))?;
             now = now.max(next);
+            let before = running.len();
             running.retain(|(f, _, _)| *f > now);
+            if running.len() == before {
+                // No entry finished: the queue cannot make progress.
+                return None;
+            }
         }
         let finish = now + dur(t);
         if q.id == target {
