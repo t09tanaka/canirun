@@ -7,6 +7,22 @@ the minor version).
 
 ## [Unreleased]
 
+### Added
+
+- **A hint for a command passed as one quoted argument.** When
+  `canirun exec -- "npm run x"` (or `submit`) fails because no program
+  named `npm run x` exists, the error suggests `-- npm run x`, or
+  `sh -c '...'` for shell syntax.
+
+### Changed
+
+- **Fewer progress lines when stderr is not a terminal.** A waiting line
+  is printed only when the wait reason (queue / budget / memory / cpu) or
+  the queue position changes, and otherwise every
+  `progress_interval_secs_non_tty` (new, default 60). On a terminal the
+  `progress_interval_secs` cadence is unchanged. Long waits under an agent
+  no longer fill its tool output with identical lines.
+
 ### Fixed
 
 - **Back-to-back `submit`s keep their order.** `submit` returned before

@@ -100,6 +100,15 @@ canirun: waiting 1:07 (memory 1.1 GiB available, need 3.4 GiB) — running 2 (6/
 canirun: waiting 0:12 (cpu 93% busy, threshold 85%) — running 2 (6/12 used)
 ```
 
+When stderr is not a terminal (a log file, an agent's tool output), a line
+is printed only when the reason or the queue position changes, plus one
+every `progress_interval_secs_non_tty` (default 60) as a heartbeat, so a
+long wait does not fill the output with identical lines.
+
+If the program is not found and the command after `--` is a single
+argument containing spaces (`-- "npm run x"`), canirun adds a hint to pass
+the words separately (`-- npm run x`) or use `sh -c '...'`.
+
 Nothing is written to stdout by canirun itself.
 
 ### `canirun status`
@@ -185,7 +194,8 @@ Absent file means all defaults.
 budget = 12                 # default: logical CPU count
 default_weight = 2          # used when nothing is known about a command
 history_keep = 200          # records kept per command key
-progress_interval_secs = 5
+progress_interval_secs = 5  # between progress lines on a terminal
+progress_interval_secs_non_tty = 60 # heartbeat when stderr is not a terminal
 memory_reserve_mib = 2048   # keep this much available before admitting
 cpu_threshold_percent = 85  # hold the next start while CPU is busier
 cpu_guard_max_wait_secs = 120 # ...but never for longer than this

@@ -96,7 +96,7 @@ pub fn run(argv: &[String], lease: &str) -> Result<Outcome> {
         .spawn()
         .map_err(|e| {
             restore_defaults();
-            Error::Spawn(format!("cannot run {prog:?}: {e}"))
+            Error::Spawn(format!("cannot run {prog:?}: {e}{}", spawn_hint(argv, &e)))
         })?;
     let pid = child.id() as libc::pid_t;
     // A signal delivered between handler installation and spawn is
@@ -148,6 +148,22 @@ pub fn run(argv: &[String], lease: &str) -> Result<Outcome> {
     })
 }
 
+/// `canirun exec -- "npm run x"` looks for a program named `npm run x`.
+/// When that is the likely mistake, say how to write it instead.
+fn spawn_hint(argv: &[String], e: &std::io::Error) -> String {
+    match argv {
+        [one] if e.kind() == std::io::ErrorKind::NotFound && one.contains(char::is_whitespace) => {
+            format!(
+                "\ncanirun: hint: the command after `--` is one quoted argument; \
+                 pass it as separate words: `-- {0}`, not `-- \"{0}\"` \
+                 (for shell syntax, `-- sh -c '...'`)",
+                one.trim()
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 fn tv(t: libc::timeval) -> f64 {
     t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0
 }
@@ -169,4 +185,26 @@ pub fn reraise(sig: i32) -> ! {
         libc::raise(sig);
     }
     std::process::exit(128 + sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error as IoError, ErrorKind};
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn hint_only_for_one_spaced_argument_not_found() {
+        let nf = IoError::from(ErrorKind::NotFound);
+        let h = spawn_hint(&argv(&["npm run x"]), &nf);
+        assert!(h.contains("`-- npm run x`"), "{h}");
+        assert!(h.contains("sh -c"), "{h}");
+        assert_eq!(spawn_hint(&argv(&["npm"]), &nf), "");
+        assert_eq!(spawn_hint(&argv(&["npm run", "x"]), &nf), "");
+        let denied = IoError::from(ErrorKind::PermissionDenied);
+        assert_eq!(spawn_hint(&argv(&["npm run x"]), &denied), "");
+    }
 }
