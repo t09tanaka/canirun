@@ -5,6 +5,18 @@ All notable changes to canirun are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+### Fixed
+
+- **Back-to-back `submit`s keep their order.** `submit` returned before
+  its detached runner had joined the queue, so a second `submit` could
+  start first, and its estimate (and `jobs`) ignored the job just
+  submitted. `submit` now returns once the runner is in the queue
+  (typically under 0.1 s) and computes the estimate from the real queue.
+  If the runner has not joined within 5 s, `submit` prints a warning and
+  returns the id anyway.
+
 ## [0.2.1] - 2026-10-16
 
 Feedback from the first day of use on a machine where most load did not go

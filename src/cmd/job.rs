@@ -12,6 +12,7 @@ use chrono::{Local, Utc};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn submit(cfg: &Config, opts: Opts, detach: bool) -> Result<i32> {
     if opts.argv.is_empty() {
@@ -33,33 +34,34 @@ pub fn submit(cfg: &Config, opts: Opts, detach: bool) -> Result<i32> {
         finished_at: None,
     };
     jobs::save(&job)?;
-    // Estimate before the runner registers: simulate with a synthetic
-    // waiting entry appended to the current queue.
-    let opts = Opts {
-        weight: job.weight,
-        front: job.front,
-        key: job.key.clone(),
-        argv: job.argv.clone(),
-    };
-    let estimate = match (exec::plan(cfg, &opts), load_ledger_reaped()) {
-        (Ok(plan), Ok(ledger)) => {
-            let mut items = exec::timed_queue(&ledger);
-            items.push(crate::eta::Timed {
-                entry: crate::admit::QueueEntry {
-                    id: job.id.clone(),
-                    state: State::Waiting,
-                    front: job.front,
-                    weight: plan.weight,
-                    seq: ledger.next_seq,
-                },
-                elapsed_secs: 0.0,
-                expected_secs: plan.expected_secs,
-            });
-            crate::eta::estimate(&items, cfg.budget, &job.id)
+    let mut runner = jobs::spawn_runner(&job)?;
+    // Return only once the runner has a ledger entry, so the next submit
+    // (or `jobs`) sees this job in the queue: back-to-back submits keep
+    // their order and their estimates count each other.
+    let deadline = Instant::now() + Duration::from_secs(STARTING_GRACE_SECS as u64);
+    let ledger = loop {
+        let ledger = load_ledger_reaped()?;
+        let gone = jobs::read_exit(&job.id).is_some() || matches!(runner.try_wait(), Ok(Some(_)));
+        if ledger.find(&job.id).is_some() || gone || Instant::now() >= deadline {
+            break ledger;
         }
-        _ => None,
+        thread::sleep(REGISTER_POLL);
     };
-    jobs::spawn_runner(&job)?;
+    let registered = ledger.find(&job.id).is_some();
+    let estimate = registered
+        .then(|| crate::eta::estimate(&exec::timed_queue(&ledger), cfg.budget, &job.id))
+        .flatten();
+    if !registered && jobs::read_exit(&job.id).is_none() {
+        // The runner exists and may still start, so the id is printed and
+        // the submit succeeds; but `state_of` stops treating a missing
+        // entry as "starting" after the same grace, hence the warning.
+        eprintln!(
+            "canirun: warning: job {} has not joined the queue within \
+             {STARTING_GRACE_SECS}s; a later submit may start before it, \
+             and `wait` may report it as lost",
+            job.id
+        );
+    }
     println!("{}", job.id);
     if let Some(e) = estimate {
         eprintln!("canirun: job {} {}", job.id, exec::fmt_estimate(&e));
@@ -115,6 +117,9 @@ fn spawn_orphan_watchdog(id: String, submitted_at: chrono::DateTime<Utc>, grace_
         }
     });
 }
+
+/// How often `submit` checks whether its runner has registered.
+const REGISTER_POLL: Duration = Duration::from_millis(10);
 
 /// Seconds after submit during which "no ledger entry yet" means the
 /// runner is still starting, not lost.

@@ -280,3 +280,85 @@ fn waiter_keeps_the_job_alive_and_detach_opts_out() {
     let log = fs::read_to_string(env.state().join(format!("jobs/{b}.log"))).unwrap();
     assert_eq!(log, "detached\n");
 }
+
+/// A `git` on PATH whose first call from a job runner sleeps `secs` (the
+/// runner calls git to derive the key before it registers), and the PATH
+/// to use it.
+fn slow_first_git(env: &TestEnv, secs: u32) -> String {
+    let bin = env.dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = env.dir.path().join("git-slowed");
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\n\
+             if ps -o args= -p $PPID | grep -q __run-job && [ ! -e {m} ]; then\n\
+             touch {m}; sleep {secs}; fi\nexit 128\n",
+            m = marker.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&git).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&git, perms).unwrap();
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn submit_with_path(env: &TestEnv, path: &str, script: &str) -> Output {
+    env.cmd()
+        .env("PATH", path)
+        .args(["submit", "--", "sh", "-c", script])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn back_to_back_submits_start_in_submit_order() {
+    let env = TestEnv::new("budget = 1\n");
+    // The first runner is 2 s slow to register; the second submit must
+    // still queue behind it.
+    let path = slow_first_git(&env, 2);
+    let order = env.dir.path().join("order");
+    let ids: Vec<String> = (1..=2)
+        .map(|n| {
+            let out = submit_with_path(&env, &path, &format!("echo {n} >> {}", order.display()));
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        })
+        .collect();
+    assert!(env
+        .run(&["wait", "--no-output", &ids[0], &ids[1]])
+        .status
+        .success());
+    assert_eq!(fs::read_to_string(&order).unwrap(), "1\n2\n");
+}
+
+#[test]
+fn submit_warns_when_the_runner_is_slow_to_register() {
+    let env = TestEnv::new("budget = 4\n");
+    // The runner's first `git` call hangs for 7 s; submit gives up after
+    // 5 s with a warning.
+    let path = slow_first_git(&env, 7);
+    let t = Instant::now();
+    let out = submit_with_path(&env, &path, "exit 3");
+    let took = t.elapsed();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("has not joined the queue within 5s"), "{err}");
+    assert!(
+        took >= Duration::from_secs(5) && took < Duration::from_secs(7),
+        "{took:?}"
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(id.len(), 32);
+    // Past the starting grace, a job with no ledger entry is reported
+    // lost, as the warning says.
+    let out = env.run(&["wait", &id]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("lost"));
+}
