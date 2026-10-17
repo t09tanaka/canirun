@@ -144,20 +144,25 @@ fn exec_missing_program_fails_cleanly() {
 #[test]
 fn exec_records_history_and_learns_weight() {
     let env = TestEnv::new().with_config("budget = 8\n");
-    // Burn roughly 2 cores for ~1.2s.
-    let script = "for i in 1 2; do (end=$(($(date +%s)+2)); while [ $(date +%s) -lt $end ]; do :; done) & done; wait";
+    // Two processes in parallel, each burning 0.6 s of its own CPU time.
+    // Bounded by CPU time rather than the clock, so a loaded machine only
+    // stretches the wall time and cpu_secs stays >= 1.2.
+    let script = "for i in 1 2; do perl -e '1 while (times)[0] < 0.6' & done; wait";
     let out = env.run(&["exec", "--", "sh", "-c", script]);
     assert!(out.status.success());
     let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
     let rec: serde_json::Value = serde_json::from_str(hist.lines().next().unwrap()).unwrap();
-    assert!(rec["wall_secs"].as_f64().unwrap() >= 1.0);
-    assert!(rec["cpu_secs"].as_f64().unwrap() > 0.5, "{rec}");
+    // One process cannot burn 0.6 s of CPU in less wall time.
+    assert!(rec["wall_secs"].as_f64().unwrap() >= 0.5, "{rec}");
+    assert!(rec["cpu_secs"].as_f64().unwrap() >= 1.0, "{rec}");
     assert_eq!(rec["exit_code"], 0);
     assert_eq!(rec["weight_used"], 2, "default weight on first run");
 
     let out = env.run(&["history", "--", "sh", "-c", script]);
     let text = stdout(&out);
     assert!(text.contains("next: weight"), "{text}");
+    // On a loaded machine the run is recorded as contended; with no calm
+    // run to prefer, it is still what the weight is learned from.
     assert!(text.contains("(Learned)"), "{text}");
 }
 
