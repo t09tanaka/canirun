@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
 ### Added
 
 - **A hint for a command passed as one quoted argument.** When
