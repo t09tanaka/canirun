@@ -10,6 +10,7 @@ use crate::runner::{self, Exit};
 use crate::weight::{self, Measurement};
 use crate::{gitctx, live, lock, paths};
 use chrono::Utc;
+use std::io::IsTerminal;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -190,8 +191,12 @@ pub fn run_gated(
     }
 
     let enqueued = Instant::now();
-    let mut last_progress: Option<Instant> = None;
-    let progress_every = Duration::from_secs(cfg.progress_interval_secs.max(1));
+    let mut last_progress: Option<(Instant, Topic)> = None;
+    let cadence = Cadence {
+        tty: std::io::stderr().is_terminal(),
+        every: Duration::from_secs(cfg.progress_interval_secs.max(1)),
+        every_non_tty: Duration::from_secs(cfg.progress_interval_secs_non_tty.max(1)),
+    };
     loop {
         let sig = runner::take_pending();
         if sig != 0 {
@@ -260,10 +265,9 @@ pub fn run_gated(
             }
         };
         if let Decision::Wait(reason) = &decision {
-            let due = last_progress
-                .map(|t| t.elapsed() >= progress_every)
-                .unwrap_or(true);
-            if due {
+            let topic = topic_of(reason);
+            let last = last_progress.map(|(t, last)| (t.elapsed(), last));
+            if cadence.due(last, topic) {
                 let running = queue.iter().filter(|e| e.state == State::Running).count();
                 let used = admit::used_budget(&queue);
                 eprintln!(
@@ -279,7 +283,7 @@ pub fn run_gated(
                     est.map(|e| format!(", {}", fmt_estimate(&e)))
                         .unwrap_or_default()
                 );
-                last_progress = Some(Instant::now());
+                last_progress = Some((Instant::now(), topic));
             }
         }
         if decision == Decision::Admitted {
@@ -342,6 +346,50 @@ fn remove_entry(id: &str) {
     let _ = std::fs::remove_file(paths::lease_file(id));
 }
 
+/// What a progress line is about: the kind of wait and, behind others in
+/// the queue, how many are ahead. Amounts (memory, cpu %) are left out so
+/// a fluctuating sample does not count as a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Topic {
+    Queue(usize),
+    Budget,
+    Memory,
+    Cpu,
+}
+
+fn topic_of(reason: &Reason) -> Topic {
+    match reason {
+        Reason::NotHead { ahead } => Topic::Queue(*ahead),
+        Reason::Budget { .. } => Topic::Budget,
+        Reason::Memory { .. } => Topic::Memory,
+        Reason::Cpu { .. } => Topic::Cpu,
+    }
+}
+
+/// When to print the next progress line. On a terminal: every `every`.
+/// Otherwise (a log file, an agent's tool result) the lines pile up, so
+/// only when the topic changes, and every `every_non_tty` as a heartbeat.
+#[derive(Debug, Clone, Copy)]
+struct Cadence {
+    tty: bool,
+    every: Duration,
+    every_non_tty: Duration,
+}
+
+impl Cadence {
+    /// `last` is the time since the previous line and what it was about.
+    fn due(&self, last: Option<(Duration, Topic)>, now: Topic) -> bool {
+        let Some((since, topic)) = last else {
+            return true;
+        };
+        if self.tty {
+            since >= self.every
+        } else {
+            topic != now || since >= self.every_non_tty
+        }
+    }
+}
+
 pub fn describe(reason: &Reason) -> String {
     match reason {
         Reason::NotHead { .. } => "queue".into(),
@@ -356,5 +404,65 @@ pub fn describe(reason: &Reason) -> String {
             busy * 100.0,
             threshold * 100.0
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TTY: Cadence = Cadence {
+        tty: true,
+        every: Duration::from_secs(5),
+        every_non_tty: Duration::from_secs(60),
+    };
+    const PIPE: Cadence = Cadence { tty: false, ..TTY };
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn first_line_is_always_due() {
+        assert!(TTY.due(None, Topic::Budget));
+        assert!(PIPE.due(None, Topic::Budget));
+    }
+
+    #[test]
+    fn terminal_prints_on_the_interval_only() {
+        assert!(!TTY.due(Some((secs(4), Topic::Budget)), Topic::Cpu));
+        assert!(TTY.due(Some((secs(5), Topic::Budget)), Topic::Budget));
+    }
+
+    #[test]
+    fn non_terminal_prints_on_change_or_heartbeat() {
+        assert!(!PIPE.due(Some((secs(5), Topic::Budget)), Topic::Budget));
+        assert!(!PIPE.due(Some((secs(59), Topic::Queue(2))), Topic::Queue(2)));
+        assert!(PIPE.due(Some((secs(1), Topic::Budget)), Topic::Memory));
+        assert!(PIPE.due(Some((secs(1), Topic::Queue(2))), Topic::Queue(1)));
+        assert!(PIPE.due(Some((secs(60), Topic::Budget)), Topic::Budget));
+    }
+
+    #[test]
+    fn topic_ignores_amounts() {
+        let a = Reason::Cpu {
+            busy: 0.9,
+            threshold: 0.85,
+        };
+        let b = Reason::Cpu {
+            busy: 0.95,
+            threshold: 0.85,
+        };
+        assert_eq!(topic_of(&a), topic_of(&b));
+        let m = |available| Reason::Memory {
+            available,
+            need: 10,
+        };
+        assert_eq!(topic_of(&m(1)), topic_of(&m(2)));
+        assert_eq!(
+            topic_of(&Reason::Budget { used: 1, budget: 2 }),
+            Topic::Budget
+        );
+        assert_eq!(topic_of(&Reason::NotHead { ahead: 3 }), Topic::Queue(3));
     }
 }

@@ -389,6 +389,67 @@ fn progress_is_printed_while_waiting() {
     assert!(hog.wait().unwrap().success());
 }
 
+/// Wait behind a 3 s hog with stderr piped (not a terminal) and return
+/// the number of progress lines.
+fn progress_lines_behind_hog(config: &str) -> usize {
+    let env = TestEnv::new().with_config(config);
+    let dir = env.marker_dir();
+    let mut hog = env.spawn_exec(&[], &marker_script(&dir, "hog", "3"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().iter().any(|e| e["state"] == "running")
+    }));
+    let waiter = env.spawn_exec(&[], "true");
+    let out = waiter.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(hog.wait().unwrap().success());
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with("canirun: waiting"))
+        .count()
+}
+
+#[test]
+fn non_tty_progress_prints_only_on_change() {
+    // The reason stays "budget" for ~3 s: one line, not one per second.
+    let n = progress_lines_behind_hog("budget = 1\nprogress_interval_secs = 1\n");
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn non_tty_progress_interval_is_configurable() {
+    let n = progress_lines_behind_hog(
+        "budget = 1\nprogress_interval_secs = 60\nprogress_interval_secs_non_tty = 1\n",
+    );
+    assert!(n >= 2, "{n}");
+}
+
+#[test]
+fn exec_one_quoted_argument_gets_a_hint() {
+    let env = TestEnv::new();
+    let out = env.run(&["exec", "--", "no-such-program-xyz run x"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("hint:"), "{err}");
+    assert!(err.contains("`-- no-such-program-xyz run x`"), "{err}");
+    // A plain missing program gets no hint.
+    let out = env.run(&["exec", "--", "no-such-program-xyz"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("hint:"));
+}
+
+#[test]
+fn submit_one_quoted_argument_gets_a_hint() {
+    let env = TestEnv::new();
+    let out = env.run(&["submit", "--", "no-such-program-xyz run x"]);
+    assert!(out.status.success());
+    let id = stdout(&out).trim().to_string();
+    let out = env.run(&["wait", &id]);
+    assert_eq!(out.status.code(), Some(2));
+    let log = stdout(&out);
+    assert!(log.contains("hint:"), "{log}");
+    assert!(log.contains("`-- no-such-program-xyz run x`"), "{log}");
+}
+
 #[test]
 fn fixed_weight_pattern_overrides_history() {
     let env = TestEnv::new().with_config(

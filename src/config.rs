@@ -26,6 +26,10 @@ pub struct Config {
     pub default_weight: u32,
     pub history_keep: usize,
     pub progress_interval_secs: u64,
+    /// When stderr is not a terminal: a progress line only when the wait
+    /// reason or queue position changes, and at most this far apart
+    /// otherwise.
+    pub progress_interval_secs_non_tty: u64,
     pub memory_reserve_mib: u64,
     /// Hold the next start while global CPU busy % is above this.
     pub cpu_threshold_percent: f64,
@@ -53,6 +57,7 @@ impl Default for Config {
             default_weight: 2,
             history_keep: 200,
             progress_interval_secs: 5,
+            progress_interval_secs_non_tty: 60,
             memory_reserve_mib: 2048,
             cpu_threshold_percent: 85.0,
             cpu_guard_max_wait_secs: 120,
