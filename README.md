@@ -53,8 +53,8 @@ saturated.
   lets a human at the keyboard jump ahead.
 - **Nesting-safe.** A gated command that itself calls `canirun exec`
   inherits the outer lease instead of deadlocking.
-- **Async jobs that die with their waiter.** `submit` returns a job id at
-  once; `wait` collects the log and exit code later. A job nobody is
+- **Async jobs that die with their waiter.** `submit` returns a job id as
+  soon as the job is queued; `wait` collects the log and exit code later. A job nobody is
   waiting on is cancelled after a grace period, so a crashed caller never
   leaves a test suite burning CPU. `--detach` opts out.
 - **Rough ETAs.** From learned wall times and the current queue, every
@@ -144,7 +144,9 @@ canirun cancel <job-id>...
 
 `submit` writes a job descriptor, starts a detached runner (own session,
 stdin from `/dev/null`, stdout and stderr merged into the job log,
-environment and cwd inherited) and prints the job id on stdout, with a
+environment and cwd inherited), waits until the runner has joined the
+queue (so back-to-back submits keep their order; at most 5 s, after which
+it warns and returns anyway) and prints the job id on stdout, with a
 rough estimate on stderr:
 
 ```

@@ -113,7 +113,7 @@ pub fn write_exit(id: &str, code: i32) {
 
 /// Spawn the detached runner for `job`: own session, stdin from
 /// /dev/null, stdout+stderr appended to the job log, env inherited.
-pub fn spawn_runner(job: &Job) -> Result<()> {
+pub fn spawn_runner(job: &Job) -> Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     let log = fs::OpenOptions::new()
         .create(true)
@@ -136,8 +136,7 @@ pub fn spawn_runner(job: &Job) -> Result<()> {
         });
     }
     cmd.spawn()
-        .map_err(|e| Error::Spawn(format!("cannot start job runner: {e}")))?;
-    Ok(())
+        .map_err(|e| Error::Spawn(format!("cannot start job runner: {e}")))
 }
 
 /// Hold this while waiting on a job; the runner treats "nobody holds it"
