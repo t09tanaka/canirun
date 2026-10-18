@@ -50,9 +50,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<i32> {
         let since = e.started_at.unwrap_or(e.enqueued_at);
         let elapsed = (now - since).to_std().unwrap_or_default();
         println!(
-            "  {:>7}  w{:<2} {:>8}  {}{}",
+            "  {:>7}  {} {:>8}  {}{}",
             e.pid,
-            e.weight,
+            weight_label(e.weight, e.using),
             fmt_duration(elapsed),
             truncate(&label(&e.repo, &e.subdir, &e.argv), 70),
             eta_of(&e.id)
@@ -78,10 +78,30 @@ pub fn run(cfg: &Config, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// `w2`, or `w2 (using 5.1)` once the running tree has been measured.
+fn weight_label(weight: u32, using: Option<f64>) -> String {
+    match using {
+        Some(u) => format!("w{weight:<2} (using {u:.1})"),
+        None => format!("w{weight:<2}"),
+    }
+}
+
 pub fn label(repo: &str, subdir: &str, argv: &str) -> String {
     if repo.is_empty() {
         argv.to_string()
     } else {
         format!("{}: {argv}", crate::key::project_label(repo, subdir))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weight_label_shows_measured_use() {
+        assert_eq!(weight_label(2, None), "w2 ");
+        assert_eq!(weight_label(2, Some(5.12)), "w2  (using 5.1)");
+        assert_eq!(weight_label(12, Some(0.0)), "w12 (using 0.0)");
     }
 }

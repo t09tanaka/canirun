@@ -83,8 +83,10 @@ pub struct Outcome {
 }
 
 /// Run `argv` with inherited stdio in our process group, with
-/// `CANIRUN_LEASE=lease` in its environment.
-pub fn run(argv: &[String], lease: &str) -> Result<Outcome> {
+/// `CANIRUN_LEASE=lease` in its environment. With `measure`, the child's
+/// process tree is sampled while it runs and the cores it uses are written
+/// to the ledger entry `lease`.
+pub fn run(argv: &[String], lease: &str, measure: bool) -> Result<Outcome> {
     let (prog, args) = argv
         .split_first()
         .ok_or_else(|| Error::Spawn("no command given".into()))?;
@@ -99,6 +101,8 @@ pub fn run(argv: &[String], lease: &str) -> Result<Outcome> {
             Error::Spawn(format!("cannot run {prog:?}: {e}{}", spawn_hint(argv, &e)))
         })?;
     let pid = child.id() as libc::pid_t;
+    // Dropped (stopped and joined) once the child has been reaped.
+    let _monitor = measure.then(|| crate::usage::Monitor::start(lease.to_string(), child.id()));
     // A signal delivered between handler installation and spawn is
     // forwarded now rather than waiting for the next EINTR.
     let early = take_pending();

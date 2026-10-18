@@ -14,7 +14,7 @@ pub enum State {
 }
 
 /// The slice of a ledger entry that admission needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueueEntry {
     pub id: String,
     pub state: State,
@@ -22,6 +22,9 @@ pub struct QueueEntry {
     pub weight: u32,
     /// Enqueue order; lower is earlier.
     pub seq: u64,
+    /// Cores a running entry's process tree was last measured using, or
+    /// None when not measured (yet).
+    pub using: Option<f64>,
 }
 
 /// What the machine looks like right now.
@@ -79,12 +82,21 @@ pub fn queue_order(entries: &[QueueEntry]) -> Vec<&QueueEntry> {
     waiting
 }
 
-/// Sum of weights of running entries.
+/// What a running entry takes from the budget: its declared weight, or
+/// the cores it was measured using when that is more. The measurement is
+/// rounded, so a command hovering just above its weight is not charged a
+/// whole extra slot.
+pub fn charged(e: &QueueEntry) -> u32 {
+    let measured = e.using.map(|u| u.round() as u32).unwrap_or(0);
+    e.weight.max(measured)
+}
+
+/// Sum of what running entries take from the budget (see [`charged`]).
 pub fn used_budget(entries: &[QueueEntry]) -> u32 {
     entries
         .iter()
         .filter(|e| e.state == State::Running)
-        .map(|e| e.weight)
+        .map(charged)
         .sum()
 }
 
@@ -159,7 +171,12 @@ mod tests {
             front,
             weight,
             seq,
+            using: None,
         }
+    }
+    fn using(mut q: QueueEntry, cores: f64) -> QueueEntry {
+        q.using = Some(cores);
+        q
     }
     const LIMITS: Limits = Limits {
         budget: 12,
@@ -442,6 +459,43 @@ mod tests {
             admit(&q, "w", 0, 0.0, LIMITS, Some(live)),
             Decision::Wait(Reason::Budget { .. })
         ));
+    }
+
+    #[test]
+    fn running_entry_is_charged_what_it_uses_beyond_its_weight() {
+        let r = e("r", State::Running, false, 2, 1);
+        assert_eq!(charged(&r), 2);
+        assert_eq!(charged(&using(r.clone(), 0.3)), 2);
+        assert_eq!(charged(&using(r.clone(), 2.49)), 2);
+        assert_eq!(charged(&using(r.clone(), 2.5)), 3);
+        assert_eq!(charged(&using(r.clone(), 5.1)), 5);
+        assert_eq!(charged(&using(r, f64::NAN)), 2);
+    }
+
+    #[test]
+    fn measured_use_holds_the_head_when_declared_weight_would_not() {
+        let declared = [
+            e("r", State::Running, false, 1, 1),
+            e("w", State::Waiting, false, 2, 2),
+        ];
+        let budget4 = Limits {
+            budget: 4,
+            ..LIMITS
+        };
+        assert_eq!(
+            admit(&declared, "w", 0, 0.0, budget4, Some(calm())),
+            Decision::Admitted
+        );
+        let measured = [using(declared[0].clone(), 3.0), declared[1].clone()];
+        assert_eq!(
+            admit(&measured, "w", 0, 0.0, budget4, Some(calm())),
+            Decision::Wait(Reason::Budget { used: 3, budget: 4 })
+        );
+        assert_eq!(used_budget(&measured), 3);
+        // A waiting entry's measurement (there is none in practice) is not
+        // charged.
+        let q = [using(e("w", State::Waiting, false, 1, 1), 9.0)];
+        assert_eq!(used_budget(&q), 0);
     }
 
     #[test]

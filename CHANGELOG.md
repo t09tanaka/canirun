@@ -7,6 +7,19 @@ the minor version).
 
 ## [Unreleased]
 
+### Added
+
+- **Running commands are charged what they actually use.** Each running
+  `canirun` samples its command's process tree once a second (macOS and
+  Linux) and writes the cores used (peak of the last three samples) to
+  its ledger entry. Admission charges a running entry `max(weight,
+  round(using))`, so a command declared at weight 1 or 2 that runs five
+  cores of workers no longer lets the next one start on top of it.
+  `status` shows it as `w2 (using 5.1)` and counts it in `budget X/Y
+  used`; the ledger field is `using`. Without a measurement (first second,
+  or a platform that cannot be read) the declared weight is used. The
+  command itself is never slowed or stopped.
+
 ### Changed
 
 - **Wrapped commands learn from their earlier runs.** `sh -c` / `bash -c`

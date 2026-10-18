@@ -119,6 +119,7 @@ mod tests {
                 front: false,
                 weight,
                 seq,
+                using: None,
             },
             elapsed_secs: elapsed,
             expected_secs: exp,
