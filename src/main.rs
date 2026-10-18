@@ -15,6 +15,7 @@ mod live;
 mod lock;
 mod paths;
 mod runner;
+mod usage;
 mod weight;
 
 use clap::{Parser, Subcommand};

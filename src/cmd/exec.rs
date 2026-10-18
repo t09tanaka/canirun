@@ -44,7 +44,7 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
     }
     if nested_lease_is_live()? {
         let lease = std::env::var("CANIRUN_LEASE").unwrap_or_default();
-        let out = runner::run(&opts.argv, &lease)?;
+        let out = runner::run(&opts.argv, &lease, false)?;
         return Ok(finish(out.exit));
     }
     let id = new_id();
@@ -104,6 +104,7 @@ pub fn timed_queue(ledger: &Ledger) -> Vec<eta::Timed> {
                 front: e.front,
                 weight: e.weight,
                 seq: e.seq,
+                using: e.using,
             },
             elapsed_secs: e
                 .started_at
@@ -175,6 +176,7 @@ pub fn run_gated(
             seq,
             enqueued_at: Utc::now(),
             started_at: None,
+            using: None,
         });
         ledger.save(&paths::ledger_file())?;
     }
@@ -296,7 +298,7 @@ pub fn run_gated(
         .map(|l| l.cpu_busy > limits.cpu_threshold)
         .unwrap_or(false);
     let started_at = Utc::now();
-    let out = runner::run(&opts.argv, id);
+    let out = runner::run(&opts.argv, id, true);
     remove_entry(id);
     let out = out?;
     let _ = history::append(

@@ -31,6 +31,10 @@ pub struct Entry {
     pub enqueued_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
+    /// Cores the running command's process tree was last measured using,
+    /// written by the running `canirun` itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub using: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,6 +91,7 @@ impl Ledger {
                 front: e.front,
                 weight: e.weight,
                 seq: e.seq,
+                using: e.using,
             })
             .collect()
     }
@@ -126,6 +131,7 @@ mod tests {
             seq,
             enqueued_at: Utc::now(),
             started_at: None,
+            using: None,
         }
     }
 
