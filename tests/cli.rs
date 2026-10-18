@@ -144,17 +144,23 @@ fn exec_missing_program_fails_cleanly() {
 #[test]
 fn exec_records_history_and_learns_weight() {
     let env = TestEnv::new().with_config("budget = 8\n");
-    // Two processes in parallel, each burning 0.6 s of its own CPU time.
-    // Bounded by CPU time rather than the clock, so a loaded machine only
-    // stretches the wall time and cpu_secs stays >= 1.2.
-    let script = "for i in 1 2; do perl -e '1 while (times)[0] < 0.6' & done; wait";
+    // Two processes in parallel, each burning 1.2 s of its own CPU time
+    // (user + sys, as cpu_secs counts it). Bounded by CPU time rather than
+    // the clock, so a loaded machine only stretches the wall time. A single
+    // process cannot burn 1.2 s of CPU in less wall time, so the run is
+    // always long enough to learn from (weight::MIN_USABLE_WALL_SECS, 1.0).
+    // Counting user time alone left the wall time to the user/sys split of
+    // the `times` loop: about 1.3 s here, but under 1.0 s elsewhere.
+    let script =
+        "for i in 1 2; do perl -e '1 while do { my @t = times; $t[0] + $t[1] } < 1.2' & done; wait";
     let out = env.run(&["exec", "--", "sh", "-c", script]);
     assert!(out.status.success());
     let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
     let rec: serde_json::Value = serde_json::from_str(hist.lines().next().unwrap()).unwrap();
-    // One process cannot burn 0.6 s of CPU in less wall time.
-    assert!(rec["wall_secs"].as_f64().unwrap() >= 0.5, "{rec}");
-    assert!(rec["cpu_secs"].as_f64().unwrap() >= 1.0, "{rec}");
+    // The learning floor itself, so a short run fails here and not as a
+    // missing "(Learned)" below.
+    assert!(rec["wall_secs"].as_f64().unwrap() >= 1.0, "{rec}");
+    assert!(rec["cpu_secs"].as_f64().unwrap() >= 2.0, "{rec}");
     assert_eq!(rec["exit_code"], 0);
     assert_eq!(rec["weight_used"], 2, "default weight on first run");
 

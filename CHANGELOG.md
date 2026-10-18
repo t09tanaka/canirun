@@ -51,6 +51,11 @@ the minor version).
   migrated: the new key starts learning from its first run (or shares
   what the plain command already learned). `--key` still wins.
 
+### Fixed
+
+- **A history test no longer flakes when its run ends under the 1 s learning
+  floor**: it now burns 1.2 s of user + sys CPU time per process.
+
 ## [0.3.0] - 2026-10-17
 
 ### Added
