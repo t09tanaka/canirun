@@ -3,9 +3,8 @@ use crate::config::Config;
 use crate::display::{fmt_bytes, truncate};
 use crate::error::Result;
 use crate::history::{self, Record};
-use crate::key::{make_key, make_override_key};
+use crate::paths;
 use crate::weight::{self, Measurement};
-use crate::{gitctx, paths};
 use std::collections::BTreeMap;
 
 pub struct Opts {
@@ -18,17 +17,7 @@ pub struct Opts {
 pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
     let all = history::read_all(&paths::history_file())?;
     let filter_hash = if opts.key.is_some() || !opts.argv.is_empty() {
-        let cwd = std::env::current_dir()?;
-        let repo = gitctx::main_worktree(&cwd);
-        let subdir = if repo.is_some() {
-            gitctx::subdir(&cwd)
-        } else {
-            String::new()
-        };
-        Some(match &opts.key {
-            Some(k) => make_override_key(repo.as_deref(), &subdir, k, &opts.argv).hash,
-            None => make_key(repo.as_deref(), &subdir, &opts.argv).hash,
-        })
+        Some(crate::cmd::command_key(opts.key.as_deref(), &opts.argv)?.hash)
     } else {
         None
     };
@@ -54,8 +43,13 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
         let hint = cfg.hint_for(&last.argv);
         let (next_w, source) =
             weight::derive_weight(None, hint, &ms, cfg.default_weight, cfg.budget);
+        let keyed_by = if last.key_argv.is_empty() {
+            String::new()
+        } else {
+            format!("\n  key: {}", truncate(&last.key_argv, 90))
+        };
         println!(
-            "{}\n  next: weight {next_w} ({source:?}), memory {}",
+            "{}{keyed_by}\n  next: weight {next_w} ({source:?}), memory {}",
             truncate(&label(&last.repo, &last.subdir, &last.argv), 90),
             fmt_bytes(weight::predicted_rss(&ms))
         );
