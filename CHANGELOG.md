@@ -7,6 +7,50 @@ the minor version).
 
 ## [Unreleased]
 
+### Added
+
+- **Running commands are charged what they actually use.** Each running
+  `canirun` samples its command's process tree once a second (macOS and
+  Linux) and writes the cores used (peak of the last three samples) to
+  its ledger entry. Admission charges a running entry `max(weight,
+  round(using))`, so a command declared at weight 1 or 2 that runs five
+  cores of workers no longer lets the next one start on top of it.
+  `status` shows it as `w2 (using 5.1)` and counts it in `budget X/Y
+  used`; the ledger field is `using`. Without a measurement (first second,
+  or a platform that cannot be read) the declared weight is used. The
+  command itself is never slowed or stopped.
+
+- **Test runners and mutation tools start heavier.** A command nothing
+  has been learned about starts at `test_initial_weight` (new, default 4)
+  when it is a test runner and `mutation_initial_weight` (new, default 6)
+  when it is mutation testing, instead of `default_weight`. A pattern's
+  `initial_weight` or `weight` still wins.
+- **`--front` waits briefly on an overloaded machine.** When the load
+  average is at least `front_overload_factor` (new, default 2.0) x
+  `budget`, a `--front` head waits for at most
+  `front_overload_max_wait_secs` (new, default 30) before starting, with
+  a progress line `overloaded: load N, limit M`. Previously `--front`
+  skipped every CPU check, so a pre-push hook could start on a machine
+  already running at many times its cores. Set the factor to 0 for the
+  old behaviour. The same cap bounds how long measured use beyond the
+  running entries' weights can hold a `--front` entry; after it, only
+  declared weights count for that entry.
+
+### Changed
+
+- **Wrapped commands learn from their earlier runs.** `sh -c` / `bash -c`
+  / `zsh -c` lines and scripts under a temporary directory used to get a
+  new history key on every run (different redirections, temp paths, a
+  new scratch file name), so they ran at `default_weight` forever. They
+  are now keyed by the first heavy command inside them (`npm run <script>`,
+  `npx`, `node`, `vitest`, `jest`, `stryker`, `cargo test`, `dart test`,
+  `flutter test`, ...), with redirections dropped and temporary paths
+  masked; a temporary script is read (first 8 KiB) for the same purpose,
+  or keyed by its file name. Plain commands keep exactly the key they had
+  before. History recorded for a wrapped command under 0.3 is not
+  migrated: the new key starts learning from its first run (or shares
+  what the plain command already learned). `--key` still wins.
+
 ### Fixed
 
 - **A history test no longer flakes when its run ends under the 1 s learning

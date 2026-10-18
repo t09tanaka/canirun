@@ -4,11 +4,10 @@ use crate::display::{fmt_bytes, fmt_duration};
 use crate::error::Result;
 use crate::eta;
 use crate::history::{self, Record};
-use crate::key::{make_key, make_override_key};
 use crate::ledger::{Entry, Ledger};
 use crate::runner::{self, Exit};
 use crate::weight::{self, Measurement};
-use crate::{gitctx, live, lock, paths};
+use crate::{live, lock, paths};
 use chrono::Utc;
 use std::io::IsTerminal;
 use std::thread;
@@ -45,7 +44,7 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
     }
     if nested_lease_is_live()? {
         let lease = std::env::var("CANIRUN_LEASE").unwrap_or_default();
-        let out = runner::run(&opts.argv, &lease)?;
+        let out = runner::run(&opts.argv, &lease, false)?;
         return Ok(finish(out.exit));
     }
     let id = new_id();
@@ -77,21 +76,18 @@ pub struct Plan {
 }
 
 pub fn plan(cfg: &Config, opts: &Opts) -> Result<Plan> {
-    let cwd = std::env::current_dir()?;
-    let repo = gitctx::main_worktree(&cwd);
-    let subdir = if repo.is_some() {
-        gitctx::subdir(&cwd)
-    } else {
-        String::new()
-    };
-    let key = match &opts.key {
-        Some(k) => make_override_key(repo.as_deref(), &subdir, k, &opts.argv),
-        None => make_key(repo.as_deref(), &subdir, &opts.argv),
-    };
+    let key = crate::cmd::command_key(opts.key.as_deref(), &opts.argv)?;
     let recs = history::for_key(&paths::history_file(), &key.hash)?;
     let records: Vec<Measurement> = recs.iter().map(Record::measurement).collect();
     let walls: Vec<f64> = recs.iter().map(|r| r.wall_secs).collect();
-    let hint = cfg.hint_for(&key.argv);
+    // An explicit `--key` names the history, not the work: classify the
+    // command itself.
+    let kind_of = if opts.key.is_some() {
+        &key.argv
+    } else {
+        &key.key_argv
+    };
+    let hint = cfg.hint_for_key(&key.argv, kind_of);
     let (weight, _source) =
         weight::derive_weight(opts.weight, hint, &records, cfg.default_weight, cfg.budget);
     Ok(Plan {
@@ -115,6 +111,7 @@ pub fn timed_queue(ledger: &Ledger) -> Vec<eta::Timed> {
                 front: e.front,
                 weight: e.weight,
                 seq: e.seq,
+                using: e.using,
             },
             elapsed_secs: e
                 .started_at
@@ -160,6 +157,8 @@ pub fn run_gated(
         memory_reserve: cfg.memory_reserve_bytes(),
         cpu_threshold: cfg.cpu_threshold(),
         cpu_guard_max_wait_secs: cfg.cpu_guard_max_wait_secs as f64,
+        front_overload_load: cfg.front_overload_load(),
+        front_overload_max_wait_secs: cfg.front_overload_max_wait_secs as f64,
     };
 
     // Register as waiting. The lease is taken before the ledger entry so
@@ -186,6 +185,7 @@ pub fn run_gated(
             seq,
             enqueued_at: Utc::now(),
             started_at: None,
+            using: None,
         });
         ledger.save(&paths::ledger_file())?;
     }
@@ -269,7 +269,11 @@ pub fn run_gated(
             let last = last_progress.map(|(t, last)| (t.elapsed(), last));
             if cadence.due(last, topic) {
                 let running = queue.iter().filter(|e| e.state == State::Running).count();
-                let used = admit::used_budget(&queue);
+                // Phase 2 may have decided on a fresher ledger.
+                let used = match reason {
+                    Reason::Budget { used, .. } => *used,
+                    _ => admit::used_budget(&queue),
+                };
                 eprintln!(
                     "canirun: waiting {} ({}) — running {running} ({used}/{} used){}{}",
                     fmt_duration(enqueued.elapsed()),
@@ -307,7 +311,7 @@ pub fn run_gated(
         .map(|l| l.cpu_busy > limits.cpu_threshold)
         .unwrap_or(false);
     let started_at = Utc::now();
-    let out = runner::run(&opts.argv, id);
+    let out = runner::run(&opts.argv, id, true);
     remove_entry(id);
     let out = out?;
     let _ = history::append(
@@ -316,6 +320,11 @@ pub fn run_gated(
             key: key.hash,
             repo: key.repo,
             subdir: key.subdir,
+            key_argv: if key.key_argv == key.argv || opts.key.is_some() {
+                String::new()
+            } else {
+                key.key_argv
+            },
             argv: key.argv,
             started_at,
             wall_secs: out.wall_secs,
@@ -355,6 +364,7 @@ enum Topic {
     Budget,
     Memory,
     Cpu,
+    Overload,
 }
 
 fn topic_of(reason: &Reason) -> Topic {
@@ -363,6 +373,7 @@ fn topic_of(reason: &Reason) -> Topic {
         Reason::Budget { .. } => Topic::Budget,
         Reason::Memory { .. } => Topic::Memory,
         Reason::Cpu { .. } => Topic::Cpu,
+        Reason::Overload { .. } => Topic::Overload,
     }
 }
 
@@ -404,6 +415,9 @@ pub fn describe(reason: &Reason) -> String {
             busy * 100.0,
             threshold * 100.0
         ),
+        Reason::Overload { load, limit } => {
+            format!("overloaded: load {load:.0}, limit {limit:.0}; --front waits briefly")
+        }
     }
 }
 

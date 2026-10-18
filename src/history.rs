@@ -15,6 +15,10 @@ pub struct Record {
     #[serde(default)]
     pub subdir: String,
     pub argv: String,
+    /// What the run was keyed by, when that is not `argv` (a command found
+    /// inside `sh -c` or a temporary script).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_argv: String,
     pub started_at: DateTime<Utc>,
     pub wall_secs: f64,
     pub cpu_secs: f64,
@@ -118,6 +122,7 @@ mod tests {
             repo: String::new(),
             subdir: String::new(),
             argv: "x".into(),
+            key_argv: String::new(),
             started_at: Utc::now(),
             wall_secs: wall,
             cpu_secs: 1.0,

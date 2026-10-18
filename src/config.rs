@@ -1,6 +1,7 @@
 //! `config.toml` loading with defaults (spec "Configuration").
 
 use crate::error::{Error, Result};
+use crate::key::{classify, Kind};
 use crate::weight::PatternHint;
 use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,11 @@ pub struct Pattern {
 pub struct Config {
     pub budget: u32,
     pub default_weight: u32,
+    /// First weight of a test runner nothing has been learned about.
+    pub test_initial_weight: u32,
+    /// First weight of a mutation-testing run nothing has been learned
+    /// about.
+    pub mutation_initial_weight: u32,
     pub history_keep: usize,
     pub progress_interval_secs: u64,
     /// When stderr is not a terminal: a progress line only when the wait
@@ -35,6 +41,11 @@ pub struct Config {
     pub cpu_threshold_percent: f64,
     /// After waiting this long the CPU guard stops holding the head.
     pub cpu_guard_max_wait_secs: u64,
+    /// A `--front` entry waits while the load average is at or above
+    /// `budget` times this (0 disables)...
+    pub front_overload_factor: f64,
+    /// ...for at most this long.
+    pub front_overload_max_wait_secs: u64,
     /// `gc` removes finished job files older than this.
     pub jobs_keep_days: u64,
     /// A job with no `wait`er is cancelled once this many seconds have
@@ -55,12 +66,16 @@ impl Default for Config {
         Config {
             budget: logical_cpus(),
             default_weight: 2,
+            test_initial_weight: 4,
+            mutation_initial_weight: 6,
             history_keep: 200,
             progress_interval_secs: 5,
             progress_interval_secs_non_tty: 60,
             memory_reserve_mib: 2048,
             cpu_threshold_percent: 85.0,
             cpu_guard_max_wait_secs: 120,
+            front_overload_factor: 2.0,
+            front_overload_max_wait_secs: 30,
             jobs_keep_days: 7,
             jobs_orphan_grace_secs: 30,
             patterns: Vec::new(),
@@ -91,6 +106,11 @@ impl Config {
         if !(self.cpu_threshold_percent > 0.0 && self.cpu_threshold_percent <= 100.0) {
             return Err(Error::Config(
                 "cpu_threshold_percent must be in (0, 100]".into(),
+            ));
+        }
+        if self.front_overload_factor.is_nan() || self.front_overload_factor < 0.0 {
+            return Err(Error::Config(
+                "front_overload_factor must be 0 or more".into(),
             ));
         }
         for p in &self.patterns {
@@ -124,8 +144,27 @@ impl Config {
         PatternHint::default()
     }
 
+    /// [`Config::hint_for`] the argv string, with the initial weight of
+    /// the key's [`Kind`] when no pattern sets one.
+    pub fn hint_for_key(&self, argv: &str, key_argv: &str) -> PatternHint {
+        let mut hint = self.hint_for(argv);
+        if hint.initial_weight.is_none() {
+            hint.initial_weight = match classify(key_argv) {
+                Kind::Tests => Some(self.test_initial_weight),
+                Kind::Mutation => Some(self.mutation_initial_weight),
+                Kind::Other => None,
+            };
+        }
+        hint
+    }
+
     pub fn cpu_threshold(&self) -> f64 {
         self.cpu_threshold_percent / 100.0
+    }
+
+    /// Load average at which a `--front` entry is held (0: never).
+    pub fn front_overload_load(&self) -> f64 {
+        self.front_overload_factor * f64::from(self.budget)
     }
 
     pub fn memory_reserve_bytes(&self) -> u64 {
@@ -174,6 +213,45 @@ weight = 1
     }
 
     #[test]
+    fn known_kinds_start_heavier_unless_a_pattern_says_otherwise() {
+        let c = Config::parse(
+            r#"
+test_initial_weight = 3
+[[pattern]]
+match = "*e2e*"
+initial_weight = 8
+[[pattern]]
+match = "*lint*"
+weight = 1
+[[pattern]]
+match = "*unit*"
+min_weight = 2
+"#,
+        )
+        .unwrap();
+        let init = |argv: &str, key: &str| c.hint_for_key(argv, key).initial_weight;
+        assert_eq!(init("npm test", "npm test"), Some(3));
+        assert_eq!(init("x", "npx stryker run"), Some(6));
+        assert_eq!(init("npm run build", "npm run build"), None);
+        assert_eq!(init("npm run test:e2e", "npm run test:e2e"), Some(8));
+        assert_eq!(init("npm run test:unit", "npm run test:unit"), Some(3));
+        assert_eq!(
+            c.hint_for_key("npm run test:unit", "npm run test:unit")
+                .min_weight,
+            Some(2)
+        );
+        assert_eq!(
+            c.hint_for_key("npm run lint", "npm run lint").weight,
+            Some(1)
+        );
+        let d = Config::default();
+        assert_eq!(
+            d.hint_for_key("cargo test", "cargo test").initial_weight,
+            Some(4)
+        );
+    }
+
+    #[test]
     fn rejects_weight_with_min_weight() {
         let e = Config::parse("[[pattern]]\nmatch = \"x\"\nweight = 1\nmin_weight = 2\n");
         assert!(e.is_err());
@@ -185,6 +263,13 @@ weight = 1
         assert!(Config::parse("cpu_threshold_percent = 0").is_err());
         assert!(Config::parse("cpu_threshold_percent = 101").is_err());
         assert!(Config::parse("cpu_threshold_percent = 100").is_ok());
+        assert!(Config::parse("front_overload_factor = -1").is_err());
+        let c = Config::parse("budget = 12\nfront_overload_factor = 0").unwrap();
+        assert_eq!(c.front_overload_load(), 0.0);
+        assert_eq!(
+            Config::parse("budget = 12").unwrap().front_overload_load(),
+            24.0
+        );
     }
 
     #[test]

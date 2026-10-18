@@ -43,7 +43,19 @@ saturated.
   under a threshold. These delay the *next* start; a running command is
   never paused or killed. `--front` entries skip the CPU brake, and any
   head gives up on it after `cpu_guard_max_wait_secs`, so load that does
-  not go through canirun cannot hold the queue indefinitely.
+  not go through canirun cannot hold the queue indefinitely. On a
+  machine that is badly overloaded (load average at least
+  `front_overload_factor` x budget) a `--front` entry still waits, for at
+  most `front_overload_max_wait_secs` (30 s). Likewise, measured use
+  beyond the running entries' weights holds a `--front` entry for at most
+  that long; after that only declared weights count for it. (The load
+  average is the trigger because measured cores cannot exceed the core
+  count, so "twice the budget" is only visible as runnable processes.)
+- **Measured, not just declared.** While a command runs, canirun samples
+  the CPU its whole process tree uses. A command declared (or learned) at
+  weight 2 that is using 5 cores takes 5 from the budget until it slows
+  down, so the next start waits instead of piling on. The running
+  command itself is never slowed or stopped.
 - **Crash-safe queue.** Each waiting or running entry holds an `flock` on
   its own lease file. A Ctrl-C'd, SIGKILLed, or crashed `canirun` — waiting
   or running — vanishes from the ledger on the next poll. No cleanup step,
@@ -90,7 +102,31 @@ if you need one.
 - `--front` puts the entry ahead of all normal entries. Several `--front`
   entries are FIFO among themselves.
 - `--key K` replaces the argv string as the history key, for commands
-  whose arguments carry temp paths or timestamps.
+  whose arguments carry temp paths or timestamps. It wins over the
+  automatic keys below.
+
+Wrapped commands are keyed by the heavy command inside them, so a
+one-off shell line still learns from earlier runs:
+
+- `sh -c` / `bash -c` / `zsh -c` / `dash -c '<line>'` (also behind `env`,
+  `time`, `nice`, `timeout` and `VAR=value`, and through nested `-c`
+  strings): the first command in the line that runs `npm run` / `npm test`
+  / `npm exec` (and the pnpm / yarn / bun equivalents), `npx`, `node`,
+  `stryker`, `vitest`, `jest`, `mocha`, `playwright`, `pytest`,
+  `cargo test|build|check|clippy|bench|nextest|mutants|llvm-cov`,
+  `go test|build|vet`, `dart test|run|analyze` or
+  `flutter test|build|analyze`. Redirections are dropped, so
+  `cd api && npm run test 2>&1 | tail -5` is keyed as `npm run test` and
+  shares its history with `canirun exec -- npm run test`.
+- A script under a temporary directory (`/tmp`, `/private/tmp`,
+  `/var/folders`, `$TMPDIR`, or any `scratchpad` directory), run directly
+  or as `bash /tmp/x.sh`: its first 8 KiB are read and the same rule
+  applies; if nothing is found (or the file cannot be read), it is keyed
+  by its file name and arguments.
+
+Temporary paths among the kept arguments become `<tmp>`. A line with no
+heavy command keeps the full argv string as its key. `history` shows the
+derived key as `key: ...` under the command.
 
 While waiting, a progress line goes to stderr every few seconds:
 
@@ -118,17 +154,20 @@ budget 10/12 used
 machine 31.2 GiB available, cpu 71% busy
 
 running (3)
-    48211  w4      2:14  webapp: npm run test:e2e
-    48190  w4      1:03  webapp: npm run test:e2e
-    48260  w2      0:20  api: npm run test:unit
+    48211  w4  (using 3.8)     2:14  webapp: npm run test:e2e
+    48190  w4  (using 4.1)     1:03  webapp: npm run test:e2e
+    48260  w2  (using 0.9)     0:20  api: npm run test:unit
 
 waiting (2)
     48302  w6      0:41  [front] api: npx stryker run
     48310  w1      0:40  webapp: npm run lint
 ```
 
-`--json` dumps the ledger. Dead entries are reaped first, so the view is
-accurate without a daemon.
+`(using N)` is the cores the running command's process tree used
+recently (see "How it works"); `budget X/Y used` counts each running
+entry at its weight or at that measurement, whichever is more. `--json`
+dumps the ledger. Dead entries are reaped first, so the view is accurate
+without a daemon.
 
 ### `canirun history [--key K] [--json] [--limit N] [-- <command>]`
 
@@ -193,16 +232,20 @@ Absent file means all defaults.
 ```toml
 budget = 12                 # default: logical CPU count
 default_weight = 2          # used when nothing is known about a command
+test_initial_weight = 4     # ...unless it is a test runner
+mutation_initial_weight = 6 # ...or a mutation-testing tool
 history_keep = 200          # records kept per command key
 progress_interval_secs = 5  # between progress lines on a terminal
 progress_interval_secs_non_tty = 60 # heartbeat when stderr is not a terminal
 memory_reserve_mib = 2048   # keep this much available before admitting
 cpu_threshold_percent = 85  # hold the next start while CPU is busier
 cpu_guard_max_wait_secs = 120 # ...but never for longer than this
+front_overload_factor = 2.0 # --front waits while load average >= budget x this (0: never)
+front_overload_max_wait_secs = 30 # ...but never for longer than this
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
 
-[[pattern]]                 # glob over the argv string, first match wins
+[[pattern]]                 # glob over the full argv string, first match wins
 match = "*stryker*"
 min_weight = 6              # learned weight may not drop below this
 
@@ -216,8 +259,17 @@ weight = 1                  # fixed; measured but never learned
 ```
 
 Weight priority: `--weight` > pattern `weight` > learned (then
-`min_weight`) > pattern `initial_weight` > `default_weight`. Floor 1,
-ceiling `budget`.
+`min_weight`) > pattern `initial_weight` > the kind's initial weight >
+`default_weight`. Floor 1, ceiling `budget`.
+
+The kind comes from the key (the command found inside a wrapper, see
+`exec`): mutation testing (`stryker`, `cargo mutants`, any word containing
+`mutant` / `mutation`, such as `npm run test:mutation`) starts at
+`mutation_initial_weight`; a test runner (`npm test`, `npm run test` /
+`test:*`, `vitest`, `jest`, `mocha`, `playwright`, `pytest`, `cargo
+test` / `nextest`, `go test`, `dart test`, `flutter test`) at
+`test_initial_weight`. Once a run has been measured, the learned weight
+takes over.
 
 ## How it works
 
@@ -239,12 +291,23 @@ the reserve and CPU usage must be under the threshold. When nothing
 managed is running the live guards are skipped, so a machine kept busy by
 processes canirun does not manage cannot hold the queue forever.
 
+While a command runs, a background thread in its `canirun` samples the
+CPU used by the command and all of its descendants once a second and
+writes the peak of the last three samples to the ledger entry as
+`using`. Admission charges each running entry `max(weight,
+round(using))`, so a command that uses far more than its weight holds the
+next start; a new or idle one is charged its weight. When the tree cannot
+be measured, the declared weight is used. Measuring does not touch the
+command. CPU spent in a Docker daemon or VM is not part of the tree
+(see "Known blind spot").
+
 Estimates are a plain simulation of that queue against the budget using
 each entry's learned wall time (max of its last five usable runs; 60 s and
 a trailing `?` when unknown). The live guards are not modelled, so an
 estimate is a lower bound.
 
-Weights are learned per `(repository, subdirectory, argv)`. The
+Weights are learned per `(repository, subdirectory, key)`, where the key
+is the argv string or the command found inside a wrapper (see `exec`). The
 repository is the main worktree (`git rev-parse --git-common-dir`), so
 every linked worktree of a project shares one history; the subdirectory
 (`git rev-parse --show-prefix`) keeps `api/` and `client/` of one monorepo

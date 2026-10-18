@@ -232,6 +232,40 @@ fn head_reserves_and_light_entry_does_not_overtake() {
 }
 
 #[test]
+fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
+    let env = TestEnv::new()
+        .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    // Declared weight 1, but six workers each burning 4 s of their own
+    // CPU time. Bounded by CPU time, so load only stretches the wall time.
+    let now = "perl -MTime::HiRes=time -e 'printf \"%.0f\\n\", time*1e9'";
+    let burn = format!(
+        "for i in 1 2 3 4 5 6; do perl -e '1 while (times)[0] < 4' & done; wait; {now} > {}",
+        dir.join("hog.end").display()
+    );
+    let mut hog = env.spawn_exec(&["--weight", "1"], &burn);
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            env.entries()
+                .iter()
+                .any(|e| e["using"].as_f64().unwrap_or(0.0) >= 2.5)
+        }),
+        "the running tree was never measured: {:?}",
+        env.entries()
+    );
+    let status = stdout(&env.run(&["status"]));
+    assert!(status.contains("w1  (using "), "{status}");
+    // By declared weight (1 + 1 <= 2) this would start at once.
+    let mut next = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "next", "0"));
+    assert!(hog.wait().unwrap().success());
+    assert!(next.wait().unwrap().success());
+    assert!(
+        read_ns(&dir.join("next.start")) >= read_ns(&dir.join("hog.end")),
+        "started while the measured tree filled the budget"
+    );
+}
+
+#[test]
 fn front_jumps_the_queue() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();
@@ -249,6 +283,33 @@ fn front_jumps_the_queue() {
         assert!(c.wait().unwrap().success());
     }
     assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("normal.start")));
+}
+
+#[test]
+fn front_waits_briefly_on_an_overloaded_machine() {
+    // A factor this small makes any non-zero load average "overloaded".
+    let env = TestEnv::new().with_config(
+        "budget = 2\nmemory_reserve_mib = 0\nfront_overload_factor = 0.0001\nfront_overload_max_wait_secs = 2\n",
+    );
+    let dir = env.marker_dir();
+    let mut first = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "first", "4"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().iter().any(|e| e["state"] == "running")
+    }));
+    let queued = Instant::now();
+    let front = env.spawn_exec(
+        &["--front", "--weight", "1"],
+        &marker_script(&dir, "front", "0"),
+    );
+    let out = front.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let waited = queued.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("overloaded: load"), "{err}");
+    assert!(waited >= Duration::from_millis(1900), "{waited:?}");
+    assert!(first.wait().unwrap().success());
+    // It gave up on the guard rather than waiting for `first` to finish.
+    assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("first.end")));
 }
 
 #[test]
@@ -495,6 +556,93 @@ fn key_override_groups_history() {
     let v: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v.len(), 2);
     assert_eq!(v[0]["key"], v[1]["key"]);
+}
+
+/// A stand-in `npx` on PATH so the heavy-command rules can be exercised
+/// without Node.
+fn with_fake_npx(env: &TestEnv, c: &mut Command) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let npx = bin.join("npx");
+    fs::write(&npx, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&npx, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    c.env("PATH", format!("{}:{path}", bin.display()));
+}
+
+#[test]
+fn wrapped_commands_share_the_key_of_their_heavy_command() {
+    let env = TestEnv::new();
+    let run = |args: &[&str]| {
+        let mut c = env.cmd();
+        with_fake_npx(&env, &mut c);
+        let out = c.args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["exec", "--", "npx", "tool"]);
+    run(&[
+        "exec",
+        "--",
+        "sh",
+        "-c",
+        "npx tool > out.log 2>&1; echo done",
+    ]);
+    run(&["exec", "--", "bash", "-c", "cd . && npx tool | cat"]);
+    // Scripts in a temporary directory (the test's own temp dir) are read.
+    for name in ["one.sh", "two.sh"] {
+        let p = env.dir.path().join(name);
+        fs::write(&p, "#!/bin/sh\nset -e\nnpx tool\n").unwrap();
+        run(&["exec", "--", "sh", p.to_str().unwrap()]);
+    }
+
+    let out = env.run(&["history", "--json", "--", "npx", "tool"]);
+    let v: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v.len(), 5, "{v:?}");
+    assert!(v.iter().all(|r| r["key"] == v[0]["key"]));
+    assert!(v[0].get("key_argv").is_none(), "{}", v[0]);
+    assert_eq!(v[1]["key_argv"], "npx tool");
+    assert_eq!(v[1]["argv"], "sh -c npx tool > out.log 2>&1; echo done");
+
+    let text = stdout(&env.run(&["history"]));
+    assert!(text.contains("key: npx tool"), "{text}");
+}
+
+#[test]
+fn test_runners_and_mutation_tools_start_heavier() {
+    let env = TestEnv::new()
+        .with_config("budget = 8\n[[pattern]]\nmatch = \"*jest*\"\ninitial_weight = 3\n");
+    let first_weight = |args: &[&str]| {
+        let mut c = env.cmd();
+        with_fake_npx(&env, &mut c);
+        let out = c.arg("exec").arg("--").args(args).output().unwrap();
+        assert!(out.status.success());
+        let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(hist.lines().last().unwrap()).unwrap();
+        last["weight_used"].as_u64().unwrap()
+    };
+    assert_eq!(first_weight(&["npx", "vitest", "run"]), 4);
+    assert_eq!(
+        first_weight(&["sh", "-c", "npx stryker run > /dev/null"]),
+        6
+    );
+    assert_eq!(first_weight(&["npx", "jest"]), 3, "a pattern overrides");
+    assert_eq!(first_weight(&["npx", "tool"]), 2, "default_weight");
+}
+
+#[test]
+fn shell_string_without_a_heavy_command_keeps_its_own_key() {
+    let env = TestEnv::new();
+    env.run(&["exec", "--", "sh", "-c", "true 1"]);
+    env.run(&["exec", "--", "sh", "-c", "true 2"]);
+    let out = env.run(&["history", "--json"]);
+    let v: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v.len(), 2);
+    assert_ne!(v[0]["key"], v[1]["key"]);
 }
 
 #[test]
