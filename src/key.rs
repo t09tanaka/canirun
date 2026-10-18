@@ -92,7 +92,7 @@ pub const TMP_ROOTS: &[&str] = &[
 ];
 
 /// How many bytes of a temporary script are read to find its command.
-pub const SCRIPT_HEAD_BYTES: usize = 8 * 1024;
+pub const SCRIPT_HEAD_BYTES: usize = 8192;
 
 /// Shells whose `-c` string (or script argument) is looked into.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash"];
@@ -229,14 +229,14 @@ fn shell_operand(words: &[String]) -> Option<(bool, usize)> {
         return None;
     }
     let mut saw_c = false;
-    let mut i = 1;
-    while let Some(a) = words.get(i) {
+    let mut rest = &words[1..];
+    while let Some((a, tail)) = rest.split_first() {
         if a == "--" {
-            i += 1;
+            rest = tail;
             break;
         }
         if a == "-o" || a == "+o" {
-            i += 2;
+            rest = tail.get(1..).unwrap_or_default();
             continue;
         }
         if !(a.len() > 1 && (a.starts_with('-') || a.starts_with('+'))) {
@@ -245,9 +245,9 @@ fn shell_operand(words: &[String]) -> Option<(bool, usize)> {
         if a.starts_with('-') && !a.starts_with("--") && a.contains('c') {
             saw_c = true;
         }
-        i += 1;
+        rest = tail;
     }
-    Some((saw_c, i))
+    Some((saw_c, words.len() - rest.len()))
 }
 
 fn is_heavy(words: &[String]) -> bool {
@@ -380,20 +380,10 @@ fn lex(text: &str) -> Vec<Vec<String>> {
                 }
                 lx.redirect = true;
             }
-            '&' if chars.peek() == Some(&'>') => {
-                // `&>file`
-                lx.flush();
-                while chars.peek().is_some_and(|&n| n == '>') {
-                    chars.next();
-                }
-                lx.redirect = true;
-            }
-            '&' | '|' => {
-                lx.sep();
-                while chars.peek().is_some_and(|&n| n == c || n == '&') {
-                    chars.next();
-                }
-            }
+            // `&>file`: the `>` that follows is the redirection.
+            '&' if chars.peek() == Some(&'>') => lx.flush(),
+            // `&&` / `||` just make an empty segment in between.
+            '&' | '|' => lx.sep(),
             _ => {
                 lx.in_word = true;
                 lx.cur.push(c);
@@ -705,6 +695,7 @@ mod tests {
         assert_eq!(norm(&["bash", "--norc", "npm test"]), None);
         assert_eq!(norm(&["bash", "-", "-c", "npm test"]), None);
         assert_eq!(norm(&["bash", "--", "-c"]), None);
+        assert_eq!(norm(&["bash", "-o"]), None);
         assert_eq!(norm(&["bash", "-c"]), None);
         assert_eq!(norm(&["bash", "-c", "echo hi"]), None);
         assert_eq!(norm(&["python", "-c", "npm test"]), None);
@@ -748,6 +739,10 @@ mod tests {
             Some(r#"npx vitest a"b c\d e$f g`h i\nj"#)
         );
         assert_eq!(sh("npx vitest ''").as_deref(), Some("npx vitest "));
+        assert_eq!(
+            sh("echo hi # ; npm run x\nnpm test").as_deref(),
+            Some("npm test")
+        );
         assert_eq!(sh("npx\tvitest\r").as_deref(), Some("npx vitest"));
         assert_eq!(sh("npx vitest \\").as_deref(), Some("npx vitest"));
         assert_eq!(sh("npx vitest \"open").as_deref(), Some("npx vitest open"));
@@ -768,6 +763,8 @@ mod tests {
             assert_eq!(sh(line).as_deref(), Some("npm test"), "{line}");
         }
         assert_eq!(sh("npm test|tail").as_deref(), Some("npm test"));
+        assert_eq!(sh("npx vitest &> log a").as_deref(), Some("npx vitest a"));
+        assert_eq!(sh("npx vitest |& tail").as_deref(), Some("npx vitest"));
         assert_eq!(sh("cat < f | npm test & wait").as_deref(), Some("npm test"));
         // A redirection without a target does not eat the next command.
         assert_eq!(sh("echo hi >; npm test").as_deref(), Some("npm test"));
@@ -819,6 +816,10 @@ mod tests {
         let a = v(&["env", "A=1", "bash", "-x", "/tmp/s/x.sh"]);
         assert_eq!(temp_script(&a, &r), Some("/tmp/s/x.sh"));
         assert_eq!(temp_script(&v(&["bash", "./x.sh"]), &r), None);
+        assert_eq!(
+            temp_script(&v(&["bash", "--", "/tmp/x.sh"]), &r),
+            Some("/tmp/x.sh")
+        );
         assert_eq!(temp_script(&v(&["bash", "-c", "/tmp/x.sh"]), &r), None);
         assert_eq!(temp_script(&v(&["bash"]), &r), None);
         assert_eq!(temp_script(&v(&["npm", "/tmp/x"]), &r), None);
