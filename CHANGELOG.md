@@ -7,6 +7,21 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- **Wrapped commands learn from their earlier runs.** `sh -c` / `bash -c`
+  / `zsh -c` lines and scripts under a temporary directory used to get a
+  new history key on every run (different redirections, temp paths, a
+  new scratch file name), so they ran at `default_weight` forever. They
+  are now keyed by the first heavy command inside them (`npm run <script>`,
+  `npx`, `node`, `vitest`, `jest`, `stryker`, `cargo test`, `dart test`,
+  `flutter test`, ...), with redirections dropped and temporary paths
+  masked; a temporary script is read (first 8 KiB) for the same purpose,
+  or keyed by its file name. Plain commands keep exactly the key they had
+  before. History recorded for a wrapped command under 0.3 is not
+  migrated: the new key starts learning from its first run (or shares
+  what the plain command already learned). `--key` still wins.
+
 ## [0.3.0] - 2026-10-17
 
 ### Added

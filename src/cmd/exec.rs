@@ -4,11 +4,10 @@ use crate::display::{fmt_bytes, fmt_duration};
 use crate::error::Result;
 use crate::eta;
 use crate::history::{self, Record};
-use crate::key::{make_key, make_override_key};
 use crate::ledger::{Entry, Ledger};
 use crate::runner::{self, Exit};
 use crate::weight::{self, Measurement};
-use crate::{gitctx, live, lock, paths};
+use crate::{live, lock, paths};
 use chrono::Utc;
 use std::io::IsTerminal;
 use std::thread;
@@ -77,17 +76,7 @@ pub struct Plan {
 }
 
 pub fn plan(cfg: &Config, opts: &Opts) -> Result<Plan> {
-    let cwd = std::env::current_dir()?;
-    let repo = gitctx::main_worktree(&cwd);
-    let subdir = if repo.is_some() {
-        gitctx::subdir(&cwd)
-    } else {
-        String::new()
-    };
-    let key = match &opts.key {
-        Some(k) => make_override_key(repo.as_deref(), &subdir, k, &opts.argv),
-        None => make_key(repo.as_deref(), &subdir, &opts.argv),
-    };
+    let key = crate::cmd::command_key(opts.key.as_deref(), &opts.argv)?;
     let recs = history::for_key(&paths::history_file(), &key.hash)?;
     let records: Vec<Measurement> = recs.iter().map(Record::measurement).collect();
     let walls: Vec<f64> = recs.iter().map(|r| r.wall_secs).collect();
@@ -316,6 +305,11 @@ pub fn run_gated(
             key: key.hash,
             repo: key.repo,
             subdir: key.subdir,
+            key_argv: if key.key_argv == key.argv {
+                String::new()
+            } else {
+                key.key_argv
+            },
             argv: key.argv,
             started_at,
             wall_secs: out.wall_secs,

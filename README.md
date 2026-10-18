@@ -90,7 +90,31 @@ if you need one.
 - `--front` puts the entry ahead of all normal entries. Several `--front`
   entries are FIFO among themselves.
 - `--key K` replaces the argv string as the history key, for commands
-  whose arguments carry temp paths or timestamps.
+  whose arguments carry temp paths or timestamps. It wins over the
+  automatic keys below.
+
+Wrapped commands are keyed by the heavy command inside them, so a
+one-off shell line still learns from earlier runs:
+
+- `sh -c` / `bash -c` / `zsh -c` / `dash -c '<line>'` (also behind `env`,
+  `time`, `nice`, `timeout` and `VAR=value`, and through nested `-c`
+  strings): the first command in the line that runs `npm run` / `npm test`
+  / `npm exec` (and the pnpm / yarn / bun equivalents), `npx`, `node`,
+  `stryker`, `vitest`, `jest`, `mocha`, `playwright`, `pytest`,
+  `cargo test|build|check|clippy|bench|nextest|mutants|llvm-cov`,
+  `go test|build|vet`, `dart test|run|analyze` or
+  `flutter test|build|analyze`. Redirections are dropped, so
+  `cd api && npm run test 2>&1 | tail -5` is keyed as `npm run test` and
+  shares its history with `canirun exec -- npm run test`.
+- A script under a temporary directory (`/tmp`, `/private/tmp`,
+  `/var/folders`, `$TMPDIR`, or any `scratchpad` directory), run directly
+  or as `bash /tmp/x.sh`: its first 8 KiB are read and the same rule
+  applies; if nothing is found (or the file cannot be read), it is keyed
+  by its file name and arguments.
+
+Temporary paths among the kept arguments become `<tmp>`. A line with no
+heavy command keeps the full argv string as its key. `history` shows the
+derived key as `key: ...` under the command.
 
 While waiting, a progress line goes to stderr every few seconds:
 
@@ -202,7 +226,7 @@ cpu_guard_max_wait_secs = 120 # ...but never for longer than this
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
 
-[[pattern]]                 # glob over the argv string, first match wins
+[[pattern]]                 # glob over the full argv string, first match wins
 match = "*stryker*"
 min_weight = 6              # learned weight may not drop below this
 
@@ -244,7 +268,8 @@ each entry's learned wall time (max of its last five usable runs; 60 s and
 a trailing `?` when unknown). The live guards are not modelled, so an
 estimate is a lower bound.
 
-Weights are learned per `(repository, subdirectory, argv)`. The
+Weights are learned per `(repository, subdirectory, key)`, where the key
+is the argv string or the command found inside a wrapper (see `exec`). The
 repository is the main worktree (`git rev-parse --git-common-dir`), so
 every linked worktree of a project shares one history; the subdirectory
 (`git rev-parse --show-prefix`) keeps `api/` and `client/` of one monorepo

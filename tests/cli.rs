@@ -491,6 +491,71 @@ fn key_override_groups_history() {
     assert_eq!(v[0]["key"], v[1]["key"]);
 }
 
+/// A stand-in `npx` on PATH so the heavy-command rules can be exercised
+/// without Node.
+fn with_fake_npx(env: &TestEnv, c: &mut Command) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let npx = bin.join("npx");
+    fs::write(&npx, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&npx, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    c.env("PATH", format!("{}:{path}", bin.display()));
+}
+
+#[test]
+fn wrapped_commands_share_the_key_of_their_heavy_command() {
+    let env = TestEnv::new();
+    let run = |args: &[&str]| {
+        let mut c = env.cmd();
+        with_fake_npx(&env, &mut c);
+        let out = c.args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["exec", "--", "npx", "tool"]);
+    run(&[
+        "exec",
+        "--",
+        "sh",
+        "-c",
+        "npx tool > out.log 2>&1; echo done",
+    ]);
+    run(&["exec", "--", "bash", "-c", "cd . && npx tool | cat"]);
+    // Scripts in a temporary directory (the test's own temp dir) are read.
+    for name in ["one.sh", "two.sh"] {
+        let p = env.dir.path().join(name);
+        fs::write(&p, "#!/bin/sh\nset -e\nnpx tool\n").unwrap();
+        run(&["exec", "--", "sh", p.to_str().unwrap()]);
+    }
+
+    let out = env.run(&["history", "--json", "--", "npx", "tool"]);
+    let v: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v.len(), 5, "{v:?}");
+    assert!(v.iter().all(|r| r["key"] == v[0]["key"]));
+    assert!(v[0].get("key_argv").is_none(), "{}", v[0]);
+    assert_eq!(v[1]["key_argv"], "npx tool");
+    assert_eq!(v[1]["argv"], "sh -c npx tool > out.log 2>&1; echo done");
+
+    let text = stdout(&env.run(&["history"]));
+    assert!(text.contains("key: npx tool"), "{text}");
+}
+
+#[test]
+fn shell_string_without_a_heavy_command_keeps_its_own_key() {
+    let env = TestEnv::new();
+    env.run(&["exec", "--", "sh", "-c", "true 1"]);
+    env.run(&["exec", "--", "sh", "-c", "true 2"]);
+    let out = env.run(&["history", "--json"]);
+    let v: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v.len(), 2);
+    assert_ne!(v[0]["key"], v[1]["key"]);
+}
+
 #[test]
 fn worktrees_share_a_key() {
     let env = TestEnv::new();
