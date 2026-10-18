@@ -20,6 +20,22 @@ the minor version).
   or a platform that cannot be read) the declared weight is used. The
   command itself is never slowed or stopped.
 
+- **Test runners and mutation tools start heavier.** A command nothing
+  has been learned about starts at `test_initial_weight` (new, default 4)
+  when it is a test runner and `mutation_initial_weight` (new, default 6)
+  when it is mutation testing, instead of `default_weight`. A pattern's
+  `initial_weight` or `weight` still wins.
+- **`--front` waits briefly on an overloaded machine.** When the load
+  average is at least `front_overload_factor` (new, default 2.0) x
+  `budget`, a `--front` head waits for at most
+  `front_overload_max_wait_secs` (new, default 30) before starting, with
+  a progress line `overloaded: load N, limit M`. Previously `--front`
+  skipped every CPU check, so a pre-push hook could start on a machine
+  already running at many times its cores. Set the factor to 0 for the
+  old behaviour. The same cap bounds how long measured use beyond the
+  running entries' weights can hold a `--front` entry; after it, only
+  declared weights count for that entry.
+
 ### Changed
 
 - **Wrapped commands learn from their earlier runs.** `sh -c` / `bash -c`

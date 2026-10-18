@@ -40,7 +40,12 @@ pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
     for (_, recs) in by_key {
         let last = recs[recs.len() - 1];
         let ms: Vec<Measurement> = recs.iter().map(|r| r.measurement()).collect();
-        let hint = cfg.hint_for(&last.argv);
+        let key_argv = if last.key_argv.is_empty() {
+            &last.argv
+        } else {
+            &last.key_argv
+        };
+        let hint = cfg.hint_for_key(&last.argv, key_argv);
         let (next_w, source) =
             weight::derive_weight(None, hint, &ms, cfg.default_weight, cfg.budget);
         let keyed_by = if last.key_argv.is_empty() {

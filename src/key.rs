@@ -461,6 +461,52 @@ pub fn normalize(
     Some(render(&shown, extra_roots))
 }
 
+/// What kind of work a key runs, for the weight used before anything is
+/// learned about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Mutation testing (`stryker`, `cargo mutants`, a `*mutation*` script).
+    Mutation,
+    /// A test runner (`npm test`, `npm run test:*`, `vitest`, `jest`,
+    /// `cargo test`, `dart test`, `flutter test`, ...).
+    Tests,
+    Other,
+}
+
+const TEST_TOOLS: &[&str] = &["vitest", "jest", "mocha", "playwright", "pytest"];
+const MUTATION_WORDS: &[&str] = &["stryker", "mutant", "mutation"];
+
+/// Classify a key (`CommandKey::key_argv`). Only heavy commands (see
+/// [`normalize`]) are classified; anything else is [`Kind::Other`].
+pub fn classify(key_argv: &str) -> Kind {
+    let all: Vec<String> = key_argv.split_whitespace().map(str::to_string).collect();
+    let words = strip_prefix(&all);
+    if !is_heavy(words) {
+        return Kind::Other;
+    }
+    let lower: Vec<String> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
+    if lower
+        .iter()
+        .any(|w| MUTATION_WORDS.iter().any(|m| w.contains(m)))
+    {
+        return Kind::Mutation;
+    }
+    let names: Vec<&str> = lower
+        .iter()
+        .filter(|w| !w.starts_with('-'))
+        .map(|w| basename(w))
+        .take(4)
+        .collect();
+    let is_test = names.iter().any(|n| {
+        TEST_TOOLS.contains(n) || matches!(*n, "test" | "t" | "nextest") || n.starts_with("test:")
+    });
+    if is_test {
+        Kind::Tests
+    } else {
+        Kind::Other
+    }
+}
+
 /// "repo/subdir" for display, or just the repo name at the root.
 pub fn project_label(repo: &str, subdir: &str) -> String {
     let name = std::path::Path::new(repo)
@@ -858,5 +904,44 @@ mod tests {
             Some("bash -x run.sh <tmp> 4")
         );
         assert_eq!(normalize(&v(&["bash", "./x.sh"]), &[], Some(head)), None);
+    }
+
+    #[test]
+    fn keys_are_classified_for_their_first_weight() {
+        let cases: &[(&str, Kind)] = &[
+            ("npx stryker run", Kind::Mutation),
+            ("cargo mutants --file src/a.rs", Kind::Mutation),
+            ("dart run dart_mutant", Kind::Mutation),
+            ("npm run test:gates:Mutation", Kind::Mutation),
+            ("npm test", Kind::Tests),
+            ("npm t", Kind::Tests),
+            ("npm run test", Kind::Tests),
+            ("npm run test:e2e -- --project a", Kind::Tests),
+            ("npm --prefix api run test:unit", Kind::Tests),
+            ("npx vitest run", Kind::Tests),
+            ("/usr/bin/npx jest", Kind::Tests),
+            ("npx mocha", Kind::Tests),
+            ("npx playwright test", Kind::Tests),
+            ("pytest -q", Kind::Tests),
+            ("cargo test --locked", Kind::Tests),
+            ("cargo nextest run", Kind::Tests),
+            ("dart test", Kind::Tests),
+            ("flutter test", Kind::Tests),
+            ("go test ./...", Kind::Tests),
+            ("TZ=UTC env -u X npm test", Kind::Tests),
+            ("npm run lint", Kind::Other),
+            ("npm run build", Kind::Other),
+            ("npm run testing", Kind::Other),
+            ("cargo build", Kind::Other),
+            ("node dist/cli.js", Kind::Other),
+            ("npx tsc --noEmit", Kind::Other),
+            ("npx tsc -p x y test", Kind::Other),
+            ("git log --grep mutation", Kind::Other),
+            ("echo test", Kind::Other),
+            ("key:e2e", Kind::Other),
+            ("", Kind::Other),
+        ];
+        let got: Vec<(&str, Kind)> = cases.iter().map(|(k, _)| (*k, classify(k))).collect();
+        assert_eq!(got, cases.to_vec());
     }
 }

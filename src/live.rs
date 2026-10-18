@@ -22,5 +22,6 @@ pub fn snapshot() -> Option<LiveSnapshot> {
     Some(LiveSnapshot {
         available_memory: sys.available_memory(),
         cpu_busy,
+        load_avg: System::load_average().one.max(0.0),
     })
 }

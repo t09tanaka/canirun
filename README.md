@@ -43,7 +43,14 @@ saturated.
   under a threshold. These delay the *next* start; a running command is
   never paused or killed. `--front` entries skip the CPU brake, and any
   head gives up on it after `cpu_guard_max_wait_secs`, so load that does
-  not go through canirun cannot hold the queue indefinitely.
+  not go through canirun cannot hold the queue indefinitely. On a
+  machine that is badly overloaded (load average at least
+  `front_overload_factor` x budget) a `--front` entry still waits, for at
+  most `front_overload_max_wait_secs` (30 s). Likewise, measured use
+  beyond the running entries' weights holds a `--front` entry for at most
+  that long; after that only declared weights count for it. (The load
+  average is the trigger because measured cores cannot exceed the core
+  count, so "twice the budget" is only visible as runnable processes.)
 - **Measured, not just declared.** While a command runs, canirun samples
   the CPU its whole process tree uses. A command declared (or learned) at
   weight 2 that is using 5 cores takes 5 from the budget until it slows
@@ -225,12 +232,16 @@ Absent file means all defaults.
 ```toml
 budget = 12                 # default: logical CPU count
 default_weight = 2          # used when nothing is known about a command
+test_initial_weight = 4     # ...unless it is a test runner
+mutation_initial_weight = 6 # ...or a mutation-testing tool
 history_keep = 200          # records kept per command key
 progress_interval_secs = 5  # between progress lines on a terminal
 progress_interval_secs_non_tty = 60 # heartbeat when stderr is not a terminal
 memory_reserve_mib = 2048   # keep this much available before admitting
 cpu_threshold_percent = 85  # hold the next start while CPU is busier
 cpu_guard_max_wait_secs = 120 # ...but never for longer than this
+front_overload_factor = 2.0 # --front waits while load average >= budget x this (0: never)
+front_overload_max_wait_secs = 30 # ...but never for longer than this
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
 
@@ -248,8 +259,17 @@ weight = 1                  # fixed; measured but never learned
 ```
 
 Weight priority: `--weight` > pattern `weight` > learned (then
-`min_weight`) > pattern `initial_weight` > `default_weight`. Floor 1,
-ceiling `budget`.
+`min_weight`) > pattern `initial_weight` > the kind's initial weight >
+`default_weight`. Floor 1, ceiling `budget`.
+
+The kind comes from the key (the command found inside a wrapper, see
+`exec`): mutation testing (`stryker`, `cargo mutants`, any word containing
+`mutant` / `mutation`, such as `npm run test:mutation`) starts at
+`mutation_initial_weight`; a test runner (`npm test`, `npm run test` /
+`test:*`, `vitest`, `jest`, `mocha`, `playwright`, `pytest`, `cargo
+test` / `nextest`, `go test`, `dart test`, `flutter test`) at
+`test_initial_weight`. Once a run has been measured, the learned weight
+takes over.
 
 ## How it works
 

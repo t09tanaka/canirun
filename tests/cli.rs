@@ -280,6 +280,33 @@ fn front_jumps_the_queue() {
 }
 
 #[test]
+fn front_waits_briefly_on_an_overloaded_machine() {
+    // A factor this small makes any non-zero load average "overloaded".
+    let env = TestEnv::new().with_config(
+        "budget = 2\nmemory_reserve_mib = 0\nfront_overload_factor = 0.0001\nfront_overload_max_wait_secs = 2\n",
+    );
+    let dir = env.marker_dir();
+    let mut first = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "first", "4"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().iter().any(|e| e["state"] == "running")
+    }));
+    let queued = Instant::now();
+    let front = env.spawn_exec(
+        &["--front", "--weight", "1"],
+        &marker_script(&dir, "front", "0"),
+    );
+    let out = front.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let waited = queued.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("overloaded: load"), "{err}");
+    assert!(waited >= Duration::from_millis(1900), "{waited:?}");
+    assert!(first.wait().unwrap().success());
+    // It gave up on the guard rather than waiting for `first` to finish.
+    assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("first.end")));
+}
+
+#[test]
 fn killed_waiting_head_is_reaped_and_queue_moves_on() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();
@@ -577,6 +604,28 @@ fn wrapped_commands_share_the_key_of_their_heavy_command() {
 
     let text = stdout(&env.run(&["history"]));
     assert!(text.contains("key: npx tool"), "{text}");
+}
+
+#[test]
+fn test_runners_and_mutation_tools_start_heavier() {
+    let env = TestEnv::new()
+        .with_config("budget = 8\n[[pattern]]\nmatch = \"*jest*\"\ninitial_weight = 3\n");
+    let first_weight = |args: &[&str]| {
+        let mut c = env.cmd();
+        with_fake_npx(&env, &mut c);
+        let out = c.arg("exec").arg("--").args(args).output().unwrap();
+        assert!(out.status.success());
+        let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(hist.lines().last().unwrap()).unwrap();
+        last["weight_used"].as_u64().unwrap()
+    };
+    assert_eq!(first_weight(&["npx", "vitest", "run"]), 4);
+    assert_eq!(
+        first_weight(&["sh", "-c", "npx stryker run > /dev/null"]),
+        6
+    );
+    assert_eq!(first_weight(&["npx", "jest"]), 3, "a pattern overrides");
+    assert_eq!(first_weight(&["npx", "tool"]), 2, "default_weight");
 }
 
 #[test]

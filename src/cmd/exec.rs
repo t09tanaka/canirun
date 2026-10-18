@@ -80,7 +80,14 @@ pub fn plan(cfg: &Config, opts: &Opts) -> Result<Plan> {
     let recs = history::for_key(&paths::history_file(), &key.hash)?;
     let records: Vec<Measurement> = recs.iter().map(Record::measurement).collect();
     let walls: Vec<f64> = recs.iter().map(|r| r.wall_secs).collect();
-    let hint = cfg.hint_for(&key.argv);
+    // An explicit `--key` names the history, not the work: classify the
+    // command itself.
+    let kind_of = if opts.key.is_some() {
+        &key.argv
+    } else {
+        &key.key_argv
+    };
+    let hint = cfg.hint_for_key(&key.argv, kind_of);
     let (weight, _source) =
         weight::derive_weight(opts.weight, hint, &records, cfg.default_weight, cfg.budget);
     Ok(Plan {
@@ -150,6 +157,8 @@ pub fn run_gated(
         memory_reserve: cfg.memory_reserve_bytes(),
         cpu_threshold: cfg.cpu_threshold(),
         cpu_guard_max_wait_secs: cfg.cpu_guard_max_wait_secs as f64,
+        front_overload_load: cfg.front_overload_load(),
+        front_overload_max_wait_secs: cfg.front_overload_max_wait_secs as f64,
     };
 
     // Register as waiting. The lease is taken before the ledger entry so
@@ -311,7 +320,7 @@ pub fn run_gated(
             key: key.hash,
             repo: key.repo,
             subdir: key.subdir,
-            key_argv: if key.key_argv == key.argv {
+            key_argv: if key.key_argv == key.argv || opts.key.is_some() {
                 String::new()
             } else {
                 key.key_argv
@@ -355,6 +364,7 @@ enum Topic {
     Budget,
     Memory,
     Cpu,
+    Overload,
 }
 
 fn topic_of(reason: &Reason) -> Topic {
@@ -363,6 +373,7 @@ fn topic_of(reason: &Reason) -> Topic {
         Reason::Budget { .. } => Topic::Budget,
         Reason::Memory { .. } => Topic::Memory,
         Reason::Cpu { .. } => Topic::Cpu,
+        Reason::Overload { .. } => Topic::Overload,
     }
 }
 
@@ -404,6 +415,9 @@ pub fn describe(reason: &Reason) -> String {
             busy * 100.0,
             threshold * 100.0
         ),
+        Reason::Overload { load, limit } => {
+            format!("overloaded: load {load:.0}, limit {limit:.0}; --front waits briefly")
+        }
     }
 }
 
