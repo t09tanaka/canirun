@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-18
+
 ### Added
 
 - **Running commands are charged what they actually use.** Each running
