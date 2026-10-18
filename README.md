@@ -46,7 +46,11 @@ saturated.
   not go through canirun cannot hold the queue indefinitely. On a
   machine that is badly overloaded (load average at least
   `front_overload_factor` x budget) a `--front` entry still waits, for at
-  most `front_overload_max_wait_secs` (30 s).
+  most `front_overload_max_wait_secs` (30 s). Likewise, measured use
+  beyond the running entries' weights holds a `--front` entry for at most
+  that long; after that only declared weights count for it. (The load
+  average is the trigger because measured cores cannot exceed the core
+  count, so "twice the budget" is only visible as runnable processes.)
 - **Measured, not just declared.** While a command runs, canirun samples
   the CPU its whole process tree uses. A command declared (or learned) at
   weight 2 that is using 5 cores takes 5 from the budget until it slows

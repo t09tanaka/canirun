@@ -32,7 +32,9 @@ the minor version).
   a progress line `overloaded: load N, limit M`. Previously `--front`
   skipped every CPU check, so a pre-push hook could start on a machine
   already running at many times its cores. Set the factor to 0 for the
-  old behaviour.
+  old behaviour. The same cap bounds how long measured use beyond the
+  running entries' weights can hold a `--front` entry; after it, only
+  declared weights count for that entry.
 
 ### Changed
 

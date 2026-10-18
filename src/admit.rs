@@ -103,6 +103,15 @@ pub fn charged(e: &QueueEntry) -> u32 {
     e.weight.max(measured)
 }
 
+/// Sum of the declared weights of running entries.
+pub fn declared_budget(entries: &[QueueEntry]) -> u32 {
+    entries
+        .iter()
+        .filter(|e| e.state == State::Running)
+        .map(|e| e.weight)
+        .sum()
+}
+
 /// Sum of what running entries take from the budget (see [`charged`]).
 pub fn used_budget(entries: &[QueueEntry]) -> u32 {
     entries
@@ -142,7 +151,14 @@ pub fn admit(
         return Decision::Wait(Reason::NotHead { ahead: pos });
     }
     let candidate = order[0];
-    let used = used_budget(entries);
+    // A `--front` head is held by what running entries measure beyond
+    // their weight only for `front_overload_max_wait_secs`; after that the
+    // declared weights decide, as before measurement existed.
+    let used = if candidate.front && waited_secs >= limits.front_overload_max_wait_secs {
+        declared_budget(entries)
+    } else {
+        used_budget(entries)
+    };
     let weight = candidate.weight.min(limits.budget).max(1);
     if used + weight > limits.budget {
         return Decision::Wait(Reason::Budget {
@@ -583,6 +599,46 @@ mod tests {
         // charged.
         let q = [using(e("w", State::Waiting, false, 1, 1), 9.0)];
         assert_eq!(used_budget(&q), 0);
+    }
+
+    #[test]
+    fn front_is_held_by_measured_use_only_for_a_while() {
+        let q = [
+            using(e("r", State::Running, false, 1, 1), 12.0),
+            e("f", State::Waiting, true, 2, 2),
+        ];
+        let held = Decision::Wait(Reason::Budget {
+            used: 12,
+            budget: 12,
+        });
+        assert_eq!(admit(&q, "f", 0, 0.0, LIMITS, Some(calm())), held);
+        assert_eq!(admit(&q, "f", 0, 29.9, LIMITS, Some(calm())), held);
+        assert_eq!(
+            admit(&q, "f", 0, 30.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        // Declared weights still hold it however long it waits.
+        let full = [
+            e("r", State::Running, false, 11, 1),
+            e("f", State::Waiting, true, 2, 2),
+        ];
+        assert_eq!(
+            admit(&full, "f", 0, 999.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Budget {
+                used: 11,
+                budget: 12
+            })
+        );
+        // A normal entry is held by measured use for as long as it lasts.
+        let n = [
+            using(e("r", State::Running, false, 1, 1), 12.0),
+            e("w", State::Waiting, false, 2, 2),
+        ];
+        assert!(matches!(
+            admit(&n, "w", 0, 999.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Budget { .. })
+        ));
+        assert_eq!(declared_budget(&n), 1);
     }
 
     #[test]
