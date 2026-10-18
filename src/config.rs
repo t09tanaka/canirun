@@ -41,6 +41,11 @@ pub struct Config {
     pub cpu_threshold_percent: f64,
     /// After waiting this long the CPU guard stops holding the head.
     pub cpu_guard_max_wait_secs: u64,
+    /// A `--front` entry waits while the load average is at or above
+    /// `budget` times this (0 disables)...
+    pub front_overload_factor: f64,
+    /// ...for at most this long.
+    pub front_overload_max_wait_secs: u64,
     /// `gc` removes finished job files older than this.
     pub jobs_keep_days: u64,
     /// A job with no `wait`er is cancelled once this many seconds have
@@ -69,6 +74,8 @@ impl Default for Config {
             memory_reserve_mib: 2048,
             cpu_threshold_percent: 85.0,
             cpu_guard_max_wait_secs: 120,
+            front_overload_factor: 2.0,
+            front_overload_max_wait_secs: 30,
             jobs_keep_days: 7,
             jobs_orphan_grace_secs: 30,
             patterns: Vec::new(),
@@ -99,6 +106,11 @@ impl Config {
         if !(self.cpu_threshold_percent > 0.0 && self.cpu_threshold_percent <= 100.0) {
             return Err(Error::Config(
                 "cpu_threshold_percent must be in (0, 100]".into(),
+            ));
+        }
+        if self.front_overload_factor.is_nan() || self.front_overload_factor < 0.0 {
+            return Err(Error::Config(
+                "front_overload_factor must be 0 or more".into(),
             ));
         }
         for p in &self.patterns {
@@ -148,6 +160,11 @@ impl Config {
 
     pub fn cpu_threshold(&self) -> f64 {
         self.cpu_threshold_percent / 100.0
+    }
+
+    /// Load average at which a `--front` entry is held (0: never).
+    pub fn front_overload_load(&self) -> f64 {
+        self.front_overload_factor * f64::from(self.budget)
     }
 
     pub fn memory_reserve_bytes(&self) -> u64 {
@@ -246,6 +263,13 @@ min_weight = 2
         assert!(Config::parse("cpu_threshold_percent = 0").is_err());
         assert!(Config::parse("cpu_threshold_percent = 101").is_err());
         assert!(Config::parse("cpu_threshold_percent = 100").is_ok());
+        assert!(Config::parse("front_overload_factor = -1").is_err());
+        let c = Config::parse("budget = 12\nfront_overload_factor = 0").unwrap();
+        assert_eq!(c.front_overload_load(), 0.0);
+        assert_eq!(
+            Config::parse("budget = 12").unwrap().front_overload_load(),
+            24.0
+        );
     }
 
     #[test]

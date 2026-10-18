@@ -157,6 +157,8 @@ pub fn run_gated(
         memory_reserve: cfg.memory_reserve_bytes(),
         cpu_threshold: cfg.cpu_threshold(),
         cpu_guard_max_wait_secs: cfg.cpu_guard_max_wait_secs as f64,
+        front_overload_load: cfg.front_overload_load(),
+        front_overload_max_wait_secs: cfg.front_overload_max_wait_secs as f64,
     };
 
     // Register as waiting. The lease is taken before the ledger entry so
@@ -362,6 +364,7 @@ enum Topic {
     Budget,
     Memory,
     Cpu,
+    Overload,
 }
 
 fn topic_of(reason: &Reason) -> Topic {
@@ -370,6 +373,7 @@ fn topic_of(reason: &Reason) -> Topic {
         Reason::Budget { .. } => Topic::Budget,
         Reason::Memory { .. } => Topic::Memory,
         Reason::Cpu { .. } => Topic::Cpu,
+        Reason::Overload { .. } => Topic::Overload,
     }
 }
 
@@ -411,6 +415,9 @@ pub fn describe(reason: &Reason) -> String {
             busy * 100.0,
             threshold * 100.0
         ),
+        Reason::Overload { load, limit } => {
+            format!("overloaded: load {load:.0}, limit {limit:.0}; --front waits briefly")
+        }
     }
 }
 

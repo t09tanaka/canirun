@@ -33,6 +33,8 @@ pub struct LiveSnapshot {
     pub available_memory: u64,
     /// Global CPU busy fraction, 0.0..=1.0, sampled just now.
     pub cpu_busy: f64,
+    /// One-minute load average (runnable processes), 0.0 when unknown.
+    pub load_avg: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +45,11 @@ pub struct Limits {
     pub cpu_threshold: f64,
     /// After waiting this long, the CPU guard no longer holds the head.
     pub cpu_guard_max_wait_secs: f64,
+    /// A `--front` head is held while the load average is at or above this
+    /// (0 disables the overload guard)...
+    pub front_overload_load: f64,
+    /// ...for at most this long.
+    pub front_overload_max_wait_secs: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +69,11 @@ pub enum Reason {
     Cpu {
         busy: f64,
         threshold: f64,
+    },
+    /// A `--front` head held briefly because the machine is overloaded.
+    Overload {
+        load: f64,
+        limit: f64,
     },
 }
 
@@ -109,7 +121,9 @@ pub fn used_budget(entries: &[QueueEntry]) -> u32 {
 /// running) is applied here so it is covered by unit tests. The CPU guard
 /// is skipped for `--front` entries (a human is waiting, and load canirun
 /// does not manage must not hold them) and once `cpu_guard_max_wait_secs`
-/// has elapsed; the memory guard always applies.
+/// has elapsed. A `--front` entry is instead held by the overload guard,
+/// while the load average is at or above `front_overload_load`, for at
+/// most `front_overload_max_wait_secs`. The memory guard always applies.
 pub fn admit(
     entries: &[QueueEntry],
     me: &str,
@@ -150,8 +164,18 @@ pub fn admit(
             need,
         });
     }
-    let cpu_guard_applies = !candidate.front && waited_secs < limits.cpu_guard_max_wait_secs;
-    if cpu_guard_applies && live.cpu_busy > limits.cpu_threshold {
+    if candidate.front {
+        let overloaded =
+            limits.front_overload_load > 0.0 && live.load_avg >= limits.front_overload_load;
+        if overloaded && waited_secs < limits.front_overload_max_wait_secs {
+            return Decision::Wait(Reason::Overload {
+                load: live.load_avg,
+                limit: limits.front_overload_load,
+            });
+        }
+        return Decision::Admitted;
+    }
+    if waited_secs < limits.cpu_guard_max_wait_secs && live.cpu_busy > limits.cpu_threshold {
         return Decision::Wait(Reason::Cpu {
             busy: live.cpu_busy,
             threshold: limits.cpu_threshold,
@@ -183,11 +207,14 @@ mod tests {
         memory_reserve: 2 << 30,
         cpu_threshold: 0.85,
         cpu_guard_max_wait_secs: 120.0,
+        front_overload_load: 24.0,
+        front_overload_max_wait_secs: 30.0,
     };
     fn calm() -> LiveSnapshot {
         LiveSnapshot {
             available_memory: 64 << 30,
             cpu_busy: 0.1,
+            load_avg: 2.0,
         }
     }
 
@@ -393,11 +420,70 @@ mod tests {
         let low_mem = LiveSnapshot {
             available_memory: 0,
             cpu_busy: 1.0,
+            ..calm()
         };
         assert!(matches!(
             admit(&q, "f", 0, 0.0, LIMITS, Some(low_mem)),
             Decision::Wait(Reason::Memory { .. })
         ));
+    }
+
+    #[test]
+    fn front_waits_briefly_when_the_machine_is_overloaded() {
+        let q = [
+            e("r", State::Running, false, 2, 1),
+            e("f", State::Waiting, true, 2, 2),
+        ];
+        let at = |load_avg| LiveSnapshot {
+            load_avg,
+            cpu_busy: 1.0,
+            ..calm()
+        };
+        assert_eq!(
+            admit(&q, "f", 0, 0.0, LIMITS, Some(at(24.0))),
+            Decision::Wait(Reason::Overload {
+                load: 24.0,
+                limit: 24.0
+            })
+        );
+        assert_eq!(
+            admit(&q, "f", 0, 29.9, LIMITS, Some(at(300.0))),
+            Decision::Wait(Reason::Overload {
+                load: 300.0,
+                limit: 24.0
+            })
+        );
+        assert_eq!(
+            admit(&q, "f", 0, 30.0, LIMITS, Some(at(300.0))),
+            Decision::Admitted
+        );
+        assert_eq!(
+            admit(&q, "f", 0, 0.0, LIMITS, Some(at(23.9))),
+            Decision::Admitted
+        );
+        let off = Limits {
+            front_overload_load: 0.0,
+            ..LIMITS
+        };
+        assert_eq!(
+            admit(&q, "f", 0, 0.0, off, Some(at(300.0))),
+            Decision::Admitted
+        );
+        // Not a front entry: the CPU guard, not the overload guard.
+        let n = [
+            e("r", State::Running, false, 2, 1),
+            e("w", State::Waiting, false, 2, 2),
+        ];
+        assert!(matches!(
+            admit(&n, "w", 0, 0.0, LIMITS, Some(at(300.0))),
+            Decision::Wait(Reason::Cpu { .. })
+        ));
+        // Nothing managed running: the starvation rule still wins.
+        let alone = [e("f", State::Waiting, true, 2, 1)];
+        assert_eq!(
+            admit(&alone, "f", 0, 0.0, LIMITS, Some(at(300.0))),
+            Decision::Admitted
+        );
     }
 
     #[test]
@@ -426,6 +512,7 @@ mod tests {
         let live = LiveSnapshot {
             available_memory: 0,
             cpu_busy: 1.0,
+            ..calm()
         };
         assert_eq!(
             admit(&q, "w", 8 << 30, 0.0, LIMITS, Some(live)),

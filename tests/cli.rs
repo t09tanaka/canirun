@@ -280,6 +280,33 @@ fn front_jumps_the_queue() {
 }
 
 #[test]
+fn front_waits_briefly_on_an_overloaded_machine() {
+    // A factor this small makes any non-zero load average "overloaded".
+    let env = TestEnv::new().with_config(
+        "budget = 2\nmemory_reserve_mib = 0\nfront_overload_factor = 0.0001\nfront_overload_max_wait_secs = 2\n",
+    );
+    let dir = env.marker_dir();
+    let mut first = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "first", "4"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().iter().any(|e| e["state"] == "running")
+    }));
+    let queued = Instant::now();
+    let front = env.spawn_exec(
+        &["--front", "--weight", "1"],
+        &marker_script(&dir, "front", "0"),
+    );
+    let out = front.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let waited = queued.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("overloaded: load"), "{err}");
+    assert!(waited >= Duration::from_millis(1900), "{waited:?}");
+    assert!(first.wait().unwrap().success());
+    // It gave up on the guard rather than waiting for `first` to finish.
+    assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("first.end")));
+}
+
+#[test]
 fn killed_waiting_head_is_reaped_and_queue_moves_on() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();
