@@ -1,6 +1,7 @@
 //! `config.toml` loading with defaults (spec "Configuration").
 
 use crate::error::{Error, Result};
+use crate::key::{classify, Kind};
 use crate::weight::PatternHint;
 use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,11 @@ pub struct Pattern {
 pub struct Config {
     pub budget: u32,
     pub default_weight: u32,
+    /// First weight of a test runner nothing has been learned about.
+    pub test_initial_weight: u32,
+    /// First weight of a mutation-testing run nothing has been learned
+    /// about.
+    pub mutation_initial_weight: u32,
     pub history_keep: usize,
     pub progress_interval_secs: u64,
     /// When stderr is not a terminal: a progress line only when the wait
@@ -55,6 +61,8 @@ impl Default for Config {
         Config {
             budget: logical_cpus(),
             default_weight: 2,
+            test_initial_weight: 4,
+            mutation_initial_weight: 6,
             history_keep: 200,
             progress_interval_secs: 5,
             progress_interval_secs_non_tty: 60,
@@ -124,6 +132,20 @@ impl Config {
         PatternHint::default()
     }
 
+    /// [`Config::hint_for`] the argv string, with the initial weight of
+    /// the key's [`Kind`] when no pattern sets one.
+    pub fn hint_for_key(&self, argv: &str, key_argv: &str) -> PatternHint {
+        let mut hint = self.hint_for(argv);
+        if hint.initial_weight.is_none() {
+            hint.initial_weight = match classify(key_argv) {
+                Kind::Tests => Some(self.test_initial_weight),
+                Kind::Mutation => Some(self.mutation_initial_weight),
+                Kind::Other => None,
+            };
+        }
+        hint
+    }
+
     pub fn cpu_threshold(&self) -> f64 {
         self.cpu_threshold_percent / 100.0
     }
@@ -171,6 +193,45 @@ weight = 1
             Some(4)
         );
         assert_eq!(c.hint_for("npm run test:unit").min_weight, None);
+    }
+
+    #[test]
+    fn known_kinds_start_heavier_unless_a_pattern_says_otherwise() {
+        let c = Config::parse(
+            r#"
+test_initial_weight = 3
+[[pattern]]
+match = "*e2e*"
+initial_weight = 8
+[[pattern]]
+match = "*lint*"
+weight = 1
+[[pattern]]
+match = "*unit*"
+min_weight = 2
+"#,
+        )
+        .unwrap();
+        let init = |argv: &str, key: &str| c.hint_for_key(argv, key).initial_weight;
+        assert_eq!(init("npm test", "npm test"), Some(3));
+        assert_eq!(init("x", "npx stryker run"), Some(6));
+        assert_eq!(init("npm run build", "npm run build"), None);
+        assert_eq!(init("npm run test:e2e", "npm run test:e2e"), Some(8));
+        assert_eq!(init("npm run test:unit", "npm run test:unit"), Some(3));
+        assert_eq!(
+            c.hint_for_key("npm run test:unit", "npm run test:unit")
+                .min_weight,
+            Some(2)
+        );
+        assert_eq!(
+            c.hint_for_key("npm run lint", "npm run lint").weight,
+            Some(1)
+        );
+        let d = Config::default();
+        assert_eq!(
+            d.hint_for_key("cargo test", "cargo test").initial_weight,
+            Some(4)
+        );
     }
 
     #[test]

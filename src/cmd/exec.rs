@@ -80,7 +80,14 @@ pub fn plan(cfg: &Config, opts: &Opts) -> Result<Plan> {
     let recs = history::for_key(&paths::history_file(), &key.hash)?;
     let records: Vec<Measurement> = recs.iter().map(Record::measurement).collect();
     let walls: Vec<f64> = recs.iter().map(|r| r.wall_secs).collect();
-    let hint = cfg.hint_for(&key.argv);
+    // An explicit `--key` names the history, not the work: classify the
+    // command itself.
+    let kind_of = if opts.key.is_some() {
+        &key.argv
+    } else {
+        &key.key_argv
+    };
+    let hint = cfg.hint_for_key(&key.argv, kind_of);
     let (weight, _source) =
         weight::derive_weight(opts.weight, hint, &records, cfg.default_weight, cfg.budget);
     Ok(Plan {
@@ -311,7 +318,7 @@ pub fn run_gated(
             key: key.hash,
             repo: key.repo,
             subdir: key.subdir,
-            key_argv: if key.key_argv == key.argv {
+            key_argv: if key.key_argv == key.argv || opts.key.is_some() {
                 String::new()
             } else {
                 key.key_argv

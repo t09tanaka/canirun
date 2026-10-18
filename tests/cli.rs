@@ -580,6 +580,28 @@ fn wrapped_commands_share_the_key_of_their_heavy_command() {
 }
 
 #[test]
+fn test_runners_and_mutation_tools_start_heavier() {
+    let env = TestEnv::new()
+        .with_config("budget = 8\n[[pattern]]\nmatch = \"*jest*\"\ninitial_weight = 3\n");
+    let first_weight = |args: &[&str]| {
+        let mut c = env.cmd();
+        with_fake_npx(&env, &mut c);
+        let out = c.arg("exec").arg("--").args(args).output().unwrap();
+        assert!(out.status.success());
+        let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(hist.lines().last().unwrap()).unwrap();
+        last["weight_used"].as_u64().unwrap()
+    };
+    assert_eq!(first_weight(&["npx", "vitest", "run"]), 4);
+    assert_eq!(
+        first_weight(&["sh", "-c", "npx stryker run > /dev/null"]),
+        6
+    );
+    assert_eq!(first_weight(&["npx", "jest"]), 3, "a pattern overrides");
+    assert_eq!(first_weight(&["npx", "tool"]), 2, "default_weight");
+}
+
+#[test]
 fn shell_string_without_a_heavy_command_keeps_its_own_key() {
     let env = TestEnv::new();
     env.run(&["exec", "--", "sh", "-c", "true 1"]);
