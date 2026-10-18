@@ -230,11 +230,11 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
     let env = TestEnv::new()
         .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     let dir = env.marker_dir();
-    // Declared weight 1, but four workers each burning 4 s of their own
+    // Declared weight 1, but six workers each burning 4 s of their own
     // CPU time. Bounded by CPU time, so load only stretches the wall time.
     let now = "perl -MTime::HiRes=time -e 'printf \"%.0f\\n\", time*1e9'";
     let burn = format!(
-        "for i in 1 2 3 4; do perl -e '1 while (times)[0] < 4' & done; wait; {now} > {}",
+        "for i in 1 2 3 4 5 6; do perl -e '1 while (times)[0] < 4' & done; wait; {now} > {}",
         dir.join("hog.end").display()
     );
     let mut hog = env.spawn_exec(&["--weight", "1"], &burn);
@@ -242,7 +242,7 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
         wait_until(Duration::from_secs(20), || {
             env.entries()
                 .iter()
-                .any(|e| e["using"].as_f64().unwrap_or(0.0) >= 1.5)
+                .any(|e| e["using"].as_f64().unwrap_or(0.0) >= 2.5)
         }),
         "the running tree was never measured: {:?}",
         env.entries()
