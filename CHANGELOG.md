@@ -7,6 +7,12 @@ the minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- The `front_jumps_the_queue` test no longer fails on a heavily loaded
+  machine: its first job now holds the slot until the test releases it
+  instead of sleeping for a fixed second.
+
 ## [0.4.0] - 2026-10-18
 
 ### Added

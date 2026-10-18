@@ -112,6 +112,17 @@ fn marker_script(dir: &Path, name: &str, secs: &str) -> String {
     )
 }
 
+/// A script that runs until the test creates `<dir>/<name>.release` (giving
+/// up after 60 s so a failed test cannot leave it behind), so the job holds
+/// its slot for as long as the test needs rather than for a fixed time.
+fn gated_script(dir: &Path, name: &str) -> String {
+    let p = dir.join(name);
+    format!(
+        "i=0; while [ ! -e {p}.release ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done",
+        p = p.display()
+    )
+}
+
 fn read_ns(p: &Path) -> u128 {
     fs::read_to_string(p).unwrap().trim().parse().unwrap()
 }
@@ -269,7 +280,9 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
 fn front_jumps_the_queue() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();
-    let mut first = env.spawn_exec(&[], &marker_script(&dir, "first", "1"));
+    // `first` holds the only slot until released, so both others are still
+    // waiting when `status` runs, however slow the machine is.
+    let mut first = env.spawn_exec(&[], &gated_script(&dir, "first"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
@@ -278,6 +291,7 @@ fn front_jumps_the_queue() {
     let mut front = env.spawn_exec(&["--front"], &marker_script(&dir, "front", "0.2"));
     assert!(wait_until(Duration::from_secs(5), || env.entries().len() == 3));
     let status = stdout(&env.run(&["status"]));
+    fs::write(dir.join("first.release"), "").unwrap();
     assert!(status.contains("[front]"), "{status}");
     for c in [&mut first, &mut normal, &mut front] {
         assert!(c.wait().unwrap().success());
