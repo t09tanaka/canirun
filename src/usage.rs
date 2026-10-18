@@ -8,7 +8,7 @@
 
 use crate::ledger::Ledger;
 use crate::{lock, paths};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -16,7 +16,28 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// How often the tree is sampled; each sample is the average over this
 /// interval.
-pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What is reported is the peak of this many recent samples, so a
+/// momentary dip (a worker between test files) does not free the budget.
+pub const PEAK_WINDOW: usize = 3;
+
+/// The peak of the last [`PEAK_WINDOW`] samples.
+#[derive(Debug, Default)]
+pub struct RecentPeak {
+    samples: VecDeque<f64>,
+}
+
+impl RecentPeak {
+    /// Add a sample and return the current peak.
+    pub fn push(&mut self, cores: f64) -> f64 {
+        if self.samples.len() == PEAK_WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(cores);
+        self.samples.iter().copied().fold(0.0, f64::max)
+    }
+}
 
 /// One process as far as tree accounting cares.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,6 +132,7 @@ fn sample_loop(id: &str, root: u32, stop: &mpsc::Receiver<()>) {
     sysinfo::set_open_files_limit(0);
     let kind = ProcessRefreshKind::nothing().with_cpu();
     let mut sys = System::new();
+    let mut peak = RecentPeak::default();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
     loop {
         match stop.recv_timeout(SAMPLE_INTERVAL) {
@@ -127,7 +149,7 @@ fn sample_loop(id: &str, root: u32, stop: &mpsc::Receiver<()>) {
                 cpu_percent: p.cpu_usage(),
             })
             .collect();
-        record(id, tree_cores(&procs, root));
+        record(id, peak.push(tree_cores(&procs, root)));
     }
 }
 
@@ -169,6 +191,16 @@ mod tests {
         assert!((tree_cores(&procs, 10) - 4.0).abs() < 1e-9);
         assert!((tree_cores(&procs, 12) - 0.5).abs() < 1e-9);
         assert_eq!(tree_cores(&procs, 99), 0.0);
+    }
+
+    #[test]
+    fn peak_covers_the_last_few_samples() {
+        let mut p = RecentPeak::default();
+        assert_eq!(p.push(4.0), 4.0);
+        assert_eq!(p.push(0.5), 4.0);
+        assert_eq!(p.push(1.0), 4.0);
+        assert_eq!(p.push(2.0), 2.0);
+        assert_eq!(p.push(0.0), 2.0);
     }
 
     #[test]

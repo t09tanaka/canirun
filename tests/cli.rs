@@ -226,6 +226,40 @@ fn head_reserves_and_light_entry_does_not_overtake() {
 }
 
 #[test]
+fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
+    let env = TestEnv::new()
+        .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    // Declared weight 1, but four workers each burning 4 s of their own
+    // CPU time. Bounded by CPU time, so load only stretches the wall time.
+    let now = "perl -MTime::HiRes=time -e 'printf \"%.0f\\n\", time*1e9'";
+    let burn = format!(
+        "for i in 1 2 3 4; do perl -e '1 while (times)[0] < 4' & done; wait; {now} > {}",
+        dir.join("hog.end").display()
+    );
+    let mut hog = env.spawn_exec(&["--weight", "1"], &burn);
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            env.entries()
+                .iter()
+                .any(|e| e["using"].as_f64().unwrap_or(0.0) >= 1.5)
+        }),
+        "the running tree was never measured: {:?}",
+        env.entries()
+    );
+    let status = stdout(&env.run(&["status"]));
+    assert!(status.contains("w1  (using "), "{status}");
+    // By declared weight (1 + 1 <= 2) this would start at once.
+    let mut next = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "next", "0"));
+    assert!(hog.wait().unwrap().success());
+    assert!(next.wait().unwrap().success());
+    assert!(
+        read_ns(&dir.join("next.start")) >= read_ns(&dir.join("hog.end")),
+        "started while the measured tree filled the budget"
+    );
+}
+
+#[test]
 fn front_jumps_the_queue() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();

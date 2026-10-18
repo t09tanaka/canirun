@@ -260,7 +260,11 @@ pub fn run_gated(
             let last = last_progress.map(|(t, last)| (t.elapsed(), last));
             if cadence.due(last, topic) {
                 let running = queue.iter().filter(|e| e.state == State::Running).count();
-                let used = admit::used_budget(&queue);
+                // Phase 2 may have decided on a fresher ledger.
+                let used = match reason {
+                    Reason::Budget { used, .. } => *used,
+                    _ => admit::used_budget(&queue),
+                };
                 eprintln!(
                     "canirun: waiting {} ({}) — running {running} ({used}/{} used){}{}",
                     fmt_duration(enqueued.elapsed()),

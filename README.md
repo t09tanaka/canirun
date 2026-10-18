@@ -44,6 +44,11 @@ saturated.
   never paused or killed. `--front` entries skip the CPU brake, and any
   head gives up on it after `cpu_guard_max_wait_secs`, so load that does
   not go through canirun cannot hold the queue indefinitely.
+- **Measured, not just declared.** While a command runs, canirun samples
+  the CPU its whole process tree uses. A command declared (or learned) at
+  weight 2 that is using 5 cores takes 5 from the budget until it slows
+  down, so the next start waits instead of piling on. The running
+  command itself is never slowed or stopped.
 - **Crash-safe queue.** Each waiting or running entry holds an `flock` on
   its own lease file. A Ctrl-C'd, SIGKILLed, or crashed `canirun` — waiting
   or running — vanishes from the ledger on the next poll. No cleanup step,
@@ -142,17 +147,20 @@ budget 10/12 used
 machine 31.2 GiB available, cpu 71% busy
 
 running (3)
-    48211  w4      2:14  webapp: npm run test:e2e
-    48190  w4      1:03  webapp: npm run test:e2e
-    48260  w2      0:20  api: npm run test:unit
+    48211  w4  (using 3.8)     2:14  webapp: npm run test:e2e
+    48190  w4  (using 4.1)     1:03  webapp: npm run test:e2e
+    48260  w2  (using 0.9)     0:20  api: npm run test:unit
 
 waiting (2)
     48302  w6      0:41  [front] api: npx stryker run
     48310  w1      0:40  webapp: npm run lint
 ```
 
-`--json` dumps the ledger. Dead entries are reaped first, so the view is
-accurate without a daemon.
+`(using N)` is the cores the running command's process tree used
+recently (see "How it works"); `budget X/Y used` counts each running
+entry at its weight or at that measurement, whichever is more. `--json`
+dumps the ledger. Dead entries are reaped first, so the view is accurate
+without a daemon.
 
 ### `canirun history [--key K] [--json] [--limit N] [-- <command>]`
 
@@ -262,6 +270,16 @@ is already running — available memory must cover its predicted RSS plus
 the reserve and CPU usage must be under the threshold. When nothing
 managed is running the live guards are skipped, so a machine kept busy by
 processes canirun does not manage cannot hold the queue forever.
+
+While a command runs, a background thread in its `canirun` samples the
+CPU used by the command and all of its descendants once a second and
+writes the peak of the last three samples to the ledger entry as
+`using`. Admission charges each running entry `max(weight,
+round(using))`, so a command that uses far more than its weight holds the
+next start; a new or idle one is charged its weight. When the tree cannot
+be measured, the declared weight is used. Measuring does not touch the
+command. CPU spent in a Docker daemon or VM is not part of the tree
+(see "Known blind spot").
 
 Estimates are a plain simulation of that queue against the budget using
 each entry's learned wall time (max of its last five usable runs; 60 s and
