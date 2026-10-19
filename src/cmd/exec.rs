@@ -387,6 +387,7 @@ fn holders(ledger: &Ledger) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Topic {
     Queue(usize),
+    Reserved(usize),
     Budget,
     Memory,
     Cpu,
@@ -395,7 +396,8 @@ enum Topic {
 
 fn topic_of(reason: &Reason) -> Topic {
     match reason {
-        Reason::NotHead { ahead } | Reason::Reserved { ahead } => Topic::Queue(*ahead),
+        Reason::NotHead { ahead } => Topic::Queue(*ahead),
+        Reason::Reserved { ahead } => Topic::Reserved(*ahead),
         Reason::Budget { .. } => Topic::Budget,
         Reason::Memory { .. } => Topic::Memory,
         Reason::Cpu { .. } => Topic::Cpu,
@@ -507,5 +509,10 @@ mod tests {
             Topic::Budget
         );
         assert_eq!(topic_of(&Reason::NotHead { ahead: 3 }), Topic::Queue(3));
+        // Backfill closing is a change worth a line of its own.
+        assert_ne!(
+            topic_of(&Reason::Reserved { ahead: 3 }),
+            topic_of(&Reason::NotHead { ahead: 3 })
+        );
     }
 }

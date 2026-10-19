@@ -230,6 +230,8 @@ fn head_reserves_and_light_entry_does_not_overtake() {
             .iter()
             .any(|e| e["weight"] == 2 && e["state"] == "waiting")
     }));
+    // Nothing has been learned about `light`, so it is not short and may not
+    // backfill (see short_command_backfills_behind_a_head_that_does_not_fit).
     let mut light = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "light", "0.3"));
     assert!(big.wait().unwrap().success());
     assert!(heavy.wait().unwrap().success());
