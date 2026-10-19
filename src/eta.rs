@@ -78,21 +78,26 @@ pub fn estimate(items: &[Timed], limits: Limits, target: &str) -> Option<Estimat
         .map(|t| t.entry.clone())
         .collect();
     let mut now: f64 = 0.0;
-    // Each pass starts whatever admission lets start at `now`, then
-    // retires at least the earliest-finishing entry, so `len + 1` passes
-    // always suffice; a loop that needs more cannot make progress and
-    // yields None (as does a target that is not in the queue).
+    // Each pass starts whatever admission lets start at `now` (at most
+    // one per entry), then retires at least the earliest-finishing entry,
+    // so `len + 1` passes always suffice. When nothing is left running
+    // the target was not in the queue; a loop that needs more passes
+    // cannot make progress. Both yield None.
     for _ in 0..=items.len() {
-        loop {
+        for _ in 0..=items.len() {
+            let shifted: Vec<QueueEntry> = waiting
+                .iter()
+                .map(|w| QueueEntry {
+                    waited_secs: w.waited_secs + now,
+                    ..w.clone()
+                })
+                .collect();
             let entries: Vec<QueueEntry> = running
                 .iter()
                 .map(|(_, e)| e.clone())
-                .chain(waiting.iter().map(|w| QueueEntry {
-                    waited_secs: w.waited_secs + now,
-                    ..w.clone()
-                }))
+                .chain(shifted.iter().cloned())
                 .collect();
-            let order = queue_order(&entries);
+            let order = queue_order(&shifted);
             let Some(pos) = order.iter().position(|q| {
                 admit(&entries, &q.id, 0, q.waited_secs, limits, None) == Decision::Admitted
             }) else {
@@ -112,16 +117,18 @@ pub fn estimate(items: &[Timed], limits: Limits, target: &str) -> Option<Estimat
             }
             let started = QueueEntry {
                 state: State::Running,
-                waited_secs: 0.0,
                 backfilled: pos > 0,
                 ..q.clone()
             };
             waiting.retain(|w| w.id != started.id);
             running.push((finish, started));
         }
-        let (next, _) = running
+        let Some((next, _)) = running
             .iter()
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))?;
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        else {
+            break;
+        };
         now = now.max(*next);
         running.retain(|(f, _)| *f > now);
     }
@@ -258,6 +265,51 @@ mod tests {
         assert_eq!(estimate(&old, lim(4), "b1").unwrap().start_in, 0.0);
         assert_eq!(estimate(&old, lim(4), "head").unwrap().start_in, 50.0);
         assert_eq!(estimate(&old, lim(4), "b2").unwrap().start_in, 55.0);
+    }
+
+    #[test]
+    fn running_entries_are_simulated_at_their_declared_weight() {
+        let mut r = t("r", State::Running, 1, 1, 0.0, Some(10.0));
+        r.entry.using = Some(12.0);
+        let items = [r, t("w", State::Waiting, 2, 2, 0.0, Some(1.0))];
+        assert_eq!(estimate(&items, lim(4), "w").unwrap().start_in, 0.0);
+    }
+
+    #[test]
+    fn zero_budget_counts_as_one() {
+        let items = [t("w", State::Waiting, 3, 1, 0.0, Some(1.0))];
+        assert_eq!(estimate(&items, lim(0), "w").unwrap().start_in, 0.0);
+    }
+
+    #[test]
+    fn a_head_that_started_normally_is_not_counted_as_backfill() {
+        // h1 starts as the head. h2 then waits on h1, which is not a
+        // backfill, so its long wait does not stop `s` from passing it.
+        let mut h2 = t("h2", State::Waiting, 4, 2, 0.0, Some(5.0));
+        h2.entry.waited_secs = 400.0;
+        let items = [
+            t("h1", State::Waiting, 2, 1, 0.0, Some(100.0)),
+            h2,
+            t("s", State::Waiting, 1, 3, 0.0, Some(10.0)),
+        ];
+        assert_eq!(estimate(&items, lim(4), "s").unwrap().start_in, 0.0);
+        assert_eq!(estimate(&items, lim(4), "h2").unwrap().start_in, 100.0);
+    }
+
+    #[test]
+    fn the_cap_counts_waiting_time_from_now_on() {
+        // At 299.5 the head (waited 1 s before) has waited 300.5 s and is
+        // held up only by b1, so b2 may not pass it.
+        let mut head = t("head", State::Waiting, 4, 2, 0.0, Some(5.0));
+        head.entry.waited_secs = 1.0;
+        let items = [
+            t("r", State::Running, 2, 1, 0.0, Some(299.5)),
+            head,
+            t("b1", State::Waiting, 1, 3, 0.0, Some(300.0)),
+            t("b2", State::Waiting, 2, 4, 0.0, Some(50.0)),
+        ];
+        assert_eq!(estimate(&items, lim(4), "head").unwrap().start_in, 300.0);
+        assert_eq!(estimate(&items, lim(4), "b2").unwrap().start_in, 305.0);
     }
 
     #[test]
