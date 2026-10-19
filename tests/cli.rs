@@ -242,6 +242,52 @@ fn head_reserves_and_light_entry_does_not_overtake() {
     );
 }
 
+/// The shape that held a queue for 50 minutes: a resident command (a
+/// development server) holds part of the budget, a `--front` head does not
+/// fit next to it, and a short command behind the head would. The short
+/// command runs while the resident still holds its slot, and the head's
+/// progress line names who holds the budget.
+#[test]
+fn short_command_backfills_behind_a_head_that_does_not_fit() {
+    let env = TestEnv::new()
+        .with_config("budget = 4\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    // Teach canirun that `quick` is short (a run of at least 1 s counts).
+    let learn = env.run(&["exec", "--key", "quick", "--", "sh", "-c", "sleep 1.1"]);
+    assert!(learn.status.success());
+    let mut resident = env.spawn_exec(&["--weight", "2"], &gated_script(&dir, "resident"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().iter().any(|e| e["state"] == "running")
+    }));
+    let head = env.spawn_exec(
+        &["--front", "--weight", "4"],
+        &marker_script(&dir, "head", "0"),
+    );
+    assert!(wait_until(Duration::from_secs(5), || env.entries().len() == 2));
+    let mut quick = env.spawn_exec(
+        &["--weight", "1", "--key", "quick"],
+        &marker_script(&dir, "quick", "0"),
+    );
+    let quick_done = wait_until(Duration::from_secs(10), || dir.join("quick.end").exists());
+    let status = stdout(&env.run(&["status"]));
+    fs::write(dir.join("resident.release"), "").unwrap();
+    assert!(quick_done, "quick never ran next to the resident: {status}");
+    assert!(
+        status.contains("the head needs w4, 2 of 4 free"),
+        "{status}"
+    );
+    assert!(quick.wait().unwrap().success());
+    assert!(resident.wait().unwrap().success());
+    let out = head.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("(budget)") && err.contains("; held by "),
+        "{err}"
+    );
+    assert!(read_ns(&dir.join("quick.start")) < read_ns(&dir.join("head.start")));
+}
+
 #[test]
 fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
     let env = TestEnv::new()

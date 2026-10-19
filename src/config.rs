@@ -1,5 +1,6 @@
 //! `config.toml` loading with defaults (spec "Configuration").
 
+use crate::admit::Limits;
 use crate::error::{Error, Result};
 use crate::key::{classify, Kind};
 use crate::weight::PatternHint;
@@ -46,6 +47,12 @@ pub struct Config {
     pub front_overload_factor: f64,
     /// ...for at most this long.
     pub front_overload_max_wait_secs: u64,
+    /// A waiting command whose learned wall time is at most this may start
+    /// ahead of entries that do not fit the budget (0 disables backfill).
+    pub backfill_max_job_secs: u64,
+    /// Once a normal entry held up by backfilled ones has waited this
+    /// long, nothing new passes it.
+    pub backfill_max_wait_secs: u64,
     /// `gc` removes finished job files older than this.
     pub jobs_keep_days: u64,
     /// A job with no `wait`er is cancelled once this many seconds have
@@ -76,6 +83,8 @@ impl Default for Config {
             cpu_guard_max_wait_secs: 120,
             front_overload_factor: 2.0,
             front_overload_max_wait_secs: 30,
+            backfill_max_job_secs: 300,
+            backfill_max_wait_secs: 300,
             jobs_keep_days: 7,
             jobs_orphan_grace_secs: 30,
             patterns: Vec::new(),
@@ -169,6 +178,20 @@ impl Config {
 
     pub fn memory_reserve_bytes(&self) -> u64 {
         self.memory_reserve_mib.saturating_mul(1024 * 1024)
+    }
+
+    /// What admission needs from the configuration.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            budget: self.budget,
+            memory_reserve: self.memory_reserve_bytes(),
+            cpu_threshold: self.cpu_threshold(),
+            cpu_guard_max_wait_secs: self.cpu_guard_max_wait_secs as f64,
+            front_overload_load: self.front_overload_load(),
+            front_overload_max_wait_secs: self.front_overload_max_wait_secs as f64,
+            backfill_max_job_secs: self.backfill_max_job_secs as f64,
+            backfill_max_wait_secs: self.backfill_max_wait_secs as f64,
+        }
     }
 }
 

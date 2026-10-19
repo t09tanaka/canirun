@@ -35,6 +35,9 @@ pub struct Entry {
     /// written by the running `canirun` itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub using: Option<f64>,
+    /// Started ahead of a waiting entry that did not fit the budget.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backfilled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,7 +85,9 @@ impl Ledger {
         s
     }
 
+    /// What admission sees of every entry, with waiting times as of now.
     pub fn queue(&self) -> Vec<QueueEntry> {
+        let now = Utc::now();
         self.entries
             .iter()
             .map(|e| QueueEntry {
@@ -92,6 +97,14 @@ impl Ledger {
                 weight: e.weight,
                 seq: e.seq,
                 using: e.using,
+                waited_secs: match e.state {
+                    State::Waiting => {
+                        (now - e.enqueued_at).num_milliseconds().max(0) as f64 / 1000.0
+                    }
+                    State::Running => 0.0,
+                },
+                expected_secs: e.expected_secs,
+                backfilled: e.backfilled,
             })
             .collect()
     }
@@ -132,6 +145,7 @@ mod tests {
             enqueued_at: Utc::now(),
             started_at: None,
             using: None,
+            backfilled: false,
         }
     }
 

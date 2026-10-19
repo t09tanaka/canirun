@@ -49,7 +49,7 @@ pub fn submit(cfg: &Config, opts: Opts, detach: bool) -> Result<i32> {
     };
     let registered = ledger.find(&job.id).is_some();
     let estimate = registered
-        .then(|| crate::eta::estimate(&exec::timed_queue(&ledger), cfg.budget, &job.id))
+        .then(|| crate::eta::estimate(&exec::timed_queue(&ledger), cfg.limits(), &job.id))
         .flatten();
     if !registered && jobs::read_exit(&job.id).is_none() {
         // The runner exists and may still start, so the id is printed and
@@ -287,9 +287,11 @@ pub fn list(cfg: &Config, json: bool) -> Result<i32> {
             crate::gitctx::subdir(&j.cwd)
         };
         let eta = match state {
-            JobState::Queued | JobState::Running => crate::eta::estimate(&timed, cfg.budget, &j.id)
-                .map(|e| format!("  ({})", exec::fmt_estimate(&e)))
-                .unwrap_or_default(),
+            JobState::Queued | JobState::Running => {
+                crate::eta::estimate(&timed, cfg.limits(), &j.id)
+                    .map(|e| format!("  ({})", exec::fmt_estimate(&e)))
+                    .unwrap_or_default()
+            }
             _ => String::new(),
         };
         println!(

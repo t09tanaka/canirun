@@ -412,6 +412,7 @@ examples/          a tiny project with fake "lint"/"test" scripts
 - Live guards are skipped when canirun has nothing running (starvation
   rule).
 - Head-of-queue reservation (strict FIFO), accepting some idle CPU.
+  (Relaxed by backfill of short commands, see the 2026-10-19 addendum.)
 - `min_weight` as the v0.1 answer to Docker-hosted load being invisible
   to rusage.
 - Lease liveness by flock, never by pid.
@@ -571,3 +572,66 @@ A further finding from the rollout: `api/`, `client/` and `admin/` of one
 monorepo shared a key because the key ignored cwd. Keys now include the
 subdirectory relative to the worktree root; root-level keys hash as
 before so existing history carries over.
+
+
+---
+
+# Addendum — head-of-line blocking (2026-10-19)
+
+## What happened
+
+`status` showed budget 4/12 used. Running: two weight-2 development
+servers (a Node.js server and a Flutter app in `run` mode), both resident,
+both measured at 0.0 cores. Waiting: a `--front` pre-push check of weight
+9 at the head, and three commands of weight 2–4 behind it. Each of the
+three fit the 8 free slots alone, but strict head reservation held all of
+them for over 50 minutes, until the two servers were stopped. Finding
+which processes held the budget took effort.
+
+## Decisions
+
+1. **Backfill of short commands.** A waiting entry behind the head may
+   start first when it fits, its learned wall time (`expected_secs`, the
+   max of its last five usable runs) is known and at most
+   `backfill_max_job_secs` (default 300, 0 disables), and every entry
+   ahead of it either does not fit the budget or cannot start before it
+   anyway (a non-head that is not short). Entries ahead that will start
+   are never overtaken, so short commands keep their order among
+   themselves. The budget and the live guards apply to a backfilled
+   entry as to a head. Entries started this way carry `backfilled` in the
+   ledger.
+2. **Starvation bound.** The cap is tied to whether backfill is what
+   delays the entry ahead, not to how long it has waited alone: an entry
+   ahead that would fit without the backfilled entries is not passed again
+   once it is `--front` (at once: a human is waiting) or has waited
+   `backfill_max_wait_secs` (default 300). It then starts as soon as the
+   short commands already running end, so backfill delays a normal head by
+   at most about `backfill_max_wait_secs + backfill_max_job_secs`, and a
+   `--front` head by at most one short command. A head held up by
+   something else (a resident server, a long build) is passed for as long
+   as that lasts, because backfill does not delay it. A cap on the head's
+   own waiting time alone was rejected: it would have closed backfill
+   five minutes into the incident and reproduced it.
+3. **Not EASY backfill.** Passing only commands that end before the
+   head's projected start was rejected: a resident entry is long past its
+   expected wall time, so the projection is always "now" and nothing
+   would ever pass.
+4. **Idle entries keep their weight.** Charging a running entry only what
+   it measures (as low as 0.0 for a server) was considered and rejected.
+   Integration suites whose work runs in a Docker daemon or VM measure
+   near zero in their own tree (the known blind spot) while the machine
+   is busy, and an idle server can start a full rebuild at any time;
+   either would let the budget admit more than the machine can take.
+   Measurement keeps only raising the charge (`max(weight, round(using))`).
+   Visibility handles the resident case instead (decision 5), together
+   with the existing advice not to wrap commands that do not exit.
+5. **Who holds the budget.** A waiting line whose reason is `budget` (or
+   the backfill cap) ends with `; held by <pid> w<weight> idle|using N
+   <running time> <label>, ...` for the biggest three running entries.
+   `status` marks running entries `idle` (running at least 5 minutes,
+   measured under 0.2 cores) and `[backfill]`, and, when the head waits on
+   the budget, prints how much it needs and how much is free.
+6. **Estimates follow admission.** `eta::estimate` now asks `admit` (no
+   live snapshot) who starts at each simulated step, so backfill and its
+   cap are modelled exactly as admission applies them.
+

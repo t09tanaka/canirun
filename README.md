@@ -60,9 +60,15 @@ saturated.
   its own lease file. A Ctrl-C'd, SIGKILLed, or crashed `canirun` — waiting
   or running — vanishes from the ledger on the next poll. No cleanup step,
   no daemon, no pid heuristics.
-- **FIFO with reservation.** The head of the queue reserves until it fits,
-  so a heavy unit is never starved by a stream of light ones. `--front`
-  lets a human at the keyboard jump ahead.
+- **FIFO with reservation, plus backfill.** The head of the queue
+  reserves until it fits. While it does not fit, a command behind it that
+  is known to be short (learned wall time at most
+  `backfill_max_job_secs`, default 5 min) may start first if it fits, so
+  one heavy head no longer stops everything behind it. A heavy unit is
+  still not starved: once a head would fit but for backfilled commands,
+  nothing new passes it after it has waited `backfill_max_wait_secs`
+  (default 5 min), or at once when it is `--front`. `--front` lets a human
+  at the keyboard jump ahead.
 - **Nesting-safe.** A gated command that itself calls `canirun exec`
   inherits the outer lease instead of deadlocking.
 - **Async jobs that die with their waiter.** `submit` returns a job id as
@@ -131,10 +137,15 @@ derived key as `key: ...` under the command.
 While waiting, a progress line goes to stderr every few seconds:
 
 ```
-canirun: waiting 0:42 (budget) — running 3 (10/12 used), ahead of you 2
+canirun: waiting 0:42 (queue) — running 3 (10/12 used), ahead of you 2
+canirun: waiting 52:10 (budget) — running 2 (4/12 used); held by 48211 w2 idle 52:30 api: make api, 48190 w2 idle 51:02 app: flutter run
 canirun: waiting 1:07 (memory 1.1 GiB available, need 3.4 GiB) — running 2 (6/12 used)
 canirun: waiting 0:12 (cpu 93% busy, threshold 85%) — running 2 (6/12 used)
 ```
+
+A line waiting on the budget names the running entries holding it
+(biggest first, at most three): pid, weight, `idle` or `using N`, and how
+long they have run, so a forgotten server is easy to find and stop.
 
 When stderr is not a terminal (a log file, an agent's tool output), a line
 is printed only when the reason or the queue position changes, plus one
@@ -154,18 +165,25 @@ budget 10/12 used
 machine 31.2 GiB available, cpu 71% busy
 
 running (3)
-    48211  w4  (using 3.8)     2:14  webapp: npm run test:e2e
-    48190  w4  (using 4.1)     1:03  webapp: npm run test:e2e
-    48260  w2  (using 0.9)     0:20  api: npm run test:unit
+    48211  w2  (using 0.0) idle    52:30  api: make api
+    48190  w4  (using 4.1)          1:03  webapp: npm run test:e2e
+    48260  w2  (using 0.9)          0:20  [backfill] api: npm run test:unit
+  (idle: running 5:00+ and using under 0.2 cores; a server or watch mode holds its weight until it exits)
 
 waiting (2)
-    48302  w6      0:41  [front] api: npx stryker run
+    48302  w9      0:41  [front] api: npm run test:gates
     48310  w1      0:40  webapp: npm run lint
+
+the head needs w9, 4 of 12 free; held by the running entries above
 ```
 
 `(using N)` is the cores the running command's process tree used
 recently (see "How it works"); `budget X/Y used` counts each running
-entry at its weight or at that measurement, whichever is more. `--json`
+entry at its weight or at that measurement, whichever is more. `idle`
+marks an entry that has run for 5 minutes and is using almost nothing:
+usually a development server or a watch mode, which holds its weight
+until it exits (see "What not to wrap"). `[backfill]` marks an entry
+that started ahead of a head that did not fit. `--json`
 dumps the ledger. Dead entries are reaped first, so the view is accurate
 without a daemon.
 
@@ -242,6 +260,8 @@ cpu_threshold_percent = 85  # hold the next start while CPU is busier
 cpu_guard_max_wait_secs = 120 # ...but never for longer than this
 front_overload_factor = 2.0 # --front waits while load average >= budget x this (0: never)
 front_overload_max_wait_secs = 30 # ...but never for longer than this
+backfill_max_job_secs = 300 # a command learned to take at most this may pass a head that does not fit (0: never)
+backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has waited this long
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
 
@@ -287,7 +307,25 @@ Admission is a pure function of the ledger plus a live snapshot: the
 candidate must be the head of the queue (`--front` entries first, then
 by enqueue order), `used + weight ≤ budget`, and — when something managed
 is already running — available memory must cover its predicted RSS plus
-the reserve and CPU usage must be under the threshold. When nothing
+the reserve and CPU usage must be under the threshold.
+
+A candidate behind the head may start first (backfill) when all of these
+hold, and the budget and guards then apply to it as to a head:
+
+- its learned wall time is known and at most `backfill_max_job_secs`
+  (a command with no history never passes anyone);
+- every entry ahead of it either does not fit the budget or cannot start
+  before it anyway (it is not the head and not short itself), so entries
+  that will start are never overtaken and short commands keep their order;
+- no entry ahead is being held up only by backfilled entries (it would
+  fit without them) while being `--front` or having waited
+  `backfill_max_wait_secs`. Such an entry gets the budget as soon as the
+  short commands already running end; the waiting line says `queue; the
+  entry ahead has waited long enough, nothing more passes it`.
+
+A head held up by something else — a long build, or a server that never
+exits — is passed for as long as that lasts, because backfill does not
+delay it. When nothing
 managed is running the live guards are skipped, so a machine kept busy by
 processes canirun does not manage cannot hold the queue forever.
 
@@ -301,8 +339,9 @@ be measured, the declared weight is used. Measuring does not touch the
 command. CPU spent in a Docker daemon or VM is not part of the tree
 (see "Known blind spot").
 
-Estimates are a plain simulation of that queue against the budget using
-each entry's learned wall time (max of its last five usable runs; 60 s and
+Estimates are a plain simulation of that queue against the budget (it
+asks the same admission function who starts at each step, so backfill is
+included) using each entry's learned wall time (max of its last five usable runs; 60 s and
 a trailing `?` when unknown). The live guards are not modelled, so an
 estimate is a lower bound.
 
@@ -312,6 +351,18 @@ repository is the main worktree (`git rev-parse --git-common-dir`), so
 every linked worktree of a project shares one history; the subdirectory
 (`git rev-parse --show-prefix`) keeps `api/` and `client/` of one monorepo
 apart.
+
+### Idle entries are charged their weight
+
+A running entry measured at nearly zero cores (a development server, a
+watch mode) still takes its full weight from the budget. Charging it
+only what it measures would be wrong in two common cases: an integration
+suite whose work runs in a Docker daemon or VM measures near zero in its
+own process tree (see below) while the machine is busy, and an idle
+server can start a full rebuild at any moment. Either way the budget
+would admit more than the machine can take. Instead, `status` marks such
+entries `idle` and the waiting line names them, so they can be stopped
+or run without canirun.
 
 ### Known blind spot
 
@@ -341,6 +392,9 @@ Only commands that burn CPU for tens of seconds or more: test suites,
 builds, mutation testing, integration and e2e runs. Do not wrap `sleep`,
 `git`, dependency installs, formatters, or one-second checks: each wrapped
 command takes a slot (default weight 2) and queues behind heavier work.
+Do not wrap development servers, watch modes or anything else that does
+not exit on its own: it holds its weight for as long as it runs, and a
+heavy head that does not fit next to it waits until it is stopped.
 
 ### Agent / CI-runner scripts
 
