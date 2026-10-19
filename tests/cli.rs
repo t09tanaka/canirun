@@ -270,7 +270,11 @@ fn short_command_backfills_behind_a_head_that_does_not_fit() {
         &["--weight", "1", "--key", "quick"],
         &marker_script(&dir, "quick", "0"),
     );
-    let quick_done = wait_until(Duration::from_secs(10), || dir.join("quick.end").exists());
+    // Finished and gone from the ledger, so `status` sees only the
+    // resident and the head.
+    let quick_done = wait_until(Duration::from_secs(10), || {
+        dir.join("quick.end").exists() && env.entries().len() == 2
+    });
     let status = stdout(&env.run(&["status"]));
     fs::write(dir.join("resident.release"), "").unwrap();
     assert!(quick_done, "quick never ran next to the resident: {status}");
