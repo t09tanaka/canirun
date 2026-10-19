@@ -1,4 +1,4 @@
-use crate::admit::{self, Decision, Limits, QueueEntry, Reason, State};
+use crate::admit::{self, Decision, Reason, State};
 use crate::config::Config;
 use crate::display::{fmt_bytes, fmt_duration};
 use crate::error::Result;
@@ -102,22 +102,15 @@ pub fn plan(cfg: &Config, opts: &Opts) -> Result<Plan> {
 pub fn timed_queue(ledger: &Ledger) -> Vec<eta::Timed> {
     let now = Utc::now();
     ledger
-        .entries
-        .iter()
-        .map(|e| eta::Timed {
-            entry: QueueEntry {
-                id: e.id.clone(),
-                state: e.state,
-                front: e.front,
-                weight: e.weight,
-                seq: e.seq,
-                using: e.using,
-            },
+        .queue()
+        .into_iter()
+        .zip(&ledger.entries)
+        .map(|(entry, e)| eta::Timed {
+            entry,
             elapsed_secs: e
                 .started_at
                 .map(|s| (now - s).num_milliseconds().max(0) as f64 / 1000.0)
                 .unwrap_or(0.0),
-            expected_secs: e.expected_secs,
         })
         .collect()
 }
@@ -152,14 +145,7 @@ pub fn run_gated(
         predicted_rss,
         expected_secs,
     } = plan(cfg, opts)?;
-    let limits = Limits {
-        budget: cfg.budget,
-        memory_reserve: cfg.memory_reserve_bytes(),
-        cpu_threshold: cfg.cpu_threshold(),
-        cpu_guard_max_wait_secs: cfg.cpu_guard_max_wait_secs as f64,
-        front_overload_load: cfg.front_overload_load(),
-        front_overload_max_wait_secs: cfg.front_overload_max_wait_secs as f64,
-    };
+    let limits = cfg.limits();
 
     // Register as waiting. The lease is taken before the ledger entry so
     // the entry is never observed without a held lease.
@@ -186,6 +172,7 @@ pub fn run_gated(
             enqueued_at: Utc::now(),
             started_at: None,
             using: None,
+            backfilled: false,
         });
         ledger.save(&paths::ledger_file())?;
     }
@@ -211,14 +198,15 @@ pub fn run_gated(
         }
         // Phase 1 (under the lock, no OS sampling): queue position and
         // budget. Only a budget-admissible head pays for a live snapshot.
-        let (first, queue, est) = {
+        let (first, queue, est, holders) = {
             let _guard = lock::ledger()?;
             let mut ledger = Ledger::load(&paths::ledger_file())?;
             if !lock::reap_dead(&mut ledger).is_empty() {
                 ledger.save(&paths::ledger_file())?;
             }
             let queue = ledger.queue();
-            let est = eta::estimate(&timed_queue(&ledger), cfg.budget, id);
+            let est = eta::estimate(&timed_queue(&ledger), limits, id);
+            let holders = holders(&ledger);
             (
                 admit::admit(
                     &queue,
@@ -230,6 +218,7 @@ pub fn run_gated(
                 ),
                 queue,
                 est,
+                holders,
             )
         };
         let decision = match first {
@@ -255,9 +244,15 @@ pub fn run_gated(
                     snapshot,
                 );
                 if decision == Decision::Admitted {
+                    // Started ahead of someone: the starvation cap in
+                    // `admit` must be able to tell it from the rest.
+                    let backfilled = admit::queue_order(&queue)
+                        .first()
+                        .is_some_and(|head| head.id != id);
                     if let Some(e) = ledger.find_mut(id) {
                         e.state = State::Running;
                         e.started_at = Some(Utc::now());
+                        e.backfilled = backfilled;
                     }
                 }
                 ledger.save(&paths::ledger_file())?;
@@ -275,17 +270,23 @@ pub fn run_gated(
                     _ => admit::used_budget(&queue),
                 };
                 eprintln!(
-                    "canirun: waiting {} ({}) — running {running} ({used}/{} used){}{}",
+                    "canirun: waiting {} ({}) — running {running} ({used}/{} used){}{}{}",
                     fmt_duration(enqueued.elapsed()),
                     describe(reason),
                     limits.budget,
                     match reason {
-                        Reason::NotHead { ahead } if *ahead != usize::MAX =>
+                        Reason::NotHead { ahead } | Reason::Reserved { ahead }
+                            if *ahead != usize::MAX =>
                             format!(", ahead of you {ahead}"),
                         _ => String::new(),
                     },
                     est.map(|e| format!(", {}", fmt_estimate(&e)))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    match reason {
+                        Reason::Budget { .. } | Reason::Reserved { .. } if !holders.is_empty() =>
+                            format!("; held by {holders}"),
+                        _ => String::new(),
+                    }
                 );
                 last_progress = Some((Instant::now(), topic));
             }
@@ -355,12 +356,38 @@ fn remove_entry(id: &str) {
     let _ = std::fs::remove_file(paths::lease_file(id));
 }
 
+/// How many running entries a waiting line names.
+const HOLDERS_SHOWN: usize = 3;
+
+/// The running entries that hold the budget, biggest first, as
+/// `48211 w2 idle 52:10 api: make api, ...` (empty when nothing runs).
+fn holders(ledger: &Ledger) -> String {
+    let now = Utc::now();
+    let mut running: Vec<_> = ledger
+        .queue()
+        .into_iter()
+        .zip(&ledger.entries)
+        .filter(|(q, _)| q.state == State::Running)
+        .collect();
+    running.sort_by_key(|(q, e)| (std::cmp::Reverse(admit::charged(q)), e.started_at));
+    let mut parts: Vec<String> = running
+        .iter()
+        .take(HOLDERS_SHOWN)
+        .map(|(_, e)| crate::cmd::status::holder(e, now, 40))
+        .collect();
+    if running.len() > HOLDERS_SHOWN {
+        parts.push(format!("+{} more", running.len() - HOLDERS_SHOWN));
+    }
+    parts.join(", ")
+}
+
 /// What a progress line is about: the kind of wait and, behind others in
 /// the queue, how many are ahead. Amounts (memory, cpu %) are left out so
 /// a fluctuating sample does not count as a change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Topic {
     Queue(usize),
+    Reserved(usize),
     Budget,
     Memory,
     Cpu,
@@ -370,6 +397,7 @@ enum Topic {
 fn topic_of(reason: &Reason) -> Topic {
     match reason {
         Reason::NotHead { ahead } => Topic::Queue(*ahead),
+        Reason::Reserved { ahead } => Topic::Reserved(*ahead),
         Reason::Budget { .. } => Topic::Budget,
         Reason::Memory { .. } => Topic::Memory,
         Reason::Cpu { .. } => Topic::Cpu,
@@ -404,6 +432,9 @@ impl Cadence {
 pub fn describe(reason: &Reason) -> String {
     match reason {
         Reason::NotHead { .. } => "queue".into(),
+        Reason::Reserved { .. } => {
+            "queue; the entry ahead has waited long enough, nothing more passes it".into()
+        }
         Reason::Budget { .. } => "budget".into(),
         Reason::Memory { available, need } => format!(
             "memory {} available, need {}",
@@ -478,5 +509,10 @@ mod tests {
             Topic::Budget
         );
         assert_eq!(topic_of(&Reason::NotHead { ahead: 3 }), Topic::Queue(3));
+        // Backfill closing is a change worth a line of its own.
+        assert_ne!(
+            topic_of(&Reason::Reserved { ahead: 3 }),
+            topic_of(&Reason::NotHead { ahead: 3 })
+        );
     }
 }

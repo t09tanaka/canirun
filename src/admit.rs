@@ -25,6 +25,13 @@ pub struct QueueEntry {
     /// Cores a running entry's process tree was last measured using, or
     /// None when not measured (yet).
     pub using: Option<f64>,
+    /// Seconds a waiting entry has been queued (0 for a running one).
+    pub waited_secs: f64,
+    /// Learned wall time, or None when unknown.
+    pub expected_secs: Option<f64>,
+    /// A running entry that started ahead of a waiting one that did not
+    /// fit (see [`admit`]).
+    pub backfilled: bool,
 }
 
 /// What the machine looks like right now.
@@ -50,12 +57,24 @@ pub struct Limits {
     pub front_overload_load: f64,
     /// ...for at most this long.
     pub front_overload_max_wait_secs: f64,
+    /// A waiting entry whose learned wall time is at most this may start
+    /// ahead of entries that do not fit the budget (0 disables).
+    pub backfill_max_job_secs: f64,
+    /// No new entry passes a normal entry that backfilled ones are holding
+    /// up once it has waited this long.
+    pub backfill_max_wait_secs: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reason {
     /// Someone is ahead in the queue; `ahead` is how many.
     NotHead {
+        ahead: usize,
+    },
+    /// Could start ahead of an entry that does not fit, but that entry is
+    /// already being held up by others that did, and has waited long
+    /// enough (or is `--front`).
+    Reserved {
         ahead: usize,
     },
     Budget {
@@ -103,15 +122,6 @@ pub fn charged(e: &QueueEntry) -> u32 {
     e.weight.max(measured)
 }
 
-/// Sum of the declared weights of running entries.
-pub fn declared_budget(entries: &[QueueEntry]) -> u32 {
-    entries
-        .iter()
-        .filter(|e| e.state == State::Running)
-        .map(|e| e.weight)
-        .sum()
-}
-
 /// Sum of what running entries take from the budget (see [`charged`]).
 pub fn used_budget(entries: &[QueueEntry]) -> u32 {
     entries
@@ -119,6 +129,74 @@ pub fn used_budget(entries: &[QueueEntry]) -> u32 {
         .filter(|e| e.state == State::Running)
         .map(charged)
         .sum()
+}
+
+/// What the budget looks like to the waiting entry `e` that has waited
+/// `waited` seconds. A `--front` entry is held by what running entries
+/// measure beyond their weight only for `front_overload_max_wait_secs`;
+/// after that the declared weights decide, as before measurement existed.
+/// With `skip_backfilled`, entries that started by backfill are left out.
+fn used_for(
+    entries: &[QueueEntry],
+    e: &QueueEntry,
+    waited: f64,
+    limits: Limits,
+    skip_backfilled: bool,
+) -> u32 {
+    let declared = e.front && waited >= limits.front_overload_max_wait_secs;
+    entries
+        .iter()
+        .filter(|r| r.state == State::Running && !(skip_backfilled && r.backfilled))
+        .map(|r| if declared { r.weight } else { charged(r) })
+        .sum()
+}
+
+/// The weight admission counts for `e`: floor 1, ceiling the budget.
+fn clamped(e: &QueueEntry, budget: u32) -> u32 {
+    e.weight.min(budget).max(1)
+}
+
+/// A command expected to finish soon: its learned wall time is known and
+/// at most `backfill_max_job_secs`.
+pub fn is_short(e: &QueueEntry, limits: Limits) -> bool {
+    limits.backfill_max_job_secs > 0.0
+        && e.expected_secs
+            .is_some_and(|s| s <= limits.backfill_max_job_secs)
+}
+
+enum Pass {
+    Yes,
+    No,
+    Reserved,
+}
+
+/// Whether the entry at `pos` in `order` may start ahead of everyone
+/// before it (backfill). It must be short, and each entry ahead must
+/// either not fit the budget or be unable to start before it anyway (a
+/// non-head that is not short). An entry ahead that is held up only by
+/// backfilled entries is not passed again once it is `--front` or has
+/// waited `backfill_max_wait_secs`, so backfill delays it by at most the
+/// short commands already running.
+fn may_pass(entries: &[QueueEntry], order: &[&QueueEntry], pos: usize, limits: Limits) -> Pass {
+    if !is_short(order[pos], limits) {
+        return Pass::No;
+    }
+    for (i, a) in order[..pos].iter().enumerate() {
+        let w = clamped(a, limits.budget);
+        if used_for(entries, a, a.waited_secs, limits, false) + w <= limits.budget {
+            // `a` fits: it starts first, as the head or as a backfill.
+            if i == 0 || is_short(a, limits) {
+                return Pass::No;
+            }
+            continue;
+        }
+        let held_by_backfill =
+            used_for(entries, a, a.waited_secs, limits, true) + w <= limits.budget;
+        if held_by_backfill && (a.front || a.waited_secs >= limits.backfill_max_wait_secs) {
+            return Pass::Reserved;
+        }
+    }
+    Pass::Yes
 }
 
 /// Decide whether the waiting entry `me` may start now.
@@ -133,6 +211,10 @@ pub fn used_budget(entries: &[QueueEntry]) -> u32 {
 /// has elapsed. A `--front` entry is instead held by the overload guard,
 /// while the load average is at or above `front_overload_load`, for at
 /// most `front_overload_max_wait_secs`. The memory guard always applies.
+///
+/// Only the head of the queue starts, except that a short command behind
+/// heads that do not fit may start first when it fits (see `may_pass`);
+/// the budget and the guards then apply to it as to a head.
 pub fn admit(
     entries: &[QueueEntry],
     me: &str,
@@ -148,22 +230,22 @@ pub fn admit(
         return Decision::Wait(Reason::NotHead { ahead: usize::MAX });
     };
     if pos != 0 {
-        return Decision::Wait(Reason::NotHead { ahead: pos });
+        match may_pass(entries, &order, pos, limits) {
+            Pass::Yes => {}
+            Pass::No => return Decision::Wait(Reason::NotHead { ahead: pos }),
+            Pass::Reserved => return Decision::Wait(Reason::Reserved { ahead: pos }),
+        }
     }
-    let candidate = order[0];
-    // A `--front` head is held by what running entries measure beyond
-    // their weight only for `front_overload_max_wait_secs`; after that the
-    // declared weights decide, as before measurement existed.
-    let used = if candidate.front && waited_secs >= limits.front_overload_max_wait_secs {
-        declared_budget(entries)
-    } else {
-        used_budget(entries)
-    };
-    let weight = candidate.weight.min(limits.budget).max(1);
-    if used + weight > limits.budget {
-        return Decision::Wait(Reason::Budget {
-            used,
-            budget: limits.budget,
+    let candidate = order[pos];
+    let used = used_for(entries, candidate, waited_secs, limits, false);
+    if used + clamped(candidate, limits.budget) > limits.budget {
+        return Decision::Wait(if pos == 0 {
+            Reason::Budget {
+                used,
+                budget: limits.budget,
+            }
+        } else {
+            Reason::NotHead { ahead: pos }
         });
     }
     let anything_running = entries.iter().any(|e| e.state == State::Running);
@@ -212,6 +294,9 @@ mod tests {
             weight,
             seq,
             using: None,
+            waited_secs: 0.0,
+            expected_secs: None,
+            backfilled: false,
         }
     }
     fn using(mut q: QueueEntry, cores: f64) -> QueueEntry {
@@ -225,7 +310,22 @@ mod tests {
         cpu_guard_max_wait_secs: 120.0,
         front_overload_load: 24.0,
         front_overload_max_wait_secs: 30.0,
+        backfill_max_job_secs: 300.0,
+        backfill_max_wait_secs: 300.0,
     };
+    /// A waiting entry expected to take `secs`, queued for `waited`.
+    fn short(mut q: QueueEntry, secs: f64) -> QueueEntry {
+        q.expected_secs = Some(secs);
+        q
+    }
+    fn waited(mut q: QueueEntry, secs: f64) -> QueueEntry {
+        q.waited_secs = secs;
+        q
+    }
+    fn backfilled(mut q: QueueEntry) -> QueueEntry {
+        q.backfilled = true;
+        q
+    }
     fn calm() -> LiveSnapshot {
         LiveSnapshot {
             available_memory: 64 << 30,
@@ -638,7 +738,214 @@ mod tests {
             admit(&n, "w", 0, 999.0, LIMITS, Some(calm())),
             Decision::Wait(Reason::Budget { .. })
         ));
-        assert_eq!(declared_budget(&n), 1);
+    }
+
+    /// The shape that held a queue for 50 minutes: two idle resident
+    /// commands hold 4 of 12, a `--front` head of weight 9 cannot fit, and
+    /// three short commands behind it each would.
+    fn idle_residents_and_a_heavy_front_head() -> Vec<QueueEntry> {
+        vec![
+            using(e("dev1", State::Running, false, 2, 1), 0.0),
+            using(e("dev2", State::Running, false, 2, 2), 0.0),
+            waited(e("head", State::Waiting, true, 9, 3), 3000.0),
+            waited(short(e("t1", State::Waiting, false, 2, 4), 40.0), 2900.0),
+            waited(short(e("t2", State::Waiting, false, 4, 5), 90.0), 2900.0),
+            waited(short(e("t3", State::Waiting, false, 3, 6), 60.0), 2900.0),
+        ]
+    }
+
+    #[test]
+    fn short_commands_start_behind_a_head_that_does_not_fit() {
+        let q = idle_residents_and_a_heavy_front_head();
+        assert_eq!(
+            admit(&q, "head", 0, 3000.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Budget {
+                used: 4,
+                budget: 12
+            })
+        );
+        assert_eq!(
+            admit(&q, "t1", 0, 2900.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        // t2 fits too, but t1 is ahead of it and fits: t1 goes first.
+        assert_eq!(
+            admit(&q, "t2", 0, 2900.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 2 })
+        );
+        // Once t1 runs, t2 fits (4 + 2 + 4 = 10), and then t3 does not.
+        let mut q = q;
+        q[3].state = State::Running;
+        q[3].backfilled = true;
+        assert_eq!(
+            admit(&q, "t2", 0, 2900.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        q[4].state = State::Running;
+        q[4].backfilled = true;
+        assert_eq!(
+            admit(&q, "t3", 0, 2900.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+        // The head is held by the residents, not by t1 and t2 (4 + 9 > 12),
+        // so its long wait does not close backfill.
+        assert_eq!(used_budget(&q), 10);
+    }
+
+    #[test]
+    fn backfill_passes_only_short_commands_with_history() {
+        let mut q = idle_residents_and_a_heavy_front_head();
+        q[3].expected_secs = None;
+        assert_eq!(
+            admit(&q, "t1", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+        // An unknown command ahead cannot start before the head either, so
+        // the short one behind it may pass both.
+        assert_eq!(
+            admit(&q, "t2", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        q[3].expected_secs = Some(300.0);
+        assert_eq!(
+            admit(&q, "t1", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        q[3].expected_secs = Some(300.1);
+        assert_eq!(
+            admit(&q, "t1", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+        let off = Limits {
+            backfill_max_job_secs: 0.0,
+            ..LIMITS
+        };
+        q[3].expected_secs = Some(0.0);
+        assert_eq!(
+            admit(&q, "t1", 0, 0.0, off, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+    }
+
+    #[test]
+    fn a_head_that_fits_is_never_passed() {
+        let q = [
+            e("r", State::Running, false, 2, 1),
+            e("head", State::Waiting, false, 2, 2),
+            short(e("s", State::Waiting, false, 1, 3), 1.0),
+        ];
+        assert_eq!(
+            admit(&q, "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+    }
+
+    #[test]
+    fn backfill_must_fit_and_passes_the_guards() {
+        let q = [
+            e("r", State::Running, false, 10, 1),
+            e("head", State::Waiting, false, 4, 2),
+            short(e("s", State::Waiting, false, 3, 3), 1.0),
+        ];
+        assert_eq!(
+            admit(&q, "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+        let q = [
+            e("r", State::Running, false, 10, 1),
+            e("head", State::Waiting, false, 4, 2),
+            short(e("s", State::Waiting, false, 2, 3), 1.0),
+        ];
+        assert_eq!(
+            admit(&q, "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        let busy = LiveSnapshot {
+            cpu_busy: 1.0,
+            ..calm()
+        };
+        assert!(matches!(
+            admit(&q, "s", 0, 0.0, LIMITS, Some(busy)),
+            Decision::Wait(Reason::Cpu { .. })
+        ));
+    }
+
+    #[test]
+    fn a_head_held_up_by_backfill_closes_it_after_a_while() {
+        // Without the backfilled entry the head would fit (8 + 4 <= 12).
+        let q = |head_waited| {
+            [
+                e("r", State::Running, false, 8, 1),
+                backfilled(e("b", State::Running, false, 2, 2)),
+                waited(e("head", State::Waiting, false, 4, 3), head_waited),
+                short(e("s", State::Waiting, false, 1, 4), 1.0),
+            ]
+        };
+        assert_eq!(
+            admit(&q(299.9), "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        assert_eq!(
+            admit(&q(300.0), "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Reserved { ahead: 1 })
+        );
+        // Held up by what is not backfilled: no cap, however long.
+        let q = [
+            e("r", State::Running, false, 9, 1),
+            backfilled(e("b", State::Running, false, 1, 2)),
+            waited(e("head", State::Waiting, false, 4, 3), 9999.0),
+            short(e("s", State::Waiting, false, 1, 4), 1.0),
+        ];
+        assert_eq!(
+            admit(&q, "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+    }
+
+    #[test]
+    fn a_front_entry_held_up_by_backfill_is_not_passed_again() {
+        let q = [
+            e("r", State::Running, false, 8, 1),
+            backfilled(e("b", State::Running, false, 2, 2)),
+            e("f", State::Waiting, true, 4, 3),
+            short(e("s", State::Waiting, false, 1, 4), 1.0),
+        ];
+        assert_eq!(
+            admit(&q, "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Reserved { ahead: 1 })
+        );
+        // ...but one blocked by something else is.
+        let q = [
+            e("r", State::Running, false, 10, 1),
+            e("f", State::Waiting, true, 4, 2),
+            short(e("s", State::Waiting, false, 1, 3), 1.0),
+        ];
+        assert_eq!(
+            admit(&q, "s", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+    }
+
+    #[test]
+    fn a_front_entry_ahead_sees_declared_weights_after_its_window() {
+        // Declared 2, measured 9. Past its window the front entry fits by
+        // declared weights (2 + 4), so it is the one to start, not `s`.
+        let q = |front_waited| {
+            [
+                using(e("r", State::Running, false, 2, 1), 9.0),
+                waited(e("f", State::Waiting, true, 4, 2), front_waited),
+                short(e("s", State::Waiting, false, 1, 3), 1.0),
+            ]
+        };
+        assert_eq!(
+            admit(&q(30.0), "s", 0, 0.0, LIMITS, None),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+        // Within it, 9 + 4 does not fit, and `s` (9 + 1) does.
+        assert_eq!(
+            admit(&q(29.9), "s", 0, 0.0, LIMITS, None),
+            Decision::Admitted
+        );
     }
 
     #[test]

@@ -7,6 +7,28 @@ the minor version).
 
 ## [Unreleased]
 
+### Added
+
+- **Short commands no longer wait behind a head that does not fit.** When
+  the head of the queue does not fit the free budget, a command behind it
+  whose learned wall time is at most `backfill_max_job_secs` (new, default
+  300; 0 restores strict FIFO) starts first if it fits. Commands with no
+  history never pass anyone, and an entry ahead that will start is never
+  overtaken. To keep the head from starving, nothing new passes an entry
+  that backfilled commands are holding up once it is `--front` or has
+  waited `backfill_max_wait_secs` (new, default 300); a head held up by
+  something else, such as a development server that never exits, is
+  passed for as long as that lasts. Estimates model the same rule.
+- **The waiting line names who holds the budget.** A line waiting on the
+  budget ends with `; held by <pid> w2 idle 52:30 <command>, ...` (the
+  biggest three running entries). `status` marks running entries `idle`
+  (running 5+ minutes, under 0.2 cores) and `[backfill]`, and says what
+  a head waiting on the budget needs and how much is free. Idle entries
+  are still charged their full weight: charging only measured use would
+  under-count work running in a Docker daemon or VM, and an idle server
+  can start a rebuild at any time (README, "Idle entries are charged
+  their weight").
+
 ### Fixed
 
 - The `front_jumps_the_queue` test no longer fails on a heavily loaded
