@@ -5,6 +5,8 @@ pub enum Error {
     Io(std::io::Error),
     Config(String),
     Ledger(String),
+    /// The ledger lock stayed busy for the whole timeout.
+    LockTimeout(String),
     Spawn(String),
 }
 
@@ -15,7 +17,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "{e}"),
             Error::Config(m) => write!(f, "config: {m}"),
-            Error::Ledger(m) => write!(f, "ledger: {m}"),
+            Error::Ledger(m) | Error::LockTimeout(m) => write!(f, "ledger: {m}"),
             Error::Spawn(m) => write!(f, "{m}"),
         }
     }

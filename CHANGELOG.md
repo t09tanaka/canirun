@@ -31,6 +31,21 @@ the minor version).
 
 ### Fixed
 
+- **A busy ledger lock no longer fails a queued command.** On a saturated
+  machine a holder of `ledger.lock` can stall for seconds, and every
+  `exec` waiting on it gave up after 10 s with `ledger: timed out` and
+  exit code 2, losing its place in the queue (one test with 40 waiters at
+  load ~250 lost 39 of them). `exec` (and the runner behind `submit`) now
+  skips that round and tries again, both when it joins the queue and
+  while it waits, still answering signals and `cancel` within about a
+  second. `status`, `jobs`, `wait`, `cancel` and `submit` read the ledger without
+  the lock when it stays busy for a second (saves are atomic renames) and
+  leave out entries whose lease is gone instead of failing. `gc` still
+  fails after 10 s.
+- **Fewer ledger writes while waiting.** The head of the queue no longer
+  rewrites the ledger on every poll it is held back by the CPU or memory
+  guard, and a running command rewrites its `using` value only when it
+  changes, so the lock is held less often.
 - The `front_jumps_the_queue` test no longer fails on a heavily loaded
   machine: its first job now holds the slot until the test releases it
   instead of sleeping for a fixed second.

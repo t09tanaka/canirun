@@ -133,6 +133,7 @@ fn sample_loop(id: &str, root: u32, stop: &mpsc::Receiver<()>) {
     let kind = ProcessRefreshKind::nothing().with_cpu();
     let mut sys = System::new();
     let mut peak = RecentPeak::default();
+    let mut recorded = None;
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
     loop {
         match stop.recv_timeout(SAMPLE_INTERVAL) {
@@ -149,22 +150,29 @@ fn sample_loop(id: &str, root: u32, stop: &mpsc::Receiver<()>) {
                 cpu_percent: p.cpu_usage(),
             })
             .collect();
-        record(id, peak.push(tree_cores(&procs, root)));
+        let cores = (peak.push(tree_cores(&procs, root)) * 10.0).round() / 10.0;
+        // An unchanged value is not written again: every write takes the
+        // ledger lock that waiting entries poll.
+        if recorded != Some(cores) && record(id, cores) {
+            recorded = Some(cores);
+        }
     }
 }
 
-fn record(id: &str, cores: f64) {
-    let Ok(_guard) = lock::ledger() else {
-        return;
+/// Write `cores` to the entry; false when it could not be written.
+fn record(id: &str, cores: f64) -> bool {
+    let Ok(Some(_guard)) = lock::try_ledger() else {
+        return false;
     };
     let path = paths::ledger_file();
     let Ok(mut ledger) = Ledger::load(&path) else {
-        return;
+        return false;
     };
-    if let Some(e) = ledger.find_mut(id) {
-        e.using = Some((cores * 10.0).round() / 10.0);
-        let _ = ledger.save(&path);
-    }
+    let Some(e) = ledger.find_mut(id) else {
+        return false;
+    };
+    e.using = Some(cores);
+    ledger.save(&path).is_ok()
 }
 
 #[cfg(test)]
