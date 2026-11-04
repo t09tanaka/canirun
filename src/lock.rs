@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(20);
 pub const LEDGER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overrides `LEDGER_LOCK_TIMEOUT`, in milliseconds (for tests).
+const LEDGER_LOCK_TIMEOUT_ENV: &str = "CANIRUN_LEDGER_LOCK_TIMEOUT_MS";
+/// How long `try_ledger` waits before giving up a round, short so a
+/// waiting `exec` still answers signals promptly.
+const TRY_ROUND: Duration = Duration::from_secs(1);
 
 /// A held exclusive lock, released on drop.
 #[derive(Debug)]
@@ -46,7 +51,7 @@ pub fn acquire(path: &Path, timeout: Duration) -> Result<Lock> {
             Ok(()) => return Ok(Lock { file }),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if start.elapsed() >= timeout {
-                    return Err(Error::Ledger(format!(
+                    return Err(Error::LockTimeout(format!(
                         "timed out after {timeout:?} waiting for {}",
                         path.display()
                     )));
@@ -58,8 +63,62 @@ pub fn acquire(path: &Path, timeout: Duration) -> Result<Lock> {
     }
 }
 
+fn ledger_lock_timeout() -> Duration {
+    std::env::var(LEDGER_LOCK_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(LEDGER_LOCK_TIMEOUT)
+}
+
 pub fn ledger() -> Result<Lock> {
-    acquire(&paths::ledger_lock(), LEDGER_LOCK_TIMEOUT)
+    acquire(&paths::ledger_lock(), ledger_lock_timeout())
+}
+
+/// The ledger lock, or `None` when it stayed busy for a round (at most
+/// `TRY_ROUND`), for callers that can skip a round and try again later.
+pub fn try_ledger() -> Result<Option<Lock>> {
+    match acquire(&paths::ledger_lock(), ledger_lock_timeout().min(TRY_ROUND)) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(Error::LockTimeout(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The ledger with dead entries removed, for readers.
+pub fn load_reaped() -> Result<Ledger> {
+    Ok(snapshot()?.ledger)
+}
+
+/// A ledger read by `snapshot`.
+pub struct Snapshot {
+    pub ledger: Ledger,
+    /// False when the lock stayed busy and the file was read without it,
+    /// so an entry still waiting for the lock to register is missing.
+    pub locked: bool,
+}
+
+/// The ledger with dead entries removed. Under the lock the removal is
+/// saved. When the lock stays busy, the file is read without it (saves
+/// are atomic renames, so it is never half-written) and dead entries are
+/// only left out of the returned copy.
+pub fn snapshot() -> Result<Snapshot> {
+    let Some(_guard) = try_ledger()? else {
+        let mut ledger = Ledger::load(&paths::ledger_file())?;
+        ledger.entries.retain(|e| lease_is_held(&e.id));
+        return Ok(Snapshot {
+            ledger,
+            locked: false,
+        });
+    };
+    let mut ledger = Ledger::load(&paths::ledger_file())?;
+    if !reap_dead(&mut ledger).is_empty() {
+        ledger.save(&paths::ledger_file())?;
+    }
+    Ok(Snapshot {
+        ledger,
+        locked: true,
+    })
 }
 
 /// Take the lease for `id`. Held by the owning canirun process until it

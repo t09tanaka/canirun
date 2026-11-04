@@ -296,7 +296,10 @@ takes over.
 State lives in `~/.local/state/canirun/` (or `$XDG_STATE_HOME/canirun/`):
 
 - `ledger.json` — the queue: id, pid, state, weight, repo, argv, times.
-  Writes are temp-file + rename under `ledger.lock`.
+  Writes are temp-file + rename under `ledger.lock`. A waiting `exec` that
+  cannot get the lock skips that poll and tries again; `status`, `jobs`,
+  `wait`, `cancel` and `submit` read the file without the lock when it
+  stays busy for a second.
 - `leases/<id>.lock` — one file per entry; the owning `canirun` holds an
   exclusive `flock` on it from registration until exit. **Liveness is
   "this flock cannot be taken."** Anyone holding the ledger lock probes

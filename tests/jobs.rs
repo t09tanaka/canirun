@@ -362,3 +362,45 @@ fn submit_warns_when_the_runner_is_slow_to_register() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).contains("lost"));
 }
+
+#[test]
+fn wait_does_not_call_a_job_lost_while_the_ledger_lock_is_busy() {
+    use fs2::FileExt;
+    let env = TestEnv::new("budget = 4\n");
+    // Held as a holder stalled on a saturated machine would, so the
+    // runner cannot register until it is released.
+    fs::create_dir_all(env.state()).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(env.state().join("ledger.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let out = env
+        .cmd()
+        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .args(["submit", "--", "echo", "ran"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // submit gave up waiting after 5 s; the wait below runs past the
+    // starting grace with the runner still unregistered.
+    let waiter = env
+        .cmd()
+        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .args(["wait", &id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(2));
+    drop(lock);
+    let out = waiter.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("ran"), "{stdout}");
+    assert!(!stdout.contains("lost"), "{stdout}");
+}

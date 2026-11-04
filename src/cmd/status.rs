@@ -2,8 +2,8 @@ use crate::admit::{self, Decision, Reason, State};
 use crate::config::Config;
 use crate::display::{fmt_bytes, fmt_duration, truncate};
 use crate::error::Result;
-use crate::ledger::{Entry, Ledger};
-use crate::{live, lock, paths};
+use crate::ledger::Entry;
+use crate::{live, lock};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
@@ -14,14 +14,7 @@ const IDLE_CORES: f64 = 0.2;
 const IDLE_AFTER: Duration = Duration::from_secs(300);
 
 pub fn run(cfg: &Config, json: bool) -> Result<i32> {
-    let ledger = {
-        let _guard = lock::ledger()?;
-        let mut ledger = Ledger::load(&paths::ledger_file())?;
-        if !lock::reap_dead(&mut ledger).is_empty() {
-            ledger.save(&paths::ledger_file())?;
-        }
-        ledger
-    };
+    let ledger = lock::load_reaped()?;
     if json {
         println!("{}", serde_json::to_string_pretty(&ledger)?);
         return Ok(0);

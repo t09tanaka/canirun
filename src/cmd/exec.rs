@@ -28,8 +28,7 @@ fn nested_lease_is_live() -> Result<bool> {
         return Ok(false);
     };
     let id = id.to_string_lossy().into_owned();
-    let _guard = lock::ledger()?;
-    let ledger = Ledger::load(&paths::ledger_file())?;
+    let ledger = lock::load_reaped()?;
     Ok(ledger
         .find(&id)
         .map(|e| e.state == State::Running && lock::lease_is_held(&id))
@@ -151,8 +150,14 @@ pub fn run_gated(
     // the entry is never observed without a held lease.
     let _lease = lock::take_lease(id)?;
     runner::install_wait_handlers();
-    {
-        let _guard = lock::ledger()?;
+    // A busy ledger lock (a saturated machine can stall its holder for
+    // seconds) is retried, here and while waiting, rather than failing a
+    // command that may have queued for minutes.
+    loop {
+        exit_if_stopped(id, before_exit, cancelled);
+        let Some(_guard) = lock::try_ledger()? else {
+            continue;
+        };
         let mut ledger = Ledger::load(&paths::ledger_file())?;
         lock::reap_dead(&mut ledger);
         let seq = ledger.take_seq();
@@ -175,6 +180,7 @@ pub fn run_gated(
             backfilled: false,
         });
         ledger.save(&paths::ledger_file())?;
+        break;
     }
 
     let enqueued = Instant::now();
@@ -185,21 +191,13 @@ pub fn run_gated(
         every_non_tty: Duration::from_secs(cfg.progress_interval_secs_non_tty.max(1)),
     };
     loop {
-        let sig = runner::take_pending();
-        if sig != 0 {
-            remove_entry(id);
-            before_exit(128 + sig);
-            runner::reraise(sig);
-        }
-        if cancelled() {
-            remove_entry(id);
-            before_exit(128 + libc::SIGTERM);
-            runner::reraise(libc::SIGTERM);
-        }
+        exit_if_stopped(id, before_exit, cancelled);
         // Phase 1 (under the lock, no OS sampling): queue position and
         // budget. Only a budget-admissible head pays for a live snapshot.
         let (first, queue, est, holders) = {
-            let _guard = lock::ledger()?;
+            let Some(_guard) = lock::try_ledger()? else {
+                continue;
+            };
             let mut ledger = Ledger::load(&paths::ledger_file())?;
             if !lock::reap_dead(&mut ledger).is_empty() {
                 ledger.save(&paths::ledger_file())?;
@@ -231,9 +229,11 @@ pub fn run_gated(
                 } else {
                     None
                 };
-                let _guard = lock::ledger()?;
+                let Some(_guard) = lock::try_ledger()? else {
+                    continue;
+                };
                 let mut ledger = Ledger::load(&paths::ledger_file())?;
-                lock::reap_dead(&mut ledger);
+                let reaped = !lock::reap_dead(&mut ledger).is_empty();
                 let queue = ledger.queue();
                 let decision = admit::admit(
                     &queue,
@@ -255,7 +255,9 @@ pub fn run_gated(
                         e.backfilled = backfilled;
                     }
                 }
-                ledger.save(&paths::ledger_file())?;
+                if reaped || decision == Decision::Admitted {
+                    ledger.save(&paths::ledger_file())?;
+                }
                 decision
             }
         };
@@ -343,6 +345,22 @@ pub fn finish(exit: Exit) -> i32 {
     match exit {
         Exit::Code(c) => c,
         Exit::Signal(s) => runner::reraise(s),
+    }
+}
+
+/// Die as `run_gated` documents when a signal arrived or the job was
+/// cancelled while waiting.
+fn exit_if_stopped(id: &str, before_exit: &dyn Fn(i32), cancelled: &dyn Fn() -> bool) {
+    let sig = runner::take_pending();
+    if sig != 0 {
+        remove_entry(id);
+        before_exit(128 + sig);
+        runner::reraise(sig);
+    }
+    if cancelled() {
+        remove_entry(id);
+        before_exit(128 + libc::SIGTERM);
+        runner::reraise(libc::SIGTERM);
     }
 }
 

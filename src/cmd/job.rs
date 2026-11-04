@@ -40,7 +40,7 @@ pub fn submit(cfg: &Config, opts: Opts, detach: bool) -> Result<i32> {
     // their order and their estimates count each other.
     let deadline = Instant::now() + Duration::from_secs(STARTING_GRACE_SECS as u64);
     let ledger = loop {
-        let ledger = load_ledger_reaped()?;
+        let ledger = lock::load_reaped()?;
         let gone = jobs::read_exit(&job.id).is_some() || matches!(runner.try_wait(), Ok(Some(_)));
         if ledger.find(&job.id).is_some() || gone || Instant::now() >= deadline {
             break ledger;
@@ -146,15 +146,6 @@ pub fn state_of(id: &str, ledger: &Ledger) -> JobState {
     }
 }
 
-fn load_ledger_reaped() -> Result<Ledger> {
-    let _guard = lock::ledger()?;
-    let mut ledger = Ledger::load(&paths::ledger_file())?;
-    if !lock::reap_dead(&mut ledger).is_empty() {
-        ledger.save(&paths::ledger_file())?;
-    }
-    Ok(ledger)
-}
-
 pub fn wait(ids: &[String], no_output: bool) -> Result<i32> {
     if ids.is_empty() {
         return Err(Error::Spawn(
@@ -170,7 +161,7 @@ pub fn wait(ids: &[String], no_output: bool) -> Result<i32> {
     let mut final_code = 0;
     let mut reported: Vec<&str> = Vec::new();
     while reported.len() < ids.len() {
-        let ledger = load_ledger_reaped()?;
+        let lock::Snapshot { ledger, locked } = lock::snapshot()?;
         let mut progressed = false;
         for id in ids {
             if reported.contains(&id.as_str()) {
@@ -181,9 +172,13 @@ pub fn wait(ids: &[String], no_output: bool) -> Result<i32> {
                 JobState::Done(c) => Some(c),
                 JobState::Lost => {
                     // The runner may be between registration steps; give
-                    // it two polls before declaring it lost.
+                    // it two polls before declaring it lost. A read made
+                    // without the lock does not count: the runner may be
+                    // waiting for that same lock to register.
                     let n = lost_strikes.entry(id.as_str()).or_default();
-                    *n += 1;
+                    if locked {
+                        *n += 1;
+                    }
                     if *n >= 3 {
                         Some(2)
                     } else {
@@ -245,7 +240,7 @@ fn report(id: &str, code: i32, lost: bool, no_output: bool) -> Result<()> {
 }
 
 pub fn list(cfg: &Config, json: bool) -> Result<i32> {
-    let ledger = load_ledger_reaped()?;
+    let ledger = lock::load_reaped()?;
     let all = jobs::list()?;
     if json {
         let rows: Vec<serde_json::Value> = all
@@ -312,7 +307,7 @@ pub fn cancel(ids: &[String]) -> Result<i32> {
     if ids.is_empty() {
         return Err(Error::Spawn("usage: canirun cancel <job-id>...".into()));
     }
-    let ledger = load_ledger_reaped()?;
+    let ledger = lock::load_reaped()?;
     for id in ids {
         jobs::load(id)?;
         match state_of(id, &ledger) {

@@ -490,6 +490,97 @@ fn sigterm_is_forwarded_and_exit_mirrors_child() {
     assert!(env.entries().is_empty());
 }
 
+/// Hold the ledger lock from the test, as a holder stalled on a saturated
+/// machine would, until the returned file is dropped.
+fn hold_ledger_lock(env: &TestEnv) -> fs::File {
+    use fs2::FileExt;
+    fs::create_dir_all(env.state()).unwrap();
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(env.state().join("ledger.lock"))
+        .unwrap();
+    f.lock_exclusive().unwrap();
+    f
+}
+
+/// `canirun exec -- echo ran` giving up on the ledger lock after 200 ms.
+fn spawn_impatient_exec(env: &TestEnv) -> Child {
+    env.cmd()
+        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .args(["exec", "--", "echo", "ran"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn assert_ran_without_timeout(child: Child) {
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("timed out"), "{err}");
+    assert_eq!(stdout(&out).trim(), "ran");
+}
+
+#[test]
+fn waiting_exec_survives_a_busy_ledger_lock() {
+    let env = TestEnv::new().with_config("budget = 1\n");
+    let dir = env.marker_dir();
+    let mut hog = env.spawn_exec(&[], &gated_script(&dir, "hog"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().iter().any(|e| e["state"] == "running")
+    }));
+    let waiter = spawn_impatient_exec(&env);
+    assert!(wait_until(Duration::from_secs(5), || env.entries().len() == 2));
+    let lock = hold_ledger_lock(&env);
+    thread::sleep(Duration::from_millis(1500));
+    drop(lock);
+    fs::write(dir.join("hog.release"), "").unwrap();
+    assert!(hog.wait().unwrap().success());
+    assert_ran_without_timeout(waiter);
+}
+
+#[test]
+fn exec_registers_once_a_busy_ledger_lock_frees() {
+    let env = TestEnv::new();
+    let lock = hold_ledger_lock(&env);
+    let exec = spawn_impatient_exec(&env);
+    thread::sleep(Duration::from_millis(1000));
+    drop(lock);
+    assert_ran_without_timeout(exec);
+}
+
+#[test]
+fn status_reads_the_ledger_while_the_lock_is_busy() {
+    let env = TestEnv::new().with_config("budget = 1\n");
+    let dir = env.marker_dir();
+    let mut hog = env.spawn_exec(&[], &gated_script(&dir, "hog"));
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().iter().any(|e| e["state"] == "running")
+    }));
+    let lock = hold_ledger_lock(&env);
+    let out = env
+        .cmd()
+        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    drop(lock);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ledger: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(ledger["entries"].as_array().unwrap().len(), 1);
+    fs::write(dir.join("hog.release"), "").unwrap();
+    assert!(hog.wait().unwrap().success());
+}
+
 #[test]
 fn sigint_while_waiting_removes_entry() {
     let env = TestEnv::new().with_config("budget = 1\n");
