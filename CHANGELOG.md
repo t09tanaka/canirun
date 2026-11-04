@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-04
+
 ### Added
 
 - **Short commands no longer wait behind a head that does not fit.** When
