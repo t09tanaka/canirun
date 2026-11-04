@@ -7,6 +7,18 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-05
+
+### Fixed
+
+- **macOS: available memory no longer drops to 0 when much is compressed.**
+  The memory guard counted free + inactive + purgeable pages minus the
+  pages the compressor occupies, which are none of those. With a few tens
+  of GiB compressed, `status` showed `machine 0 KiB available` and every
+  command waited for `memory` while anything else ran, even though most
+  memory was reclaimable. canirun now reads the page counts itself and no
+  longer subtracts the compressor.
+
 ## [0.4.1] - 2026-11-04
 
 ### Added
