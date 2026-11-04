@@ -42,8 +42,9 @@ the minor version).
   while it waits, still answering signals and `cancel` within about a
   second. `status`, `jobs`, `wait`, `cancel` and `submit` read the ledger without
   the lock when it stays busy for a second (saves are atomic renames) and
-  leave out entries whose lease is gone instead of failing. `gc` still
-  fails after 10 s.
+  leave out entries whose lease is gone instead of failing; `wait` does
+  not count such a read toward calling a job lost, since its runner may
+  be waiting for the same lock to register. `gc` still fails after 10 s.
 - **Fewer ledger writes while waiting.** The head of the queue no longer
   rewrites the ledger on every poll it is held back by the CPU or memory
   guard, and a running command rewrites its `using` value only when it

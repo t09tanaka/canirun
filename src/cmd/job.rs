@@ -161,7 +161,7 @@ pub fn wait(ids: &[String], no_output: bool) -> Result<i32> {
     let mut final_code = 0;
     let mut reported: Vec<&str> = Vec::new();
     while reported.len() < ids.len() {
-        let ledger = lock::load_reaped()?;
+        let lock::Snapshot { ledger, locked } = lock::snapshot()?;
         let mut progressed = false;
         for id in ids {
             if reported.contains(&id.as_str()) {
@@ -172,9 +172,13 @@ pub fn wait(ids: &[String], no_output: bool) -> Result<i32> {
                 JobState::Done(c) => Some(c),
                 JobState::Lost => {
                     // The runner may be between registration steps; give
-                    // it two polls before declaring it lost.
+                    // it two polls before declaring it lost. A read made
+                    // without the lock does not count: the runner may be
+                    // waiting for that same lock to register.
                     let n = lost_strikes.entry(id.as_str()).or_default();
-                    *n += 1;
+                    if locked {
+                        *n += 1;
+                    }
                     if *n >= 3 {
                         Some(2)
                     } else {

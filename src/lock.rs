@@ -85,21 +85,40 @@ pub fn try_ledger() -> Result<Option<Lock>> {
     }
 }
 
-/// The ledger with dead entries removed, for readers. Under the lock the
-/// removal is saved. When the lock stays busy, the file is read without it
-/// (saves are atomic renames, so it is never half-written) and dead
-/// entries are only left out of the returned copy.
+/// The ledger with dead entries removed, for readers.
 pub fn load_reaped() -> Result<Ledger> {
+    Ok(snapshot()?.ledger)
+}
+
+/// A ledger read by `snapshot`.
+pub struct Snapshot {
+    pub ledger: Ledger,
+    /// False when the lock stayed busy and the file was read without it,
+    /// so an entry still waiting for the lock to register is missing.
+    pub locked: bool,
+}
+
+/// The ledger with dead entries removed. Under the lock the removal is
+/// saved. When the lock stays busy, the file is read without it (saves
+/// are atomic renames, so it is never half-written) and dead entries are
+/// only left out of the returned copy.
+pub fn snapshot() -> Result<Snapshot> {
     let Some(_guard) = try_ledger()? else {
         let mut ledger = Ledger::load(&paths::ledger_file())?;
         ledger.entries.retain(|e| lease_is_held(&e.id));
-        return Ok(ledger);
+        return Ok(Snapshot {
+            ledger,
+            locked: false,
+        });
     };
     let mut ledger = Ledger::load(&paths::ledger_file())?;
     if !reap_dead(&mut ledger).is_empty() {
         ledger.save(&paths::ledger_file())?;
     }
-    Ok(ledger)
+    Ok(Snapshot {
+        ledger,
+        locked: true,
+    })
 }
 
 /// Take the lease for `id`. Held by the owning canirun process until it
