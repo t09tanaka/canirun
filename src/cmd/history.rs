@@ -1,10 +1,9 @@
-use crate::cmd::status::label;
-use crate::config::Config;
-use crate::display::{fmt_bytes, truncate};
-use crate::error::Result;
-use crate::history::{self, Record};
-use crate::paths;
-use crate::weight::{self, Measurement};
+use canirun::config::Config;
+use canirun::display::{fmt_bytes, label, truncate};
+use canirun::error::Result;
+use canirun::history::{self, Record};
+use canirun::weight::{self, Measurement};
+use canirun::{exec, Context};
 use std::collections::BTreeMap;
 
 pub struct Opts {
@@ -14,10 +13,18 @@ pub struct Opts {
     pub limit: usize,
 }
 
-pub fn run(cfg: &Config, opts: Opts) -> Result<i32> {
-    let all = history::read_all(&paths::history_file())?;
+pub fn run(ctx: &Context, cfg: &Config, opts: Opts) -> Result<i32> {
+    let all = history::read_all(ctx.paths.history_file())?;
     let filter_hash = if opts.key.is_some() || !opts.argv.is_empty() {
-        Some(crate::cmd::command_key(opts.key.as_deref(), &opts.argv)?.hash)
+        Some(
+            exec::command_key(
+                ctx,
+                &std::env::current_dir()?,
+                opts.key.as_deref(),
+                &opts.argv,
+            )?
+            .hash,
+        )
     } else {
         None
     };

@@ -87,7 +87,11 @@ impl Ledger {
 
     /// What admission sees of every entry, with waiting times as of now.
     pub fn queue(&self) -> Vec<QueueEntry> {
-        let now = Utc::now();
+        self.queue_at(Utc::now())
+    }
+
+    /// [`Ledger::queue`] as of `now`.
+    pub fn queue_at(&self, now: DateTime<Utc>) -> Vec<QueueEntry> {
         self.entries
             .iter()
             .map(|e| QueueEntry {

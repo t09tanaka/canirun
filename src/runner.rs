@@ -1,62 +1,18 @@
 //! Spawn the gated command, forward signals, and collect rusage via
 //! `wait4` (spec `exec` steps 5–6).
+//!
+//! Nothing here installs a signal handler or reads the process
+//! environment: stop signals arrive through [`crate::Supervisor`], which
+//! the caller owns. To run several commands in one process, give each run
+//! its own supervisor; this module has no process-global state. (A
+//! supervisor can only interrupt `wait4` on the thread that receives the
+//! signal, so a multi-threaded embedder cancels through the `cancelled`
+//! hook of [`crate::exec::run_gated`] and kills by pid instead.)
 
 use crate::error::{Error, Result};
+use crate::Context;
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Instant;
-
-static PENDING: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn on_signal(sig: libc::c_int) {
-    PENDING.store(sig, Ordering::SeqCst);
-}
-
-/// Returns and clears the last signal delivered to a handler installed
-/// here, or 0.
-pub fn take_pending() -> i32 {
-    PENDING.swap(0, Ordering::SeqCst)
-}
-
-fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0; // no SA_RESTART: wait4 must return EINTR
-        libc::sigaction(sig, &sa, std::ptr::null_mut());
-    }
-}
-
-/// While waiting in the queue: SIGINT/SIGTERM/SIGHUP set a flag so the
-/// loop can remove its entry and exit.
-pub fn install_wait_handlers() {
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        set_handler(
-            sig,
-            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
-        );
-    }
-}
-
-fn install_run_handlers() {
-    // Terminal-originated signals reach the child directly (same process
-    // group); a second copy from us would make test runners force-quit.
-    set_handler(libc::SIGINT, libc::SIG_IGN);
-    set_handler(libc::SIGQUIT, libc::SIG_IGN);
-    for sig in [libc::SIGTERM, libc::SIGHUP] {
-        set_handler(
-            sig,
-            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
-        );
-    }
-}
-
-fn restore_defaults() {
-    for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
-        set_handler(sig, libc::SIG_DFL);
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Exit {
@@ -82,30 +38,38 @@ pub struct Outcome {
     pub max_rss_bytes: u64,
 }
 
-/// Run `argv` with inherited stdio in our process group, with
+/// Run `argv` with inherited stdio in our process group, in `cwd`, with
 /// `CANIRUN_LEASE=lease` in its environment. With `measure`, the child's
 /// process tree is sampled while it runs and the cores it uses are written
 /// to the ledger entry `lease`.
-pub fn run(argv: &[String], lease: &str, measure: bool) -> Result<Outcome> {
+pub fn run(
+    ctx: &Context,
+    argv: &[String],
+    cwd: &Path,
+    lease: &str,
+    measure: bool,
+) -> Result<Outcome> {
     let (prog, args) = argv
         .split_first()
         .ok_or_else(|| Error::Spawn("no command given".into()))?;
-    install_run_handlers();
-    let start = Instant::now();
+    ctx.supervisor.running();
+    let start = ctx.clock.monotonic();
     let child = Command::new(prog)
         .args(args)
+        .current_dir(cwd)
         .env("CANIRUN_LEASE", lease)
         .spawn()
         .map_err(|e| {
-            restore_defaults();
+            ctx.supervisor.finished();
             Error::Spawn(format!("cannot run {prog:?}: {e}{}", spawn_hint(argv, &e)))
         })?;
     let pid = child.id() as libc::pid_t;
     // Dropped (stopped and joined) once the child has been reaped.
-    let _monitor = measure.then(|| crate::usage::Monitor::start(lease.to_string(), child.id()));
+    let _monitor =
+        measure.then(|| crate::usage::Monitor::start(ctx.clone(), lease.to_string(), child.id()));
     // A signal delivered between handler installation and spawn is
     // forwarded now rather than waiting for the next EINTR.
-    let early = take_pending();
+    let early = ctx.supervisor.take_pending();
     if early != 0 {
         unsafe {
             libc::kill(pid, early);
@@ -121,7 +85,7 @@ pub fn run(argv: &[String], lease: &str, measure: bool) -> Result<Outcome> {
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINTR) {
-            let sig = take_pending();
+            let sig = ctx.supervisor.take_pending();
             if sig != 0 {
                 unsafe {
                     libc::kill(pid, sig);
@@ -129,11 +93,11 @@ pub fn run(argv: &[String], lease: &str, measure: bool) -> Result<Outcome> {
             }
             continue;
         }
-        restore_defaults();
+        ctx.supervisor.finished();
         return Err(Error::Spawn(format!("wait4 failed: {err}")));
     }
-    restore_defaults();
-    let wall_secs = start.elapsed().as_secs_f64();
+    ctx.supervisor.finished();
+    let wall_secs = (ctx.clock.monotonic().saturating_sub(start)).as_secs_f64();
 
     let exit = if libc::WIFEXITED(status) {
         Exit::Code(libc::WEXITSTATUS(status))
@@ -179,16 +143,6 @@ fn normalise_maxrss(raw: u64) -> u64 {
     } else {
         raw.saturating_mul(1024)
     }
-}
-
-/// Terminate ourselves the way the child did, so the calling shell sees
-/// the same signal death. Falls back to exiting 128+N.
-pub fn reraise(sig: i32) -> ! {
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
-    std::process::exit(128 + sig)
 }
 
 #[cfg(test)]

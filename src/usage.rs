@@ -7,7 +7,7 @@
 //! declared. Nothing here slows down or stops the command.
 
 use crate::ledger::Ledger;
-use crate::{lock, paths};
+use crate::{lock, Context};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -84,7 +84,7 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    pub fn start(id: String, root: u32) -> Monitor {
+    pub fn start(ctx: Context, id: String, root: u32) -> Monitor {
         let (tx, rx) = mpsc::channel::<()>();
         // The sampler must never be the thread a SIGTERM / SIGHUP lands
         // on: the main thread relies on it interrupting `wait4`. Block
@@ -92,7 +92,7 @@ impl Monitor {
         let old = block_all_signals();
         let handle = std::thread::Builder::new()
             .name("canirun-usage".into())
-            .spawn(move || sample_loop(&id, root, &rx))
+            .spawn(move || sample_loop(&ctx, &id, root, &rx))
             .ok();
         restore_signals(&old);
         Monitor {
@@ -127,7 +127,7 @@ fn restore_signals(old: &libc::sigset_t) {
     }
 }
 
-fn sample_loop(id: &str, root: u32, stop: &mpsc::Receiver<()>) {
+fn sample_loop(ctx: &Context, id: &str, root: u32, stop: &mpsc::Receiver<()>) {
     // Do not keep /proc files open between samples (Linux).
     sysinfo::set_open_files_limit(0);
     let kind = ProcessRefreshKind::nothing().with_cpu();
@@ -153,18 +153,18 @@ fn sample_loop(id: &str, root: u32, stop: &mpsc::Receiver<()>) {
         let cores = (peak.push(tree_cores(&procs, root)) * 10.0).round() / 10.0;
         // An unchanged value is not written again: every write takes the
         // ledger lock that waiting entries poll.
-        if recorded != Some(cores) && record(id, cores) {
+        if recorded != Some(cores) && record(ctx, id, cores) {
             recorded = Some(cores);
         }
     }
 }
 
 /// Write `cores` to the entry; false when it could not be written.
-fn record(id: &str, cores: f64) -> bool {
-    let Ok(Some(_guard)) = lock::try_ledger() else {
+fn record(ctx: &Context, id: &str, cores: f64) -> bool {
+    let Ok(Some(_guard)) = lock::try_ledger(ctx) else {
         return false;
     };
-    let path = paths::ledger_file();
+    let path = ctx.paths.ledger_file();
     let Ok(mut ledger) = Ledger::load(&path) else {
         return false;
     };
