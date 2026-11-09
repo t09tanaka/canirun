@@ -14,6 +14,7 @@
 use crate::marker::{HiddenProc, ProcRef, Scan};
 use crate::reap::Probe;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 /// The most descendants recorded for one command.
 pub const MAX_DESCENDANTS: usize = 4096;
@@ -103,6 +104,9 @@ pub fn descendants_of(table: &[Row], root: ProcRef, known: &[ProcRef]) -> Vec<Pr
         // zombie) cannot be matched by start time. It is our own unreaped
         // child, so its pid is still ours: seed by pid so its live children
         // are walked and recorded before they are reparented.
+        // This only arises for our own zombie child before `wait4`; a pid
+        // reused in that window can at worst cause a false hold, or in
+        // theory make an unrelated process look like ours: negligible.
         seeds.extend(
             table
                 .iter()
@@ -174,15 +178,51 @@ pub fn prune(table: &[Row], recorded: &[ProcRef], missed: &[ProcRef]) -> Pruned 
     }
 }
 
-/// One look at the table: prune, find what is new and record it. True when
-/// the record grew or became truncated (the caller then persists it).
+/// How one look at the table went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Step {
+    /// The record grew or became truncated (the caller then persists it).
+    pub changed: bool,
+    /// The look could not be believed (see [`look_failed`]).
+    pub failed: bool,
+}
+
+/// Does the table list the command itself? A root without a start time (an
+/// unreaped zombie) is matched by pid alone.
+pub fn contains_root(table: &[Row], root: ProcRef) -> bool {
+    table.iter().any(|r| {
+        r.proc.pid == root.pid
+            && (root.start_time.is_none() || r.proc.start_time == root.start_time)
+    })
+}
+
+/// A look that cannot be believed: the read failed or came back empty, or it
+/// does not list the command although the command is still there
+/// (`root_gone` false). Nothing can be ruled out from it.
+pub fn look_failed(table: &[Row], root: ProcRef, root_gone: bool) -> bool {
+    table.is_empty() || (!root_gone && !contains_root(table, root))
+}
+
+/// One look at the table: prune, find what is new and record it. A look that
+/// failed is a tracker failure: the record becomes truncated (a change, to be
+/// persisted at once) and is otherwise left as it is, so no recorded entry is
+/// dropped on the strength of a bad read.
 pub fn step(
     table: &[Row],
     root: ProcRef,
+    root_gone: bool,
     tracked: &mut Tracked,
     missed: &mut Vec<ProcRef>,
     cap: usize,
-) -> bool {
+) -> Step {
+    if look_failed(table, root, root_gone) {
+        let changed = !tracked.truncated;
+        tracked.truncated = true;
+        return Step {
+            changed,
+            failed: true,
+        };
+    }
     let pruned = prune(table, &tracked.descendants, missed);
     tracked.descendants = pruned.kept;
     *missed = pruned.missed;
@@ -191,7 +231,23 @@ pub fn step(
     let changed = !m.added.is_empty() || m.truncated != tracked.truncated;
     tracked.descendants.extend(m.added);
     tracked.truncated = m.truncated;
-    changed
+    Step {
+        changed,
+        failed: false,
+    }
+}
+
+/// How long the sidecar's `recorded_at` may go without a write while the
+/// record does not change.
+pub const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// Is a write due after `step`? Always when the record changed. A good look
+/// that changed nothing still stamps `recorded_at` (it is a heartbeat: the
+/// tracker was alive then), but at most once per [`HEARTBEAT`]. A failed look
+/// that changed nothing stamps nothing: the tracker was not working.
+/// `since_write` is the time since the last write, `None` before the first.
+pub fn write_due(step: Step, since_write: Option<Duration>) -> bool {
+    step.changed || (!step.failed && since_write.is_none_or(|d| d >= HEARTBEAT))
 }
 
 /// What recording `found` changes.
@@ -325,32 +381,167 @@ mod tests {
         assert_eq!((r.kept, r.missed), (vec![a], vec![]));
     }
 
+    fn changed(
+        table: &[Row],
+        root: ProcRef,
+        t: &mut Tracked,
+        missed: &mut Vec<ProcRef>,
+        cap: usize,
+    ) -> bool {
+        let s = step(table, root, false, t, missed, cap);
+        assert!(!s.failed, "{table:?}");
+        s.changed
+    }
+
     #[test]
     fn step_survives_one_missed_look_and_follows_the_tree() {
         let root = p(5, 50);
         let child = p(6, 60);
         let full = [row(5, 1, 50), row(6, 5, 60)];
-        let none: [Row; 0] = [];
+        // The root is listed, its child is not: one missed look.
+        let none = [row(5, 1, 50)];
         let mut t = Tracked::default();
         let mut missed = Vec::new();
-        assert!(step(&full, root, &mut t, &mut missed, 10));
+        assert!(changed(&full, root, &mut t, &mut missed, 10));
         assert_eq!(t.descendants, vec![child]);
         // One look that does not show it: still recorded, no change.
-        assert!(!step(&none, root, &mut t, &mut missed, 10));
+        assert!(!changed(&none, root, &mut t, &mut missed, 10));
         assert_eq!(t.descendants, vec![child]);
         assert_eq!(missed, vec![child]);
         // It is back: nothing new, the miss is forgotten.
-        assert!(!step(&full, root, &mut t, &mut missed, 10));
+        assert!(!changed(&full, root, &mut t, &mut missed, 10));
         assert!(missed.is_empty());
         // Two empty looks drop it.
-        step(&none, root, &mut t, &mut missed, 10);
-        step(&none, root, &mut t, &mut missed, 10);
+        changed(&none, root, &mut t, &mut missed, 10);
+        changed(&none, root, &mut t, &mut missed, 10);
         assert!(t.descendants.is_empty());
         // The cap marks the record truncated, which is a change.
         let many = [row(5, 1, 50), row(6, 5, 60), row(7, 5, 61)];
         let mut t = Tracked::default();
-        assert!(step(&many, root, &mut t, &mut Vec::new(), 1));
+        assert!(changed(&many, root, &mut t, &mut Vec::new(), 1));
         assert!(t.truncated && t.descendants.len() == 1);
+    }
+
+    #[test]
+    fn more_descendants_than_the_cap_keep_the_hold_even_after_they_are_gone() {
+        let root = p(5, 50);
+        let many = [row(5, 1, 50), row(6, 5, 60), row(7, 5, 61), row(8, 5, 62)];
+        let mut t = Tracked::default();
+        let mut missed = Vec::new();
+        assert!(changed(&many, root, &mut t, &mut missed, 2));
+        assert!(t.truncated && t.descendants.len() == 2, "{t:?}");
+        // They all end: the record says nothing runs, but the dropped ones
+        // are unknown, so a clear scan is not believed.
+        let gone = [row(5, 1, 50)];
+        for _ in 0..3 {
+            changed(&gone, root, &mut t, &mut missed, 2);
+        }
+        assert!(t.descendants.is_empty() && t.truncated, "{t:?}");
+        let held = with_recorded(
+            Scan::new(Probe::Gone, vec![]),
+            alive_in(&gone, &t.descendants),
+            t.truncated,
+        );
+        assert_eq!(held.probe, Probe::Unknown);
+        assert!(!step(&gone, root, false, &mut t, &mut missed, 2).changed);
+        assert!(t.truncated, "sticky");
+    }
+
+    #[test]
+    fn a_look_that_cannot_be_believed_truncates_and_drops_nothing() {
+        let root = p(5, 50);
+        let child = p(6, 60);
+        let full = [row(5, 1, 50), row(6, 5, 60)];
+        let mut t = Tracked::default();
+        let mut missed = Vec::new();
+        assert!(changed(&full, root, &mut t, &mut missed, 10));
+        let before = t.descendants.clone();
+        // Empty, even though the command is gone: a failed read.
+        let none: [Row; 0] = [];
+        for gone in [true, false] {
+            let mut t2 = Tracked {
+                descendants: before.clone(),
+                truncated: false,
+            };
+            let mut m2 = vec![child];
+            let s = step(&none, root, gone, &mut t2, &mut m2, 10);
+            assert_eq!(
+                s,
+                Step {
+                    changed: true,
+                    failed: true
+                }
+            );
+            // Not pruned, even though it was already missed once.
+            assert_eq!(t2.descendants, vec![child]);
+            assert_eq!(m2, vec![child]);
+            assert!(t2.truncated);
+        }
+        // A table without the command although it still runs.
+        let other = [row(9, 1, 90)];
+        let s = step(&other, root, false, &mut t, &mut missed, 10);
+        assert_eq!(
+            s,
+            Step {
+                changed: true,
+                failed: true
+            }
+        );
+        assert_eq!(t.descendants, before);
+        // Already truncated: failing again changes nothing.
+        let s = step(&other, root, false, &mut t, &mut missed, 10);
+        assert_eq!(
+            s,
+            Step {
+                changed: false,
+                failed: true
+            }
+        );
+        // A command that has ended or is gone is not a failure...
+        assert!(!look_failed(&other, root, true));
+        // ...nor is one that is listed.
+        assert!(!look_failed(&full, root, false));
+        assert!(look_failed(&none, root, true));
+        // A start-less root is matched by pid alone; a start time must match.
+        let bare = ProcRef {
+            pid: 5,
+            start_time: None,
+        };
+        assert!(contains_root(&full, bare));
+        assert!(!contains_root(&other, bare));
+        assert!(!contains_root(&[row(5, 1, 51)], root));
+    }
+
+    #[test]
+    fn a_good_look_is_a_heartbeat_at_most_once_a_second_and_a_bad_one_is_not() {
+        let quiet = Step {
+            changed: false,
+            failed: false,
+        };
+        let bad = Step {
+            changed: false,
+            failed: true,
+        };
+        let grew = Step {
+            changed: true,
+            failed: false,
+        };
+        let failed_now = Step {
+            changed: true,
+            failed: true,
+        };
+        let ms = Duration::from_millis;
+        assert!(write_due(quiet, None), "the first look always writes");
+        assert!(!write_due(quiet, Some(ms(0))));
+        assert!(!write_due(quiet, Some(ms(999))));
+        assert!(write_due(quiet, Some(HEARTBEAT)));
+        assert!(write_due(quiet, Some(ms(5000))));
+        // A change is written at once, whatever was written last.
+        assert!(write_due(grew, Some(ms(0))));
+        assert!(write_due(failed_now, Some(ms(0))));
+        // A failure that changed nothing stamps nothing.
+        assert!(!write_due(bad, None));
+        assert!(!write_due(bad, Some(ms(5000))));
     }
 
     #[test]

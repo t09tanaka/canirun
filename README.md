@@ -368,6 +368,16 @@ What is not found, and what follows:
   or the command cannot be read while it runs) counts as "could not be
   checked", never as "no descendants". A recorded descendant is dropped only
   after two looks in a row did not find it.
+  A look at the process table that fails, comes back empty, or does not list
+  a command that still runs is a recorder failure too: it is written to the
+  sidecar at once, during the run, so a supervisor that dies mid-run leaves
+  a hold, not a release. `recorded_at` is a heartbeat: every good look
+  stamps it (written about once a second), and the spawn writes the first.
+- **More than 4096 live descendants.** Only 4096 are recorded; past that the
+  rest are unknown, so the record is marked truncated and the entry stays
+  held after the command ends, by design. The way out is
+  `canirun resolve <id> --force`, after checking that nothing of the command
+  still runs.
 - On macOS a process whose environment the kernel refuses with anything but
   `EINVAL`/`EPERM`, or whose owner the kernel did not confirm, is
   unreadable and makes the scan unknown.

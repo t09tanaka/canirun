@@ -1,6 +1,7 @@
 //! Records the descendants of a running managed command (see
 //! [`crate::lineage`]): a background thread reads the process table every
-//! [`INTERVAL`] and hands the recorded set to a callback whenever it grows.
+//! [`INTERVAL`] and hands the recorded set to a callback whenever it changes, and
+//! again about once a second while it does not (a heartbeat).
 //! Nothing here slows down or stops the command.
 
 use crate::lineage::{self, Tracked, MAX_DESCENDANTS};
@@ -9,13 +10,13 @@ use crate::process::{self, TableReader};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often the process table is read. A descendant that forks and
 /// loses its parent within one interval is missed.
 pub const INTERVAL: Duration = Duration::from_millis(250);
 
-/// Called with everything recorded so far, only when it changed.
+/// Called with everything recorded so far: when it changed, and as a heartbeat.
 pub type Record = Arc<dyn Fn(&Tracked) + Send + Sync>;
 
 pub struct Tracker {
@@ -63,6 +64,16 @@ impl Tracker {
         Tracker {
             stop: None,
             handle: Some(Err(std::io::Error::other("recorder failed to start"))),
+        }
+    }
+
+    /// A recorder that starts and records nothing, as when no look has
+    /// happened yet.
+    #[doc(hidden)]
+    pub fn idle(_root: u32, _record: Record) -> Tracker {
+        Tracker {
+            stop: None,
+            handle: Some(Ok(std::thread::spawn(Tracked::default))),
         }
     }
 
@@ -124,27 +135,50 @@ fn track_loop(root: ProcRef, record: &Record, stop: &mpsc::Receiver<()>) -> Trac
     let mut reader = TableReader::new();
     let mut tracked = Tracked::default();
     let mut missed = Vec::new();
+    let mut last_write: Option<Instant> = None;
     loop {
-        tick(&mut reader, root, &mut tracked, &mut missed, record);
+        tick(
+            &mut reader,
+            root,
+            &mut tracked,
+            &mut missed,
+            record,
+            &mut last_write,
+        );
         if !matches!(stop.recv_timeout(INTERVAL), Err(RecvTimeoutError::Timeout)) {
             // One last look: the leader is likely reaped by now, and the
             // recorded ones still seed the walk.
-            tick(&mut reader, root, &mut tracked, &mut missed, record);
+            tick(
+                &mut reader,
+                root,
+                &mut tracked,
+                &mut missed,
+                record,
+                &mut last_write,
+            );
             return tracked;
         }
     }
 }
 
+/// One look. The record is handed over when it changed, and as a heartbeat
+/// (at most once per [`lineage::HEARTBEAT`]) when it did not, so the sidecar's
+/// `recorded_at` says when the tracker last worked.
 fn tick(
     reader: &mut TableReader,
     root: ProcRef,
     tracked: &mut Tracked,
     missed: &mut Vec<ProcRef>,
     record: &Record,
+    last_write: &mut Option<Instant>,
 ) {
     let table = reader.read();
-    if lineage::step(&table, root, tracked, missed, MAX_DESCENDANTS) {
+    // Only asked when the table does not list the command.
+    let gone = !lineage::contains_root(&table, root) && process::root_gone(root.pid);
+    let step = lineage::step(&table, root, gone, tracked, missed, MAX_DESCENDANTS);
+    if lineage::write_due(step, last_write.map(|t| t.elapsed())) {
         record(tracked);
+        *last_write = Some(Instant::now());
     }
 }
 
@@ -239,6 +273,32 @@ mod tests {
         let tracker = Tracker::start(child.id(), Arc::new(|_| {}));
         let t = tracker.finish();
         assert!(!t.truncated, "{t:?}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_quiet_run_is_stamped_as_a_heartbeat_about_once_a_second() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = writes.clone();
+        let tracker = Tracker::start(
+            child.id(),
+            Arc::new(move |t| {
+                assert!(!t.truncated, "{t:?}");
+                w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        std::thread::sleep(Duration::from_millis(2300));
+        let t = tracker.finish();
+        assert!(!t.truncated && t.descendants.is_empty(), "{t:?}");
+        let n = writes.load(std::sync::atomic::Ordering::SeqCst);
+        // Nothing changed: one write at the start, then one per second, far
+        // fewer than the ~9 looks.
+        assert!((2..=4).contains(&n), "{n}");
         child.kill().unwrap();
         child.wait().unwrap();
     }

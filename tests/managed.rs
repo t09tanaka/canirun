@@ -1580,7 +1580,10 @@ fn a_failed_recorder_is_persisted_so_finish_and_the_reaper_both_keep_the_entry()
     // The in-memory guard refuses on its own...
     let err = managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap_err();
     assert!(err.to_string().contains("could not be recorded"), "{err}");
-    assert!(ledger(&ctx).find("tf").is_some(), "released on an unknown");
+    assert!(
+        ledger(&ctx).find("tf").is_some(),
+        "the entry was released although the recorder failed"
+    );
     assert_eq!(sidecar(&ctx, "tf").phase, Phase::ChildStarted);
     // ...and so does the reaper, reading only the sidecar: everything is
     // gone, but nothing was recorded to prove it.
@@ -1643,9 +1646,10 @@ fn a_hidden_orphan_counts_only_inside_the_window_of_the_last_record() {
     }
     // The end is the last record plus the 2 s slack, inclusive.
     assert!(reaped(&hidden(62)).find("w-in").is_some(), "the slack");
-    assert!(reaped(&hidden(62)).find("w-late").is_some(), "the slack");
-    // Started well after the last record: an unrelated process.
-    assert!(reaped(&hidden(63)).find("w-late").is_none(), "after");
+    // Started after the last record plus the slack: an unrelated process.
+    let after = reaped(&hidden(63));
+    assert!(after.find("w-in").is_none(), "after");
+    assert!(after.find("w-late").is_none(), "after");
     // No child start time: the launch intent is the lower bound.
     let no_start = |id: &str| {
         dead_child(dir.path(), &clock, id, |sc| {
@@ -1658,4 +1662,47 @@ fn a_hidden_orphan_counts_only_inside_the_window_of_the_last_record() {
     assert!(reaped(&hidden(39)).find("w-before").is_none(), "before");
     no_start("w-intent");
     assert!(reaped(&hidden(40)).find("w-intent").is_some(), "intent");
+}
+
+fn idle_tracker(root: u32, record: canirun::tracker::Record) -> canirun::tracker::Tracker {
+    canirun::tracker::Tracker::idle(root, record)
+}
+
+#[test]
+fn a_run_with_no_descendants_has_a_record_time_so_a_late_hidden_orphan_does_not_hold_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    let now = canirun::Clock::now(&*clock);
+    let start = now.timestamp() as u64;
+    let hidden = |start: u64| {
+        let mut s = Scan::new(Probe::Gone, vec![]);
+        s.hidden.push(HiddenProc {
+            proc: ProcRef {
+                pid: 4242,
+                start_time: Some(start),
+            },
+            parent: Some(1),
+        });
+        ctx_with_fixed(dir.path(), clock.clone(), s)
+    };
+    let cfg = Config::default();
+    let c = hidden(0);
+    let s = spec(dir.path(), "nr", "d", &["true"]);
+    let (_, guard) = registered(managed::register(&c, &cfg, &s).unwrap());
+    admit_now(&c, &cfg, "nr");
+    // The tracker never records, as if the supervisor died before its
+    // first look; the sidecar still carries the time of the spawn.
+    let ran =
+        managed::run_command_with_tracker(&c, &guard, &s.opts, cfg.limits(), Some(idle_tracker))
+            .unwrap();
+    assert!(!ran.outcome.tracker_unknown);
+    let sc = sidecar(&c, "nr");
+    assert_eq!(sc.recorded_at, Some(now), "{sc:?}");
+    assert!(sc.descendants.is_empty() && !sc.descendants_truncated);
+    // The supervisor dies; everything is gone.
+    drop(guard);
+    // Inside the window (the record plus 2 s): it may be the command's.
+    assert!(reaped(&hidden(start + 2)).find("nr").is_some(), "inside");
+    // After it: an unrelated process, so the entry is settled.
+    assert!(reaped(&hidden(start + 3)).find("nr").is_none(), "after");
 }

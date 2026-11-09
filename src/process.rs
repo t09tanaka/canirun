@@ -75,6 +75,15 @@ pub fn has_ended(pid: u32) -> bool {
     who as u32 == pid
 }
 
+/// Is our child `pid` gone: a zombie, or already reaped (no such process)?
+/// False while it runs, so a process table that does not list it is then a
+/// failed read, not an exit.
+pub fn root_gone(pid: u32) -> bool {
+    has_ended(pid)
+        || (unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
 /// How to recognise a spawned child again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildIdentity {

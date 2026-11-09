@@ -839,7 +839,13 @@ pub fn run_command_with_tracker(
         let identity = ChildIdentity::capture(pid);
         // Best effort: if this fails the phase stays LaunchIntent, which
         // the reaper keeps (quarantine) rather than frees.
-        let _ = advance_sidecar(ctx, id, Phase::ChildStarted, |s| s.child = Some(identity));
+        let at = ctx.clock.now();
+        let _ = advance_sidecar(ctx, id, Phase::ChildStarted, |s| {
+            s.child = Some(identity);
+            // An upper bound on the hidden-orphan window for every run,
+            // even one whose tracker never records.
+            s.recorded_at = Some(at);
+        });
     };
     let record: crate::tracker::Record = {
         let (ctx, id) = (ctx.clone(), id.to_string());

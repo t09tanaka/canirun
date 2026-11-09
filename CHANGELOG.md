@@ -7,8 +7,23 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- `runner::Spawn` gained a field, `start_tracker`, so a struct literal built
+  outside the crate no longer compiles. Pre-1.0: this is a breaking change.
+
 ### Fixed
 
+- `recorded_at` is a heartbeat, not the time of the last growth: every good
+  look stamps it (written at most about once a second), and the spawn writes
+  the first one, so every managed run has an upper bound on the
+  hidden-orphan window.
+- A look at the process table that fails, is empty, or does not list a
+  command that still runs is persisted at once as a recorder failure
+  (`descendants_truncated`), without dropping what was recorded, so a
+  supervisor that dies mid-run leaves a hold, not a release.
+- More than 4096 live descendants keep the entry held by design (the rest
+  are unknown); `canirun resolve <id> --force` is the way out.
 - A failed descendant recorder (a panicked or unstarted thread, an
   unreadable running command) is "could not be checked", not "nothing
   recorded". A recorded descendant is dropped only after two looks in a row
