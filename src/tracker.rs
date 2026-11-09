@@ -30,13 +30,17 @@ impl Tracker {
     /// child of this process.
     pub fn start(root: u32, record: Record) -> Tracker {
         let (tx, rx) = mpsc::channel::<()>();
-        let start_time = process::start_time(root);
-        if lineage::root_unreadable(start_time, process::has_ended(root)) {
+        let Some(start_time) = root_start_with(
+            || process::start_time(root),
+            || process::has_ended(root),
+            ROOT_READ_TRIES,
+            || std::thread::sleep(Duration::from_millis(10)),
+        ) else {
             return Tracker {
                 stop: None,
                 handle: Some(Err(std::io::Error::other("cannot read the command"))),
             };
-        }
+        };
         let root = ProcRef {
             pid: root,
             start_time,
@@ -68,6 +72,30 @@ impl Drop for Tracker {
     fn drop(&mut self) {
         let _ = self.join();
     }
+}
+
+/// How many times the command's start time is read before it counts as
+/// unreadable: right after the spawn the process table may not show it yet.
+const ROOT_READ_TRIES: usize = 20;
+
+/// The command's start time (`None` inside when it has already ended), or
+/// `None` when it is still running but could not be read in `tries` looks.
+fn root_start_with(
+    mut start: impl FnMut() -> Option<u64>,
+    mut ended: impl FnMut() -> bool,
+    tries: usize,
+    mut pause: impl FnMut(),
+) -> Option<Option<u64>> {
+    for i in 0..tries {
+        if i > 0 {
+            pause();
+        }
+        let t = start();
+        if !lineage::root_unreadable(t, ended()) {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// What the thread recorded. A thread that panicked or never started
@@ -126,6 +154,39 @@ mod tests {
         let fine = std::thread::spawn(Tracked::default);
         assert_eq!(join_outcome(Some(Ok(fine))), Tracked::default());
         assert_eq!(join_outcome(None), Tracked::default());
+    }
+
+    #[test]
+    fn the_command_start_is_read_again_before_it_counts_as_unreadable() {
+        let mut n = 0;
+        let mut pauses = 0;
+        let got = root_start_with(
+            || {
+                n += 1;
+                (n == 3).then_some(7)
+            },
+            || false,
+            5,
+            || pauses += 1,
+        );
+        assert_eq!((got, n, pauses), (Some(Some(7)), 3, 2));
+        // Ended: nothing to read, and not an error.
+        assert_eq!(root_start_with(|| None, || true, 5, || {}), Some(None));
+        // Never readable while running.
+        let mut looks = 0;
+        assert_eq!(
+            root_start_with(
+                || {
+                    looks += 1;
+                    None
+                },
+                || false,
+                4,
+                || {}
+            ),
+            None
+        );
+        assert_eq!(looks, 4);
     }
 
     #[test]
