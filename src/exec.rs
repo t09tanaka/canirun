@@ -549,6 +549,16 @@ mod tests {
             (ctx, clock)
         }
 
+        /// Hooks that give up after `n` polls, so a run that wrongly keeps
+        /// waiting (under a mutated admission rule, say) fails instead of
+        /// hanging.
+        fn bounded<'a>(n: u32, polls: &'a Cell<u32>) -> impl Fn() -> bool + 'a {
+            move || {
+                polls.set(polls.get() + 1);
+                polls.get() > n
+            }
+        }
+
         fn opts(dir: &std::path::Path, argv: &[&str]) -> Opts {
             Opts {
                 weight: None,
@@ -564,7 +574,14 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (ctx, _) = ctx_in(dir.path());
             let o = opts(dir.path(), &["sh", "-c", "exit 3"]);
-            let got = run_gated(&ctx, &Config::default(), &o, "run1", &Hooks::quiet()).unwrap();
+            let polls = Cell::new(0);
+            let cancelled = bounded(50, &polls);
+            let hooks = Hooks {
+                cancelled: &cancelled,
+                progress: &|_| {},
+                progress_tty: false,
+            };
+            let got = run_gated(&ctx, &Config::default(), &o, "run1", &hooks).unwrap();
             assert_eq!(got, Gated::Finished(Exit::Code(3)));
             let recs = history::read_all(ctx.paths.history_file()).unwrap();
             assert_eq!(recs.len(), 1);
@@ -650,7 +667,14 @@ mod tests {
                 std::thread::spawn(move || {
                     let (ctx, _) = ctx_in(&dir);
                     let o = opts(&dir, &["true"]);
-                    let got = run_gated(&ctx, &Config::default(), &o, "same-id", &Hooks::quiet());
+                    let polls = Cell::new(0);
+                    let cancelled = bounded(50, &polls);
+                    let hooks = Hooks {
+                        cancelled: &cancelled,
+                        progress: &|_| {},
+                        progress_tty: false,
+                    };
+                    let got = run_gated(&ctx, &Config::default(), &o, "same-id", &hooks);
                     (
                         got.unwrap(),
                         history::read_all(ctx.paths.history_file()).unwrap().len(),
