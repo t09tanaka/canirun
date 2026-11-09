@@ -288,7 +288,21 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 }
                 // A live child or group already keeps the entry.
                 if child_probe != Probe::Alive && group_probe != Probe::Alive {
-                    marker = runner::settled_scan(ctx, id, &tracked).probe;
+                    let scan = runner::settled_scan(ctx, id, &tracked);
+                    marker = scan.probe;
+                    // Nothing marked or recorded runs (a recorded one alive
+                    // would make the scan `Alive`) and the child and its
+                    // group are gone. A hidden orphan that began after the
+                    // child may still be its descendant.
+                    if marker == Probe::Gone
+                        && child_probe == Probe::Gone
+                        && group_probe == Probe::Gone
+                    {
+                        let since = child.as_ref().and_then(|c| c.start_time).unwrap_or(0);
+                        if lineage::suspicious_hidden(&scan.hidden, since, supervisor) {
+                            marker = Probe::Unknown;
+                        }
+                    }
                 }
             }
             SidecarFacts::Managed {

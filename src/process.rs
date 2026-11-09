@@ -25,6 +25,28 @@ pub fn start_time(pid: u32) -> Option<u64> {
     Some(proc.start_time())
 }
 
+/// Has our child `pid` ended without being reaped yet (a zombie)? Asked of
+/// the kernel without reaping it: the process table may not list a zombie.
+pub fn has_ended(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    let who = unsafe { info.si_pid() };
+    #[cfg(not(target_os = "linux"))]
+    let who = info.si_pid;
+    who as u32 == pid
+}
+
 /// How to recognise a spawned child again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildIdentity {
@@ -176,7 +198,23 @@ fn kernel_uid(pid: u32) -> Option<u32> {
             size,
         )
     };
-    (got == size).then_some(info.pbi_uid)
+    if got == size {
+        return Some(info.pbi_uid);
+    }
+    // The short form is readable for processes the full one refuses (root
+    // daemons), and is enough for the owner.
+    let mut short: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut short as *mut libc::proc_bsdshortinfo).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(short.pbsi_uid)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -205,11 +243,12 @@ fn observe_all() -> Vec<Seen> {
         // The kernel's answer first (sysinfo reports no owner for another
         // user's process on macOS, which would make it look like ours).
         // A process whose owner is not known is read anyway.
-        match kernel_uid(pid).or_else(|| p.user_id().map(|u| **u)) {
+        let kernel = kernel_uid(pid);
+        match kernel.or_else(|| p.user_id().map(|u| **u)) {
             Some(u) if u != me => continue,
             _ => {}
         }
-        let Some(marker) = read_marker(pid) else {
+        let Some(marker) = read_marker(pid, kernel == Some(me)) else {
             continue;
         };
         out.push(Seen {
@@ -234,7 +273,7 @@ fn vanished(pid: u32) -> bool {
 
 /// `None` when the process is gone.
 #[cfg(target_os = "linux")]
-fn read_marker(pid: u32) -> Option<Marker> {
+fn read_marker(pid: u32, _owned: bool) -> Option<Marker> {
     match std::fs::read(format!("/proc/{pid}/environ")) {
         Ok(bytes) => Some(marker::find_marker(&bytes)),
         Err(_) if vanished(pid) => None,
@@ -249,9 +288,11 @@ fn read_marker(pid: u32) -> Option<Marker> {
 
 /// `None` when the process is gone. A process of ours whose environment the
 /// kernel will not give (an Apple platform binary, a hardened-runtime app)
-/// is [`Marker::Hidden`], as is one whose environment is empty.
+/// is [`Marker::Hidden`], as is one whose environment is empty; any other
+/// failure to read is [`Marker::Unreadable`] (see
+/// [`marker::procargs_failure`]). `owned`: the kernel says it is ours.
 #[cfg(target_os = "macos")]
-fn read_marker(pid: u32) -> Option<Marker> {
+fn read_marker(pid: u32, owned: bool) -> Option<Marker> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut len: libc::size_t = 0;
     let sized = unsafe {
@@ -264,6 +305,7 @@ fn read_marker(pid: u32) -> Option<Marker> {
             0,
         )
     };
+    let sized_errno = std::io::Error::last_os_error().raw_os_error();
     let mut buf = vec![0u8; len + 4096];
     len = buf.len();
     let rc = if sized == 0 {
@@ -281,10 +323,15 @@ fn read_marker(pid: u32) -> Option<Marker> {
         -1
     };
     if rc != 0 {
+        let errno = if sized == 0 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            sized_errno
+        };
         return if vanished(pid) {
             None
         } else {
-            Some(Marker::Hidden)
+            Some(marker::procargs_failure(errno, owned))
         };
     }
     buf.truncate(len);
@@ -293,7 +340,7 @@ fn read_marker(pid: u32) -> Option<Marker> {
 
 /// No reader for this OS: nothing can be ruled out.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_marker(pid: u32) -> Option<Marker> {
+fn read_marker(pid: u32, _owned: bool) -> Option<Marker> {
     (!vanished(pid)).then_some(Marker::Unreadable)
 }
 

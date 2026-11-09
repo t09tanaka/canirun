@@ -7,6 +7,20 @@ the minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed descendant recorder (a panicked or unstarted thread, an
+  unreadable running command) is "could not be checked", not "nothing
+  recorded". A recorded descendant is dropped only after two looks in a row
+  did not find it.
+- macOS: a refused `KERN_PROCARGS2` is hidden only for `EINVAL`/`EPERM` on a
+  process the kernel confirmed is ours; other errors make the scan unknown.
+- A started entry whose child and group are gone is also kept when a hidden
+  orphan began after the child (as for a launch intent).
+- On macOS an entry can stay held (`ProbeUnknown`) because of a hidden
+  process `launchd` started (an Apple binary); `canirun resolve <id> --force`
+  releases it.
+
 ### Added
 
 - Library: managed commands (`canirun::managed`). `register` takes a

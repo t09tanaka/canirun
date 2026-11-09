@@ -652,9 +652,12 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     let (_, g) =
         registered(managed::register(&lib, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
     orphan(&lib, "c", Phase::LaunchIntent, None);
-    // The real scan of this machine sees hidden processes that are
-    // orphans; an intent in the future keeps those out of the picture so
-    // the outcome does not depend on what else is running.
+    // This checks the LaunchUnknown branch: a launch intent that has not
+    // aged past the grace keeps the entry without any scan. The intent is
+    // placed an hour ahead (not "now") so its age stays negative however
+    // slow this test is; a "now" intent would age past the grace on a slow
+    // machine and the real scan of this machine (which sees hidden
+    // orphans that depend on what else is running) would decide instead.
     let mut sc = sidecar(&lib, "c");
     sc.launch_intent_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
     managed::write_sidecar(&lib, &sc).unwrap();
@@ -1222,9 +1225,13 @@ fn setsid_supervisor_entry() {
     };
     let dir = PathBuf::from(dir);
     let (ctx, cfg) = (ctx(&dir), Config::default());
+    // The descendant drops the marker variables before it execs, so only the
+    // recorded descendants (not the environment marker) can find it.
     let script = "use POSIX qw(setsid); my $p = fork(); if (!$p) { setsid(); \
         open(F, '>', $ARGV[0] . '.tmp'); print F $$; close F; \
-        rename($ARGV[0] . '.tmp', $ARGV[0]); exec('sleep', '60'); } sleep 60;";
+        rename($ARGV[0] . '.tmp', $ARGV[0]); \
+        delete $ENV{CANIRUN_MANAGED_ID}; delete $ENV{CANIRUN_MANAGED_SCOPE}; \
+        exec('sleep', '60'); } sleep 60;";
     let pidfile = dir.join("sleeper.pid");
     let s = spec(
         &dir,
@@ -1237,11 +1244,42 @@ fn setsid_supervisor_entry() {
     let _ = managed::run_command(&ctx, &guard, &s.opts, cfg.limits());
 }
 
+/// Stops the supervisor and the sleeper even when an assert fails.
+struct Cleanup {
+    sup: Option<std::process::Child>,
+    sleeper: Option<u32>,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if let Some(mut s) = self.sup.take() {
+            // The command (perl) leads its own group and is a child of the
+            // supervisor: stop that group while the parent link still shows.
+            if let Ok(o) = Command::new("pgrep")
+                .args(["-P", &s.id().to_string()])
+                .output()
+            {
+                for pid in String::from_utf8_lossy(&o.stdout).split_whitespace() {
+                    if let Ok(pid) = pid.parse::<libc::pid_t>() {
+                        unsafe { libc::killpg(pid, libc::SIGKILL) };
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+            let _ = s.kill();
+            let _ = s.wait();
+        }
+        if let Some(p) = self.sleeper {
+            unsafe { libc::kill(p as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+}
+
 #[test]
 fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path());
-    let mut sup = Command::new(std::env::current_exe().unwrap())
+    let sup = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "setsid_supervisor_entry",
@@ -1253,6 +1291,10 @@ fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let mut guard = Cleanup {
+        sup: Some(sup),
+        sleeper: None,
+    };
     let pidfile = dir.path().join("sleeper.pid");
     let sleeper = || -> Option<u32> { std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok() };
     assert!(
@@ -1260,6 +1302,7 @@ fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
         "the descendant never started"
     );
     let sleeper = sleeper().unwrap();
+    guard.sleeper = Some(sleeper);
     // Recorded within a few sampling intervals.
     let recorded = until(20, || match managed::load_sidecar(&ctx, "sup-2") {
         Loaded::Ok(sc) => sc.descendants.iter().any(|p| p.pid == sleeper),
@@ -1270,6 +1313,7 @@ fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
 
     // The supervisor dies, then the leader: only the descendant is left,
     // orphaned and outside the group.
+    let mut sup = guard.sup.take().unwrap();
     unsafe { libc::kill(sup.id() as libc::pid_t, libc::SIGKILL) };
     sup.wait().unwrap();
     unsafe { libc::killpg(pgid, libc::SIGKILL) };
@@ -1342,6 +1386,49 @@ fn dropped_descendants_make_a_clear_scan_unknown_and_only_force_releases_it() {
     let t = sc.terminal.unwrap();
     assert_eq!(t.kind, TerminalKind::Interrupted);
     assert!(t.detail.unwrap().starts_with("forced: "));
+}
+
+#[test]
+fn a_hidden_orphan_started_since_the_child_keeps_a_started_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    // The child identity written by `dead_child` started at second 1.
+    let hidden = |parent: u32, start: u64| {
+        let mut s = Scan::new(Probe::Gone, vec![]);
+        s.hidden.push(HiddenProc {
+            proc: ProcRef {
+                pid: 4242,
+                start_time: Some(start),
+            },
+            parent: Some(parent),
+        });
+        ctx_with_fixed(dir.path(), clock.clone(), s)
+    };
+    dead_child(dir.path(), &clock, "hc1", |_| {});
+    dead_child(dir.path(), &clock, "hc2", |_| {});
+    dead_child(dir.path(), &clock, "hc3", |_| {});
+    dead_child(dir.path(), &clock, "hc4", |sc| {
+        sc.child.as_mut().unwrap().start_time = Some(100)
+    });
+    // An orphan that began after the child: it may be a descendant.
+    let orphan = hidden(1, 50);
+    assert!(reaped(&orphan).find("hc1").is_some());
+    let kept = managed::resolve_checked(&orphan, "hc1").unwrap();
+    assert!(
+        !kept.released && kept.verdict.contains("ProbeUnknown"),
+        "{kept:?}"
+    );
+    let forced = managed::resolve_checked_with(&orphan, "hc1", true).unwrap();
+    assert!(forced.released && forced.forced, "{forced:?}");
+    // Somebody else's child: not it.
+    let other = hidden(31337, 50);
+    assert!(reaped(&other).find("hc2").is_none());
+    // The same orphan with a clear scan and nothing hidden is freed.
+    let clear = ctx_with_fixed(dir.path(), clock.clone(), Scan::new(Probe::Gone, vec![]));
+    assert!(reaped(&clear).find("hc3").is_none());
+    // An orphan older than the child: not it either.
+    let older = hidden(1, 99);
+    assert!(reaped(&older).find("hc4").is_none());
 }
 
 #[test]

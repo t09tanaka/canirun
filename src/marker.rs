@@ -187,6 +187,20 @@ pub fn parse_procargs(buf: &[u8]) -> Marker {
     find_marker(env)
 }
 
+/// The marker to report when macOS refused `KERN_PROCARGS2` for a process
+/// that has not vanished. Only `EINVAL` and `EPERM` are the OS withholding the
+/// environment of a process of ours (an Apple platform binary, a hardened
+/// runtime app), and only when the kernel confirmed the owner is us
+/// (`owned`): that is [`Marker::Hidden`]. Anything else (`ENOMEM`, `EIO`,
+/// no errno at all) is a failure to look, so the process is
+/// [`Marker::Unreadable`] and the scan unknown.
+pub fn procargs_failure(errno: Option<i32>, owned: bool) -> Marker {
+    match errno {
+        Some(libc::EINVAL | libc::EPERM) if owned => Marker::Hidden,
+        _ => Marker::Unreadable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +472,18 @@ mod tests {
         assert_eq!(m.probe, Probe::Alive);
         assert_eq!(m.hidden.len(), 1);
         assert!(Scan::new(Probe::Gone, vec![]).hidden.is_empty());
+    }
+
+    #[test]
+    fn only_a_refusal_for_our_own_process_is_hidden() {
+        for e in [libc::EINVAL, libc::EPERM] {
+            assert_eq!(procargs_failure(Some(e), true), Marker::Hidden);
+            assert_eq!(procargs_failure(Some(e), false), Marker::Unreadable);
+        }
+        for e in [libc::ENOMEM, libc::EIO, libc::EACCES, libc::ESRCH, 0] {
+            assert_eq!(procargs_failure(Some(e), true), Marker::Unreadable);
+        }
+        assert_eq!(procargs_failure(None, true), Marker::Unreadable);
     }
 
     #[test]

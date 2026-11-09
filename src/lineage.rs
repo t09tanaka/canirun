@@ -34,6 +34,26 @@ pub struct Tracked {
     pub truncated: bool,
 }
 
+impl Tracked {
+    /// What is known when recording itself failed (the thread panicked or
+    /// could not start, or the command could not be read): nothing is
+    /// recorded and nothing can be ruled out, so a clear scan is not
+    /// believed.
+    pub fn unknown() -> Tracked {
+        Tracked {
+            descendants: Vec::new(),
+            truncated: true,
+        }
+    }
+}
+
+/// Could the command's own start time not be read although it has not
+/// ended? Then nothing can be tracked below it. (`ended`: a zombie, which
+/// runs nothing, so there is nothing to record.)
+pub fn root_unreadable(start_time: Option<u64>, ended: bool) -> bool {
+    start_time.is_none() && !ended
+}
+
 /// The rows that are running now: a recorded process is the same one when
 /// pid and start time both match.
 pub fn alive_in(table: &[Row], recorded: &[ProcRef]) -> Vec<ProcRef> {
@@ -95,6 +115,56 @@ pub fn descendants_of(table: &[Row], root: ProcRef, known: &[ProcRef]) -> Vec<Pr
         frontier = next;
     }
     out
+}
+
+/// The recorded descendants after one look at the process table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pruned {
+    pub kept: Vec<ProcRef>,
+    /// Recorded ones that were not in the table this time.
+    pub missed: Vec<ProcRef>,
+}
+
+/// Drop a recorded descendant only after two looks in a row did not find it:
+/// one read of the table can miss a process (it is read while it changes), and
+/// a dropped process is no longer followed. `missed` is what the previous
+/// look did not find.
+pub fn prune(table: &[Row], recorded: &[ProcRef], missed: &[ProcRef]) -> Pruned {
+    let alive = alive_in(table, recorded);
+    let mut kept = Vec::new();
+    let mut now_missed = Vec::new();
+    for p in recorded {
+        if alive.contains(p) {
+            kept.push(*p);
+        } else if !missed.contains(p) {
+            kept.push(*p);
+            now_missed.push(*p);
+        }
+    }
+    Pruned {
+        kept,
+        missed: now_missed,
+    }
+}
+
+/// One look at the table: prune, find what is new and record it. True when
+/// the record grew or became truncated (the caller then persists it).
+pub fn step(
+    table: &[Row],
+    root: ProcRef,
+    tracked: &mut Tracked,
+    missed: &mut Vec<ProcRef>,
+    cap: usize,
+) -> bool {
+    let pruned = prune(table, &tracked.descendants, missed);
+    tracked.descendants = pruned.kept;
+    *missed = pruned.missed;
+    let found = descendants_of(table, root, &tracked.descendants);
+    let m = merge(&tracked.descendants, tracked.truncated, &found, cap);
+    let changed = !m.added.is_empty() || m.truncated != tracked.truncated;
+    tracked.descendants.extend(m.added);
+    tracked.truncated = m.truncated;
+    changed
 }
 
 /// What recording `found` changes.
@@ -178,6 +248,62 @@ mod tests {
         let mut x: Vec<u32> = v.iter().map(|p| p.pid).collect();
         x.sort();
         x
+    }
+
+    #[test]
+    fn a_recorded_process_is_dropped_only_after_two_misses_in_a_row() {
+        let a = p(10, 100);
+        let table = [row(10, 1, 100)];
+        let empty: [Row; 0] = [];
+        // Seen: kept, no miss.
+        let r = prune(&table, &[a], &[]);
+        assert_eq!((r.kept.clone(), r.missed.clone()), (vec![a], vec![]));
+        // First miss: kept, remembered.
+        let r = prune(&empty, &[a], &[]);
+        assert_eq!((r.kept.clone(), r.missed.clone()), (vec![a], vec![a]));
+        // Second miss in a row: dropped.
+        let r = prune(&empty, &[a], &[a]);
+        assert!(r.kept.is_empty() && r.missed.is_empty());
+        // Seen again after one miss: the miss is forgotten.
+        let r = prune(&table, &[a], &[a]);
+        assert_eq!((r.kept, r.missed), (vec![a], vec![]));
+    }
+
+    #[test]
+    fn step_survives_one_missed_look_and_follows_the_tree() {
+        let root = p(5, 50);
+        let child = p(6, 60);
+        let full = [row(5, 1, 50), row(6, 5, 60)];
+        let none: [Row; 0] = [];
+        let mut t = Tracked::default();
+        let mut missed = Vec::new();
+        assert!(step(&full, root, &mut t, &mut missed, 10));
+        assert_eq!(t.descendants, vec![child]);
+        // One look that does not show it: still recorded, no change.
+        assert!(!step(&none, root, &mut t, &mut missed, 10));
+        assert_eq!(t.descendants, vec![child]);
+        assert_eq!(missed, vec![child]);
+        // It is back: nothing new, the miss is forgotten.
+        assert!(!step(&full, root, &mut t, &mut missed, 10));
+        assert!(missed.is_empty());
+        // Two empty looks drop it.
+        step(&none, root, &mut t, &mut missed, 10);
+        step(&none, root, &mut t, &mut missed, 10);
+        assert!(t.descendants.is_empty());
+        // The cap marks the record truncated, which is a change.
+        let many = [row(5, 1, 50), row(6, 5, 60), row(7, 5, 61)];
+        let mut t = Tracked::default();
+        assert!(step(&many, root, &mut t, &mut Vec::new(), 1));
+        assert!(t.truncated && t.descendants.len() == 1);
+    }
+
+    #[test]
+    fn failed_tracking_is_unknown_and_an_unreadable_root_needs_a_live_one() {
+        assert!(Tracked::unknown().truncated && Tracked::unknown().descendants.is_empty());
+        assert!(root_unreadable(None, false));
+        assert!(!root_unreadable(None, true));
+        assert!(!root_unreadable(Some(1), false));
+        assert!(!root_unreadable(Some(1), true));
     }
 
     #[test]

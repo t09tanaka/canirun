@@ -347,6 +347,19 @@ What is not found, and what follows:
   for a while. That errs on the side of keeping the budget.
 - A scan that could not read some process of the user is unknown and
   releases nothing, until `resolve --force`.
+- **A Mac entry that stays held.** On macOS a process that `launchd`
+  started (an Apple binary whose environment is hidden) can be mistaken for
+  the child of a launch intent or a started command: the reaper then
+  answers "could not be checked" (`ProbeUnknown`) and the entry stays held.
+  The way out is `canirun resolve <id> --force`, after checking that
+  nothing of the command still runs.
+- Recording the descendants that fails (the thread panics or cannot start,
+  or the command cannot be read while it runs) counts as "could not be
+  checked", never as "no descendants". A recorded descendant is dropped only
+  after two looks in a row did not find it.
+- On macOS a process whose environment the kernel refuses with anything but
+  `EINVAL`/`EPERM`, or whose owner the kernel did not confirm, is
+  unreadable and makes the scan unknown.
 
 ### `canirun config [--path]` and `canirun gc`
 

@@ -272,7 +272,13 @@ pub fn run_with(
     // The leader is gone, but a managed command's descendants may not be:
     // the budget is only free once the whole group, and anything marked
     // that left it, is confirmed stopped.
-    let tracked = tracker.map(|t| t.finish()).unwrap_or_default();
+    // No tracker for a managed command is not "nothing recorded": a clear
+    // scan cannot be believed.
+    let tracked = match tracker {
+        Some(t) => t.finish(),
+        None if spawn.own_process_group && spawn.marker_id.is_some() => Tracked::unknown(),
+        None => Tracked::default(),
+    };
     let descendants_left = spawn.own_process_group && {
         let group = clear_group(ctx, pid);
         let marked = spawn
