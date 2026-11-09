@@ -718,9 +718,9 @@ fn timing_of(
     // a start that rests on an entry with little history is as uncertain
     // as the entry's runtime.
     let mut history_floor = meta.runtime.history_count;
-    if let Some(s) = start.filter(|s| *s > 0) {
-        for (k, y) in jobs.iter().enumerate() {
-            if k != i && y.from_ledger && y.finish_ms == Some(s) {
+    if let Some(s) = start {
+        for y in jobs {
+            if y.from_ledger && y.finish_ms == Some(s) {
                 history_floor = history_floor.min(y.history_count);
                 if y.history_count < 3 {
                     assumptions.push(format!(
@@ -908,9 +908,11 @@ fn critical_path(nodes: &[NodeForecast], info: &[PathInfo]) -> CriticalPath {
             covered = pred.is_some();
         }
         path.push((cur, covered));
+        // Neither a dependency (acyclic) nor the search (unvisited only)
+        // can lead back to a node already on the path.
         match pred {
-            Some(p) if !visited[p] => cur = p,
-            _ => break,
+            Some(p) => cur = p,
+            None => break,
         }
     }
     path.reverse();
@@ -2337,6 +2339,31 @@ mod tests {
     }
 
     #[test]
+    fn a_later_start_chain_is_followed_through_every_waiter() {
+        // Budget 1: x 0-5, a 5-15, b 15-35, all independent.
+        let x = node("x", 1, Runtime::measured(5.0, 3));
+        let a = node("a", 1, Runtime::measured(10.0, 3));
+        let b = node("b", 1, Runtime::measured(20.0, 3));
+        let f = run(&insp(1, calm(), vec![]), &plan(vec![x, a, b]), &[]);
+        assert_eq!(nodes_of(&f), ["x", "a", "b"]);
+        assert_eq!(f.target.critical_path_execution_ms, Some(35_000));
+    }
+
+    #[test]
+    fn a_node_that_did_not_wait_has_no_resource_predecessor() {
+        // c is held back by its ready floor, not by the budget, although a
+        // happens to finish at the moment c starts.
+        let a = node("a", 1, Runtime::measured(10.0, 3));
+        let mut c = node("c", 1, Runtime::measured(5.0, 3));
+        c.ready_in_ms = 10_000;
+        let f = run(&insp(4, calm(), vec![]), &plan(vec![a, c]), &[]);
+        assert_eq!(f.target.timing.finish_in_ms, Some(15_000));
+        assert_eq!(nodes_of(&f), ["c"]);
+        assert_eq!(f.target.critical_path_execution_ms, Some(5_000));
+        assert_eq!(f.target.critical_path_wait_ms, Some(0));
+    }
+
+    #[test]
     fn a_dependency_wins_over_the_budget_and_its_wait_counts() {
         // Budget 1. p runs 0-10, q 10-15, r (after p) is ready at 10 but
         // waits for q until 15 and ends at 18.
@@ -2521,6 +2548,39 @@ mod tests {
         .is_ok());
     }
 
+    #[test]
+    fn only_the_entry_that_freed_the_budget_counts_for_confidence() {
+        // Budget 2: r (well known) frees a slot at 30 s, q (unknown) runs on.
+        let i = with_history(
+            with_history(
+                insp(
+                    2,
+                    calm(),
+                    vec![
+                        running("r", 1, Some(30.0), 0),
+                        running("q", 1, Some(100.0), 0),
+                    ],
+                ),
+                "r",
+                5,
+            ),
+            "q",
+            0,
+        );
+        let t = single(&i, node("n", 1, Runtime::measured(1.0, 5)));
+        assert_eq!(t.start_in_ms, Some(30_000));
+        assert_eq!(t.confidence, Confidence::High);
+        // A plan node that finishes right before is not a ledger entry.
+        let a = node("a", 1, Runtime::measured(10.0, 1));
+        let mut b = node("b", 1, Runtime::measured(1.0, 5));
+        b.depends_on = vec!["a".into()];
+        let f = run(&insp(2, calm(), vec![]), &plan(vec![a, b]), &[]);
+        let b = &f.target.nodes[1].timing;
+        assert_eq!(b.start_in_ms, Some(10_000));
+        assert_eq!(b.confidence, Confidence::High);
+        assert!(!b.assumptions.iter().any(|x| x.contains("recorded runs")));
+    }
+
     fn with_history(mut i: Inspection, key: &str, records: usize) -> Inspection {
         i.history.push(crate::inspect::HistoryRef {
             key: key.into(),
@@ -2550,6 +2610,18 @@ mod tests {
         let t = single(&rich, n.clone());
         assert_eq!(t.confidence, Confidence::High);
         assert!(!t.assumptions.iter().any(|a| a.contains("entry r")));
+        // Three runs are enough, two are not.
+        for (records, want) in [(2, Confidence::Medium), (3, Confidence::High)] {
+            let i = with_history(
+                insp(1, calm(), vec![running("r", 1, Some(30.0), 0)]),
+                "r",
+                records,
+            );
+            let t = single(&i, n.clone());
+            assert_eq!(t.confidence, want, "{records}");
+            let noted = t.assumptions.iter().any(|a| a.contains("recorded runs"));
+            assert_eq!(noted, records < 3, "{records}");
+        }
         // Not behind the entry: its history does not matter.
         let idle = with_history(
             insp(2, calm(), vec![running("r", 1, Some(30.0), 0)]),
