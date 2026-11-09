@@ -207,10 +207,45 @@ fn digests_follow_their_inputs() {
     let c = inspect::inspect(&e.ctx).unwrap();
     assert_ne!(a.snapshot_digest, c.snapshot_digest);
     assert_eq!(a.policy_digest, c.policy_digest);
-    std::fs::write(e.ctx.paths.config_file(), "budget = 3\n").unwrap();
+    // The default budget is the machine's CPU count, so the override must
+    // differ from it on any machine (a fixed 3 equals the default on a
+    // 3-core CI runner and leaves the effective policy unchanged).
+    let budget = canirun::config::logical_cpus() + 1;
+    std::fs::write(e.ctx.paths.config_file(), format!("budget = {budget}\n")).unwrap();
     let d = inspect::inspect(&e.ctx).unwrap();
     assert_ne!(c.policy_digest, d.policy_digest);
-    assert_eq!(d.limits.budget, 3);
+    assert_eq!(d.limits.budget, budget);
+}
+
+/// The policy digest follows the effective configuration, not the file:
+/// writing the value the default already has changes nothing.
+#[test]
+fn policy_digest_follows_the_effective_config_not_the_file() {
+    let e = env();
+    let a = inspect::inspect(&e.ctx).unwrap();
+    let same = canirun::config::logical_cpus();
+    std::fs::write(e.ctx.paths.config_file(), format!("budget = {same}\n")).unwrap();
+    let b = inspect::inspect(&e.ctx).unwrap();
+    assert_eq!(a.policy_digest, b.policy_digest);
+}
+
+/// History is digested by content, not by mtime or size granularity: a
+/// record appended within the same instant (same `started_at`) still counts.
+#[test]
+fn snapshot_digest_follows_history_appended_in_the_same_instant() {
+    let e = env();
+    let _leases = populate(&e);
+    let mut last = inspect::inspect(&e.ctx).unwrap().snapshot_digest;
+    for i in 0..5 {
+        history::append(
+            e.ctx.paths.history_file(),
+            &record("kb", 10.0 + f64::from(i)),
+        )
+        .unwrap();
+        let now = inspect::inspect(&e.ctx).unwrap().snapshot_digest;
+        assert_ne!(last, now);
+        last = now;
+    }
 }
 
 #[test]
