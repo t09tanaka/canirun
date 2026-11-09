@@ -288,14 +288,17 @@ What this cannot see, and the safe-side behaviour that results:
 - On macOS, Apple's own binaries (`/bin/sh`, `sleep`, ...) do not show their
   environment to other processes, so such a descendant is not found either
   (node, python, Rust or Go binaries and the like are). On Linux every
-  process of the user is readable.
+  process of the user is readable, except one that made itself non-dumpable
+  (an agent or sandboxed helper), which the kernel also withholds and which
+  is read as unmarked.
 - The process group check does not compare start times, so a pid that was
   reused by an unrelated process in the same group id can keep an entry held
   for a while. That errs on the side of keeping the budget.
 - The marker is the id alone. Two canirun state directories that use the
   same command id can hold each other's entries; that is also the safe side.
-- Only processes of the same user are scanned. If one of them cannot be read
-  the scan is "unknown" and nothing is released on its account.
+- Only processes of the same user are scanned. If one of them fails to be
+  read for a reason other than the OS withholding its environment, the scan
+  is "unknown" and nothing is released on its account.
 
 ### `canirun config [--path]` and `canirun gc`
 

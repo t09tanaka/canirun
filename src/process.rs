@@ -146,6 +146,11 @@ fn read_marker(pid: u32) -> Option<Marker> {
     match std::fs::read(format!("/proc/{pid}/environ")) {
         Ok(bytes) => Some(marker::find_marker(&bytes, 0)),
         Err(_) if vanished(pid) => None,
+        // The kernel withholds the environment of a process that made itself
+        // non-dumpable (an agent, a sandboxed helper). A descendant of a
+        // command is not one in practice; reading it as unmarked keeps one
+        // such bystander from blocking every release.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(Marker::Absent),
         Err(_) => Some(Marker::Unreadable),
     }
 }
@@ -182,8 +187,11 @@ fn read_marker(pid: u32) -> Option<Marker> {
         -1
     };
     if rc != 0 {
+        let denied = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         return if vanished(pid) {
             None
+        } else if denied {
+            Some(Marker::Absent)
         } else {
             Some(Marker::Unreadable)
         };
