@@ -46,6 +46,10 @@ pub struct Outcome {
     /// confirmed gone in time or could not be checked. Always false for a
     /// plain run.
     pub descendants_left: bool,
+    /// The recorder of the descendants failed (or recorded more than fit):
+    /// whether anything is left cannot be ruled out. [`crate::managed::finish`]
+    /// then keeps the entry. Always false for a plain run.
+    pub tracker_unknown: bool,
 }
 
 /// Run `argv` with inherited stdio in our process group, in `cwd`, with
@@ -80,7 +84,13 @@ pub struct Spawn<'a> {
     /// to this each time the set grows. Those still running are stopped
     /// together with the marked ones.
     pub on_descendants: Option<crate::tracker::Record>,
+    /// Replaces [`crate::tracker::Tracker::start`] (tests make it fail).
+    #[doc(hidden)]
+    pub start_tracker: Option<StartTracker>,
 }
+
+/// Starts the recorder of a command's descendants.
+pub type StartTracker = fn(u32, crate::tracker::Record) -> crate::tracker::Tracker;
 
 /// Grace between SIGTERM and SIGKILL for descendants that outlive a
 /// managed command's leader, and how long to wait for the group to empty
@@ -227,7 +237,10 @@ pub fn run_with(
         spawn.marker_id,
     ) {
         (Some(record), true, Some(_)) => {
-            Some(crate::tracker::Tracker::start(child.id(), record.clone()))
+            let start = spawn
+                .start_tracker
+                .unwrap_or(crate::tracker::Tracker::start);
+            Some(start(child.id(), record.clone()))
         }
         _ => None,
     };
@@ -279,6 +292,15 @@ pub fn run_with(
         None if spawn.own_process_group && spawn.marker_id.is_some() => Tracked::unknown(),
         None => Tracked::default(),
     };
+    // A recorder that failed left nothing in the sidecar to say so: write
+    // the unknown there too, or the reaper would read an empty record as
+    // "nothing was running".
+    if tracked.truncated {
+        if let Some(record) = &spawn.on_descendants {
+            record(&tracked);
+        }
+    }
+    let tracker_unknown = tracked.truncated;
     let descendants_left = spawn.own_process_group && {
         let group = clear_group(ctx, pid);
         let marked = spawn
@@ -302,6 +324,7 @@ pub fn run_with(
         cpu_secs,
         max_rss_bytes,
         descendants_left,
+        tracker_unknown,
     })
 }
 

@@ -47,6 +47,21 @@ impl Tracked {
     }
 }
 
+/// What goes into the sidecar when the tracker hands over `t`. A tracker
+/// that failed (`t` unknown: truncated, nothing recorded) must not erase
+/// what earlier writes recorded, and `truncated` never goes back to false.
+pub fn persisted(existing: &[ProcRef], existing_truncated: bool, t: &Tracked) -> Tracked {
+    let descendants = if t.truncated && t.descendants.is_empty() {
+        existing.to_vec()
+    } else {
+        t.descendants.clone()
+    };
+    Tracked {
+        descendants,
+        truncated: t.truncated || existing_truncated,
+    }
+}
+
 /// Could the command's own start time not be read although it has not
 /// ended? Then nothing can be tracked below it. (`ended`: a zombie, which
 /// runs nothing, so there is nothing to record.)
@@ -83,6 +98,18 @@ pub fn descendants_of(table: &[Row], root: ProcRef, known: &[ProcRef]) -> Vec<Pr
         }
     }
     let mut seeds = alive_in(table, &[root]);
+    if root.start_time.is_none() {
+        // A root whose start time could not be read (it ended unreaped, a
+        // zombie) cannot be matched by start time. It is our own unreaped
+        // child, so its pid is still ours: seed by pid so its live children
+        // are walked and recorded before they are reparented.
+        seeds.extend(
+            table
+                .iter()
+                .filter(|r| r.proc.pid == root.pid)
+                .map(|r| r.proc),
+        );
+    }
     seeds.extend(alive_in(table, known));
     let mut seen: HashSet<u32> = seeds.iter().map(|p| p.pid).collect();
     seen.insert(root.pid);
@@ -214,14 +241,43 @@ pub fn with_recorded(mut scan: Scan, recorded_alive: Vec<ProcRef>, truncated: bo
     scan
 }
 
+/// How long after the last tracker record a hidden process may still have
+/// started and be counted as the command's.
+pub const RECORD_SLACK_SECS: u64 = 2;
+
+/// The window (`since`, `until`; seconds since the epoch, both inclusive)
+/// in which a hidden process may be a descendant nobody recorded: from the
+/// child's start (the launch intent when that is unknown, else 0) to the
+/// last tracker record plus [`RECORD_SLACK_SECS`]. Without a record (the
+/// supervisor died before the first) the end is open. Outside it, a hidden
+/// orphan is an unrelated process that merely started meanwhile, such as
+/// one the OS starts for the user all the time.
+pub fn suspicion_window(
+    child_start: Option<u64>,
+    intent: Option<u64>,
+    recorded: Option<u64>,
+) -> (u64, Option<u64>) {
+    (
+        child_start.or(intent).unwrap_or(0),
+        recorded.map(|r| r.saturating_add(RECORD_SLACK_SECS)),
+    )
+}
+
 /// Is there a hidden process that could be a child of a launch whose
-/// outcome is unknown? One that started at or after the launch intent
-/// (`since`, seconds since the epoch; an unknown start time counts) and
-/// whose parent is `init` / `launchd` (pid 1: it was orphaned) or the
-/// supervisor that died.
-pub fn suspicious_hidden(hidden: &[HiddenProc], since: u64, supervisor: u32) -> bool {
+/// outcome is unknown? One that started within the window (`since`, `until`
+/// as in [`suspicion_window`]; an unknown start time counts) and whose
+/// parent is `init` / `launchd` (pid 1: it was orphaned) or the supervisor
+/// that died.
+pub fn suspicious_hidden(
+    hidden: &[HiddenProc],
+    since: u64,
+    until: Option<u64>,
+    supervisor: u32,
+) -> bool {
     hidden.iter().any(|h| {
-        h.proc.start_time.is_none_or(|t| t >= since)
+        h.proc
+            .start_time
+            .is_none_or(|t| t >= since && until.is_none_or(|u| t <= u))
             && h.parent.is_some_and(|p| p == 1 || p == supervisor)
     })
 }
@@ -353,11 +409,8 @@ mod tests {
         // not ours.
         let table = [row(10, 1, 500), row(20, 10, 501)];
         assert!(descendants_of(&table, p(10, 100), &[]).is_empty());
-        let no_start = ProcRef {
-            pid: 10,
-            start_time: None,
-        };
-        assert!(descendants_of(&table, no_start, &[]).is_empty());
+        // (A root with no start time is the one case seeded by pid alone:
+        // see `a_root_without_a_start_time_is_seeded_by_pid`.)
     }
 
     #[test]
@@ -475,24 +528,153 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_orphan_or_child_of_the_supervisor_since_the_intent_is_suspicious() {
-        assert!(!suspicious_hidden(&[], 100, 7));
-        // Orphaned (parent 1), at the intent second and later.
-        assert!(suspicious_hidden(&[hidden(1, Some(1), Some(100))], 100, 7));
-        assert!(suspicious_hidden(&[hidden(1, Some(1), Some(900))], 100, 7));
+    fn a_hidden_orphan_or_child_of_the_supervisor_in_the_window_is_suspicious() {
+        assert!(!suspicious_hidden(&[], 100, None, 7));
+        // Orphaned (parent 1), at the window start and later.
+        assert!(suspicious_hidden(
+            &[hidden(1, Some(1), Some(100))],
+            100,
+            None,
+            7
+        ));
+        assert!(suspicious_hidden(
+            &[hidden(1, Some(1), Some(900))],
+            100,
+            None,
+            7
+        ));
         // The dead supervisor's child.
-        assert!(suspicious_hidden(&[hidden(1, Some(7), Some(100))], 100, 7));
-        // Before the intent, another parent, or no parent: not ours.
-        assert!(!suspicious_hidden(&[hidden(1, Some(1), Some(99))], 100, 7));
-        assert!(!suspicious_hidden(&[hidden(1, Some(8), Some(500))], 100, 7));
-        assert!(!suspicious_hidden(&[hidden(1, None, Some(500))], 100, 7));
-        // An unknown start time cannot be ruled out.
-        assert!(suspicious_hidden(&[hidden(1, Some(1), None)], 100, 7));
+        assert!(suspicious_hidden(
+            &[hidden(1, Some(7), Some(100))],
+            100,
+            None,
+            7
+        ));
+        // Before the window, another parent, or no parent: not ours.
+        assert!(!suspicious_hidden(
+            &[hidden(1, Some(1), Some(99))],
+            100,
+            None,
+            7
+        ));
+        assert!(!suspicious_hidden(
+            &[hidden(1, Some(8), Some(500))],
+            100,
+            None,
+            7
+        ));
+        assert!(!suspicious_hidden(
+            &[hidden(1, None, Some(500))],
+            100,
+            None,
+            7
+        ));
+        // An unknown start time cannot be ruled out, bounded or not.
+        assert!(suspicious_hidden(&[hidden(1, Some(1), None)], 100, None, 7));
+        assert!(suspicious_hidden(
+            &[hidden(1, Some(1), None)],
+            100,
+            Some(200),
+            7
+        ));
         // One suspicious among many.
         assert!(suspicious_hidden(
             &[hidden(1, Some(8), Some(500)), hidden(2, Some(1), Some(500))],
             100,
+            None,
             7
         ));
+    }
+
+    #[test]
+    fn the_window_ends_at_the_last_record_plus_the_slack() {
+        let at = |t| [hidden(1, Some(1), Some(t))];
+        // Both ends are inclusive.
+        assert!(suspicious_hidden(&at(100), 100, Some(200), 7));
+        assert!(suspicious_hidden(&at(200), 100, Some(200), 7));
+        assert!(!suspicious_hidden(&at(99), 100, Some(200), 7));
+        assert!(!suspicious_hidden(&at(201), 100, Some(200), 7));
+    }
+
+    #[test]
+    fn the_window_starts_at_the_child_or_else_the_intent_and_is_open_without_a_record() {
+        assert_eq!(
+            suspicion_window(Some(50), Some(40), Some(100)),
+            (50, Some(102))
+        );
+        assert_eq!(suspicion_window(None, Some(40), Some(100)), (40, Some(102)));
+        assert_eq!(suspicion_window(None, None, Some(100)), (0, Some(102)));
+        assert_eq!(suspicion_window(Some(50), None, None), (50, None));
+        assert_eq!(
+            suspicion_window(None, None, Some(u64::MAX)),
+            (0, Some(u64::MAX))
+        );
+        assert_eq!(RECORD_SLACK_SECS, 2);
+    }
+
+    #[test]
+    fn a_failed_tracker_keeps_what_was_recorded_and_stays_truncated() {
+        let a = p(10, 100);
+        // Unknown: nothing recorded, nothing erased.
+        let r = persisted(&[a], false, &Tracked::unknown());
+        assert_eq!(
+            r,
+            Tracked {
+                descendants: vec![a],
+                truncated: true
+            }
+        );
+        // An ordinary record replaces the set.
+        let b = p(11, 101);
+        let t = Tracked {
+            descendants: vec![b],
+            truncated: false,
+        };
+        assert_eq!(persisted(&[a], false, &t), t);
+        // Truncated never goes back.
+        let r = persisted(&[a], true, &t);
+        assert_eq!(
+            r,
+            Tracked {
+                descendants: vec![b],
+                truncated: true
+            }
+        );
+        // Truncated with a full set is the set, not the old one.
+        let t = Tracked {
+            descendants: vec![b],
+            truncated: true,
+        };
+        assert_eq!(persisted(&[a], false, &t), t);
+    }
+
+    #[test]
+    fn a_root_without_a_start_time_is_seeded_by_pid() {
+        // The root ended unreaped (a zombie: no start time) and still has a
+        // live child, which is reparented only once the root is reaped.
+        let root = ProcRef {
+            pid: 10,
+            start_time: None,
+        };
+        let table = [
+            Row {
+                proc: root,
+                parent: Some(1),
+            },
+            row(11, 10, 200),
+            row(12, 11, 201),
+            row(13, 1, 202),
+        ];
+        assert_eq!(pids(&descendants_of(&table, root, &[])), vec![11, 12]);
+        // Not in the table (already reaped): nothing to seed.
+        assert!(descendants_of(&table[1..], root, &[]).is_empty());
+        // With a start time the pid is not trusted alone: a different
+        // process on the same pid is not the root.
+        let reused = ProcRef {
+            pid: 10,
+            start_time: Some(5),
+        };
+        let table = [row(10, 1, 300), row(11, 10, 301)];
+        assert!(descendants_of(&table, reused, &[]).is_empty());
     }
 }

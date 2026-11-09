@@ -15,6 +15,21 @@ the minor version).
   did not find it.
 - macOS: a refused `KERN_PROCARGS2` is hidden only for `EINVAL`/`EPERM` on a
   process the kernel confirmed is ours; other errors make the scan unknown.
+- A recorder failure is persisted to the sidecar and also stops the
+  supervisor that saw it from releasing (`finish` keeps the entry); the
+  reaper reads it as "could not be checked" until `resolve --force`.
+- A hidden orphan only keeps an entry when it started from the child's start
+  (the launch intent when unknown) to two seconds after the last recorder
+  write (`recorded_at`), so processes `launchd` starts later no longer hold
+  it. A hold that remains is expected; `resolve --force` is the way out.
+- A command that ended unreaped (no readable start time) now has its live
+  children recorded (the walk is seeded by pid).
+- macOS: the command's start time is also read with `proc_pidinfo` when the
+  process table does not list it (the short form has no start time, so only
+  the full one is used); the retry stays for other platforms.
+- macOS: if the kernel cannot tell the owner of a process of yours, a hidden
+  process of yours is unreadable, the scan is unknown and the entry is held
+  until `resolve --force`.
 - A started entry whose child and group are gone is also kept when a hidden
   orphan began after the child (as for a launch intent).
 - On macOS an entry can stay held (`ProbeUnknown`) because of a hidden

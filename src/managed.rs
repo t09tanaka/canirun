@@ -138,6 +138,11 @@ pub struct Sidecar {
     /// More were seen than fit: the rest are not recorded.
     #[serde(default, skip_serializing_if = "is_false")]
     pub descendants_truncated: bool,
+    /// When the tracker last wrote its record (descendants or an unknown
+    /// outcome). A hidden process that started long after this is not a
+    /// descendant the tracker missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<DateTime<Utc>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -270,10 +275,16 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
             sc.child.clone(),
         ),
     };
-    let (tracked, intent, supervisor) = match &sidecar {
-        Loaded::Ok(sc) => (sc.tracked(), sc.launch_intent_at, sc.owner_pid),
-        _ => (Tracked::default(), None, 0),
+    let (tracked, intent, supervisor, recorded) = match &sidecar {
+        Loaded::Ok(sc) => (
+            sc.tracked(),
+            sc.launch_intent_at,
+            sc.owner_pid,
+            sc.recorded_at,
+        ),
+        _ => (Tracked::default(), None, 0, None),
     };
+    let secs = |t: DateTime<Utc>| t.timestamp().max(0) as u64;
     let (mut child_probe, mut group_probe, mut marker) =
         (Probe::Unknown, Probe::Unknown, Probe::Unknown);
     if !lease_held {
@@ -298,8 +309,12 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                         && child_probe == Probe::Gone
                         && group_probe == Probe::Gone
                     {
-                        let since = child.as_ref().and_then(|c| c.start_time).unwrap_or(0);
-                        if lineage::suspicious_hidden(&scan.hidden, since, supervisor) {
+                        let (since, until) = lineage::suspicion_window(
+                            child.as_ref().and_then(|c| c.start_time),
+                            intent.map(secs),
+                            recorded.map(secs),
+                        );
+                        if lineage::suspicious_hidden(&scan.hidden, since, until, supervisor) {
                             marker = Probe::Unknown;
                         }
                     }
@@ -314,9 +329,10 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 // A clear scan does not show a child whose environment the
                 // OS hides. One that began after the intent and is an
                 // orphan (or the dead supervisor's child) may be it.
-                let since = intent.map_or(0, |t| t.timestamp().max(0) as u64);
+                let (since, until) =
+                    lineage::suspicion_window(None, intent.map(secs), recorded.map(secs));
                 marker = if scan.probe == Probe::Gone
-                    && lineage::suspicious_hidden(&scan.hidden, since, supervisor)
+                    && lineage::suspicious_hidden(&scan.hidden, since, until, supervisor)
                 {
                     Probe::Unknown
                 } else {
@@ -442,6 +458,9 @@ pub struct OwnerGuard {
     _lease: Lock,
     id: String,
     managed: bool,
+    /// The recorder of the command's descendants failed in this process, so
+    /// nothing can be ruled out: [`finish`] does not release.
+    tracker_unknown: std::sync::atomic::AtomicBool,
 }
 
 impl OwnerGuard {
@@ -450,6 +469,7 @@ impl OwnerGuard {
             _lease: lease,
             id: id.to_string(),
             managed,
+            tracker_unknown: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -575,6 +595,7 @@ pub(crate) fn push_entry(
                     terminal: None,
                     descendants: Vec::new(),
                     descendants_truncated: false,
+                    recorded_at: None,
                 },
             )?;
         }
@@ -768,6 +789,19 @@ pub struct Ran {
 /// child leads its own process group. The ledger entry and lease are *not*
 /// released here: record the outcome with [`finish`] first.
 pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limits) -> Result<Ran> {
+    run_command_with_tracker(ctx, guard, opts, limits, None)
+}
+
+/// [`run_command`] with the recorder's start replaced (for tests that make
+/// it fail).
+#[doc(hidden)]
+pub fn run_command_with_tracker(
+    ctx: &Context,
+    guard: &OwnerGuard,
+    opts: &Opts,
+    limits: Limits,
+    start_tracker: Option<runner::StartTracker>,
+) -> Result<Ran> {
     let id = guard.command_id();
     if guard.managed {
         // Only a command that never reached its launch may spawn. After a
@@ -814,8 +848,10 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
             // the whole set.
             if let Loaded::Ok(mut sc) = load_sidecar(&ctx, &id) {
                 if sc.phase != Phase::Terminal {
-                    sc.descendants = t.descendants.clone();
-                    sc.descendants_truncated = t.truncated;
+                    let kept = lineage::persisted(&sc.descendants, sc.descendants_truncated, t);
+                    sc.descendants = kept.descendants;
+                    sc.descendants_truncated = kept.truncated;
+                    sc.recorded_at = Some(ctx.clock.now());
                     let _ = write_sidecar(&ctx, &sc);
                 }
             }
@@ -832,8 +868,14 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
             marker_id: guard.managed.then_some(id),
             on_spawn: guard.managed.then_some(&on_spawn),
             on_descendants: guard.managed.then_some(record),
+            start_tracker,
         },
     )?;
+    if outcome.tracker_unknown {
+        guard
+            .tracker_unknown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     Ok(Ran {
         outcome,
         started_at,
@@ -848,6 +890,15 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
 pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()> {
     let id = guard.id.clone();
     if guard.managed {
+        if guard
+            .tracker_unknown
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Ledger(format!(
+                "{id}: the descendants of the command could not be recorded, so the entry \
+                 keeps its budget (see `canirun resolve {id}`)"
+            )));
+        }
         // Budget is only released once the whole process group, and anything
         // marked that left it, is known to be stopped. `run_command` stops
         // what it can; if members remain the entry is kept (the reaper then
@@ -936,6 +987,7 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
                     terminal: Some(terminal),
                     descendants: Vec::new(),
                     descendants_truncated: false,
+                    recorded_at: None,
                 },
             )?;
         }

@@ -18,11 +18,39 @@ pub fn start_time(pid: u32) -> Option<u64> {
         true,
         ProcessRefreshKind::nothing(),
     );
-    let proc = sys.process(p)?;
+    let Some(proc) = sys.process(p) else {
+        // sysinfo may not list a process that exists: ask the kernel.
+        return kernel_start_time(pid);
+    };
     if matches!(proc.status(), ProcessStatus::Zombie) {
         return None;
     }
     Some(proc.start_time())
+}
+
+/// The start time of a live, non-zombie `pid` from the kernel (macOS:
+/// `proc_pidinfo`, whose short form has no start time, so only the full
+/// one is asked), in seconds since the epoch.
+#[cfg(target_os = "macos")]
+fn kernel_start_time(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (got == size && info.pbi_status != libc::SZOMB && info.pbi_start_tvsec != 0)
+        .then_some(info.pbi_start_tvsec)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_start_time(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Has our child `pid` ended without being reaped yet (a zombie)? Asked of
@@ -383,6 +411,21 @@ pub fn system_boot_id() -> Option<String> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_start_time_agrees_with_the_process_table_and_skips_a_zombie() {
+        let me = std::process::id();
+        assert_eq!(kernel_start_time(me), start_time(me));
+        assert!(kernel_start_time(me).is_some());
+        assert_eq!(kernel_start_time(0x3fff_fff0), None);
+        let mut child = Command::new("true").spawn().unwrap();
+        while !has_ended(child.id()) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(kernel_start_time(child.id()), None);
+        child.wait().unwrap();
+    }
 
     #[test]
     fn we_see_ourselves_and_not_a_missing_pid() {

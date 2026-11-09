@@ -351,8 +351,19 @@ What is not found, and what follows:
   started (an Apple binary whose environment is hidden) can be mistaken for
   the child of a launch intent or a started command: the reaper then
   answers "could not be checked" (`ProbeUnknown`) and the entry stays held.
-  The way out is `canirun resolve <id> --force`, after checking that
+  Only a hidden process that started in a window counts: from the child's
+  start (the launch intent when that is unknown) to two seconds after the
+  last time the recorder wrote (`recorded_at` in the sidecar); with no
+  record at all the window has no end. Such a hold is expected, not a bug,
+  and the way out is `canirun resolve <id> --force`, after checking that
   nothing of the command still runs.
+- Recording the descendants that fails is written to the sidecar too
+  (`descendants_truncated`), and the supervisor that saw it fail does not
+  release either: the entry stays held until `resolve --force`.
+- If the kernel cannot tell the owner of a process of yours (macOS
+  `proc_pidinfo` refused both ways), a process whose environment is hidden
+  is unreadable, the scan is unknown, and the entry is held. The way out
+  is the same: `canirun resolve <id> --force`.
 - Recording the descendants that fails (the thread panics or cannot start,
   or the command cannot be read while it runs) counts as "could not be
   checked", never as "no descendants". A recorded descendant is dropped only

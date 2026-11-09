@@ -57,6 +57,15 @@ impl Tracker {
         }
     }
 
+    /// A recorder that could not start, as when the command cannot be read.
+    #[doc(hidden)]
+    pub fn failed(_root: u32, _record: Record) -> Tracker {
+        Tracker {
+            stop: None,
+            handle: Some(Err(std::io::Error::other("recorder failed to start"))),
+        }
+    }
+
     /// Stop after one last look, and return what was recorded.
     pub fn finish(mut self) -> Tracked {
         self.join()
