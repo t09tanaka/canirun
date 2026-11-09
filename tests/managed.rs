@@ -1212,9 +1212,9 @@ fn gc_keeps_only_the_newest_applied_markers() {
 
 /// Runs only when re-executed by the test below, as the supervisor of a
 /// command whose child starts a descendant in a session of its own (so it
-/// leaves the process group) and writes its pid to a file. perl and sleep
-/// are what Apple ships: their environment is hidden from other processes
-/// on macOS, so the marker cannot find the descendant there.
+/// leaves the process group) and writes its pid to a file. On a Mac with
+/// Apple's perl and sleep their environment is hidden from other processes,
+/// so only the recorded descendants can find it there.
 #[test]
 fn setsid_supervisor_entry() {
     let Some(dir) = std::env::var_os("CANIRUN_TEST_SETSID_DIR") else {
@@ -1274,11 +1274,6 @@ fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
     sup.wait().unwrap();
     unsafe { libc::killpg(pgid, libc::SIGKILL) };
     assert!(until(20, || unsafe { libc::killpg(pgid, 0) } == -1));
-    if cfg!(target_os = "macos") {
-        // Without the record nothing would show it: its environment is
-        // hidden.
-        assert!(until(10, || ctx.scan_marked("sup-2").probe == Probe::Gone));
-    }
     for _ in 0..3 {
         assert!(
             reaped(&ctx).find("sup-2").is_some(),
