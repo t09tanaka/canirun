@@ -329,4 +329,56 @@ mod tests {
         assert!(snap.ledger.entries.is_empty());
         assert!(!d.path().join("state").exists());
     }
+
+    /// Run `snapshot_read_only` on its own thread, so the caller can hold
+    /// the exclusive ledger lock meanwhile.
+    fn snapshot_in_thread(
+        ctx: &Context,
+    ) -> std::sync::mpsc::Receiver<(ReadOnlySnapshot, Duration)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let start = Instant::now();
+            let snap = snapshot_read_only(&ctx).unwrap();
+            let _ = tx.send((snap, start.elapsed()));
+        });
+        rx
+    }
+
+    /// Deterministic in the direction that matters: while an exclusive
+    /// lock is held the snapshot must not return (the wait is bounded by
+    /// `TRY_ROUND`, 1 s, far above the 200 ms checked here), and once the
+    /// lock is released it must take the shared lock (`locked == true`)
+    /// instead of reading without it.
+    #[test]
+    fn read_only_snapshot_waits_for_the_exclusive_lock() {
+        let (_d, ctx) = state_with(&["a"]);
+        let _lease = take_lease(&ctx, "a").unwrap();
+        let held = ledger(&ctx).unwrap();
+        let rx = snapshot_in_thread(&ctx);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the snapshot finished while the exclusive lock was held"
+        );
+        drop(held);
+        let (snap, _) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(snap.locked);
+        assert_eq!(snap.ledger.entries.len(), 1);
+    }
+
+    /// If the exclusive lock stays held past the (shortened) round, the
+    /// snapshot falls back to reading without the lock: `locked == false`,
+    /// and not before the round has elapsed.
+    #[test]
+    fn read_only_snapshot_falls_back_unlocked_after_the_round() {
+        let (_d, ctx) = state_with(&["a"]);
+        let ctx = ctx.with_ledger_lock_timeout(Duration::from_millis(300));
+        let _lease = take_lease(&ctx, "a").unwrap();
+        let _held = ledger(&ctx).unwrap();
+        let rx = snapshot_in_thread(&ctx);
+        let (snap, took) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!snap.locked);
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert_eq!(snap.ledger.entries.len(), 1);
+    }
 }

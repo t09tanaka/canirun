@@ -891,12 +891,18 @@ fn critical_path(nodes: &[NodeForecast], info: &[PathInfo]) -> CriticalPath {
     // (node, its wait is covered by the next node on the path)
     let mut path: Vec<(usize, bool)> = Vec::new();
     let mut visited = vec![false; nodes.len()];
-    loop {
+    // At most one step per node: the visited checks already guarantee it,
+    // the bound only keeps a read-only forecast from hanging if they ever
+    // fail.
+    for _ in 0..nodes.len() {
         visited[cur] = true;
         let n = &info[cur];
         let mut pred = None;
         for &d in &n.deps {
-            if pred.is_none_or(|p: usize| finishes[d] > finishes[p]) {
+            // A node already on the path must not be chosen again: after a
+            // resource-wait jump the new node's dependency can point back
+            // at a visited node, and the walk would never end.
+            if !visited[d] && pred.is_none_or(|p: usize| finishes[d] > finishes[p]) {
                 pred = Some(d);
             }
         }
@@ -908,8 +914,8 @@ fn critical_path(nodes: &[NodeForecast], info: &[PathInfo]) -> CriticalPath {
             covered = pred.is_some();
         }
         path.push((cur, covered));
-        // Neither a dependency (acyclic) nor the search (unvisited only)
-        // can lead back to a node already on the path.
+        // Neither a dependency nor the search (both unvisited only) can
+        // lead back to a node already on the path.
         match pred {
             Some(p) => cur = p,
             None => break,
@@ -2645,5 +2651,65 @@ mod tests {
             .assumptions
             .iter()
             .any(|a| a.contains("1 running entries have unknown remaining time")));
+    }
+
+    /// Zero-length nodes `w` (0), `p` (1), `q` (2) and an earlier `r` (3);
+    /// w depends on p, q on w and r. p waited for a budget slot (start after
+    /// ready) until t, and w, p, q finish at t. The resource-wait jump from
+    /// p lands on q, whose dependency w is already on the path. Before the
+    /// `visited` check on dependencies the walk went q -> w -> ... and never
+    /// returned (the length cap only bounds it now); with it q's next step
+    /// is the unvisited r.
+    #[test]
+    fn critical_path_does_not_loop_through_visited_dependencies() {
+        let t = 5_000u64;
+        let node = |id: &str| NodeForecast {
+            node_id: id.into(),
+            timing: Timing {
+                ready_in_ms: Some(0),
+                start_in_ms: Some(t),
+                queue_wait_after_ready_ms: Some(0),
+                execution_ms: Some(0),
+                finish_in_ms: Some(t),
+                null_reasons: BTreeMap::new(),
+                ranking: None,
+                confidence: Confidence::High,
+                runtime_source: RuntimeSource::Measured,
+                history_count: 3,
+                conditional: false,
+                assumptions: Vec::new(),
+                wait_reason: None,
+            },
+        };
+        let pi = |deps: Vec<usize>, ready: u64| PathInfo {
+            deps,
+            ready: Some(ready),
+            start: Some(t),
+            finish: Some(t),
+        };
+        let mut r = node("r");
+        r.timing.start_in_ms = Some(0);
+        r.timing.finish_in_ms = Some(0);
+        let nodes = vec![node("w"), node("p"), node("q"), r];
+        // p: waited for budget (ready 0, start t); q: ready 0 too.
+        let info = vec![
+            pi(vec![1], t),
+            pi(vec![], 0),
+            pi(vec![0, 3], 0),
+            PathInfo {
+                deps: vec![],
+                ready: Some(0),
+                start: Some(0),
+                finish: Some(0),
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(critical_path(&nodes, &info).nodes);
+        });
+        let path = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("critical_path must terminate");
+        assert_eq!(path, ["r", "q", "p", "w"]);
     }
 }
