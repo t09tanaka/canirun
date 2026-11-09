@@ -2,7 +2,7 @@
 //! a JSON descriptor, a merged log, and an exit file.
 
 use crate::error::{Error, Result};
-use crate::paths;
+use crate::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -50,26 +50,26 @@ impl JobState {
     }
 }
 
-pub fn save(job: &Job) -> Result<()> {
-    let path = paths::job_json(&job.id);
-    fs::create_dir_all(paths::jobs_dir())?;
-    let mut tmp = tempfile::NamedTempFile::new_in(paths::jobs_dir())?;
+pub fn save(ctx: &Context, job: &Job) -> Result<()> {
+    let path = ctx.paths.job_json(&job.id);
+    fs::create_dir_all(ctx.paths.jobs_dir())?;
+    let mut tmp = tempfile::NamedTempFile::new_in(ctx.paths.jobs_dir())?;
     serde_json::to_writer_pretty(&mut tmp, job)?;
     tmp.write_all(b"\n")?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 
-pub fn load(id: &str) -> Result<Job> {
+pub fn load(ctx: &Context, id: &str) -> Result<Job> {
     let bytes =
-        fs::read(paths::job_json(id)).map_err(|e| Error::Ledger(format!("job {id}: {e}")))?;
+        fs::read(ctx.paths.job_json(id)).map_err(|e| Error::Ledger(format!("job {id}: {e}")))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// All jobs, newest first. Unreadable descriptors are skipped.
-pub fn list() -> Result<Vec<Job>> {
+pub fn list(ctx: &Context) -> Result<Vec<Job>> {
     let mut out = Vec::new();
-    let rd = match fs::read_dir(paths::jobs_dir()) {
+    let rd = match fs::read_dir(ctx.paths.jobs_dir()) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e.into()),
@@ -79,7 +79,7 @@ pub fn list() -> Result<Vec<Job>> {
         let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
             continue;
         };
-        if let Ok(job) = load(id) {
+        if let Ok(job) = load(ctx, id) {
             out.push(job);
         }
     }
@@ -87,38 +87,44 @@ pub fn list() -> Result<Vec<Job>> {
     Ok(out)
 }
 
-pub fn read_exit(id: &str) -> Option<i32> {
-    fs::read_to_string(paths::job_exit(id))
+pub fn read_exit(ctx: &Context, id: &str) -> Option<i32> {
+    fs::read_to_string(ctx.paths.job_exit(id))
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
 
 /// Persist the outcome. Written once; later writers lose (the first
 /// outcome is the real one, e.g. the runner's over a late `cancel`).
-pub fn write_exit(id: &str, code: i32) {
-    let path = paths::job_exit(id);
+pub fn write_exit(ctx: &Context, id: &str, code: i32) {
+    let path = ctx.paths.job_exit(id);
     if path.exists() {
         return;
     }
-    let _ = fs::create_dir_all(paths::jobs_dir());
-    if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(paths::jobs_dir()) {
+    let _ = fs::create_dir_all(ctx.paths.jobs_dir());
+    if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(ctx.paths.jobs_dir()) {
         let _ = writeln!(tmp, "{code}");
         let _ = tmp.persist(&path);
     }
-    if let Ok(mut job) = load(id) {
-        job.finished_at = Some(Utc::now());
-        let _ = save(&job);
+    if let Ok(mut job) = load(ctx, id) {
+        job.finished_at = Some(ctx.clock.now());
+        let _ = save(ctx, &job);
     }
 }
 
 /// Spawn the detached runner for `job`: own session, stdin from
-/// /dev/null, stdout+stderr appended to the job log, env inherited.
-pub fn spawn_runner(job: &Job) -> Result<std::process::Child> {
-    let exe = std::env::current_exe()?;
+/// /dev/null, stdout+stderr appended to the job log, env inherited. The
+/// runner is `exe __run-job <id>`; it rebuilds its own context from the
+/// environment it inherits, so the caller's `exe` must resolve the same
+/// state directory as `ctx`.
+pub fn spawn_runner(
+    ctx: &Context,
+    exe: &std::path::Path,
+    job: &Job,
+) -> Result<std::process::Child> {
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(paths::job_log(&job.id))?;
+        .open(ctx.paths.job_log(&job.id))?;
     let log_err = log.try_clone()?;
     let mut cmd = Command::new(exe);
     cmd.arg("__run-job")
@@ -141,27 +147,27 @@ pub fn spawn_runner(job: &Job) -> Result<std::process::Child> {
 
 /// Hold this while waiting on a job; the runner treats "nobody holds it"
 /// as "nobody cares" once the grace period is over.
-pub fn take_waiter(id: &str) -> Result<crate::lock::Lock> {
-    crate::lock::take_shared(&paths::job_waiter(id))
+pub fn take_waiter(ctx: &Context, id: &str) -> Result<crate::lock::Lock> {
+    crate::lock::take_shared(&ctx.paths.job_waiter(id))
 }
 
-pub fn has_waiter(id: &str) -> bool {
-    crate::lock::is_held(&paths::job_waiter(id))
+pub fn has_waiter(ctx: &Context, id: &str) -> bool {
+    crate::lock::is_held(&ctx.paths.job_waiter(id))
 }
 
-pub fn mark_orphaned(id: &str) {
-    if let Ok(mut job) = load(id) {
+pub fn mark_orphaned(ctx: &Context, id: &str) {
+    if let Ok(mut job) = load(ctx, id) {
         job.orphaned = true;
-        let _ = save(&job);
+        let _ = save(ctx, &job);
     }
 }
 
-pub fn remove_files(id: &str) {
+pub fn remove_files(ctx: &Context, id: &str) {
     for p in [
-        paths::job_json(id),
-        paths::job_log(id),
-        paths::job_exit(id),
-        paths::job_waiter(id),
+        ctx.paths.job_json(id),
+        ctx.paths.job_log(id),
+        ctx.paths.job_exit(id),
+        ctx.paths.job_waiter(id),
     ] {
         let _ = fs::remove_file(p);
     }

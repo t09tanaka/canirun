@@ -4,7 +4,7 @@
 # through the end-to-end binary tests.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo llvm-cov --bin canirun --json --output-path target/llvm-cov.json \
+cargo llvm-cov --lib --json --output-path target/llvm-cov.json \
   -- admit:: weight:: key:: eta:: >/dev/null
 python3 - <<'PY'
 import json, sys

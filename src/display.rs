@@ -1,3 +1,5 @@
+use crate::ledger::Entry;
+use chrono::{DateTime, Utc};
 use std::time::Duration;
 
 pub fn fmt_duration(d: Duration) -> String {
@@ -31,9 +33,92 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// A running entry using less than this many cores...
+pub const IDLE_CORES: f64 = 0.2;
+/// ...after running this long is marked `idle`: most likely a server or a
+/// watch mode, which holds its weight until it exits.
+pub const IDLE_AFTER: Duration = Duration::from_secs(300);
+
+pub fn running_for(e: &Entry, now: DateTime<Utc>) -> Duration {
+    (now - e.started_at.unwrap_or(e.enqueued_at))
+        .to_std()
+        .unwrap_or_default()
+}
+
+/// Measured at almost nothing after running a while.
+pub fn is_idle(using: Option<f64>, running_for: Duration) -> bool {
+    running_for >= IDLE_AFTER && using.is_some_and(|u| u < IDLE_CORES)
+}
+
+/// One running entry for a waiting line: `48211 w2 idle 52:10 api: make
+/// api`, the label cut to `max` characters.
+pub fn holder(e: &Entry, now: DateTime<Utc>, max: usize) -> String {
+    let elapsed = running_for(e, now);
+    let use_part = match e.using {
+        _ if is_idle(e.using, elapsed) => " idle".to_string(),
+        Some(u) => format!(" using {u:.1}"),
+        None => String::new(),
+    };
+    format!(
+        "{} w{}{use_part} {} {}",
+        e.pid,
+        e.weight,
+        fmt_duration(elapsed),
+        truncate(&label(&e.repo, &e.subdir, &e.argv), max)
+    )
+}
+
+pub fn label(repo: &str, subdir: &str, argv: &str) -> String {
+    if repo.is_empty() {
+        argv.to_string()
+    } else {
+        format!("{}: {argv}", crate::key::project_label(repo, subdir))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admit::State;
+
+    #[test]
+    fn idle_means_measured_near_zero_after_a_while() {
+        let long = IDLE_AFTER;
+        assert!(is_idle(Some(0.0), long));
+        assert!(is_idle(Some(0.19), long));
+        assert!(!is_idle(Some(0.2), long));
+        assert!(!is_idle(None, long));
+        assert!(!is_idle(Some(0.0), long - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn holder_names_pid_weight_use_and_command() {
+        let now = Utc::now();
+        let mut e = Entry {
+            id: "a".into(),
+            pid: 48211,
+            state: State::Running,
+            front: false,
+            weight: 2,
+            predicted_rss: 0,
+            expected_secs: None,
+            repo: String::new(),
+            subdir: String::new(),
+            argv: "make api".into(),
+            key: "k".into(),
+            seq: 1,
+            enqueued_at: now,
+            started_at: Some(now - chrono::Duration::seconds(3130)),
+            using: Some(0.0),
+            backfilled: false,
+        };
+        assert_eq!(holder(&e, now, 40), "48211 w2 idle 52:10 make api");
+        e.using = Some(1.26);
+        assert_eq!(holder(&e, now, 40), "48211 w2 using 1.3 52:10 make api");
+        e.using = None;
+        e.started_at = Some(now - chrono::Duration::seconds(5));
+        assert_eq!(holder(&e, now, 4), "48211 w2 0:05 mak…");
+    }
 
     #[test]
     fn durations() {

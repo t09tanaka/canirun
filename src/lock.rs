@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ledger::Ledger;
-use crate::paths;
+use crate::Context;
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -12,8 +12,6 @@ use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(20);
 pub const LEDGER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
-/// Overrides `LEDGER_LOCK_TIMEOUT`, in milliseconds (for tests).
-const LEDGER_LOCK_TIMEOUT_ENV: &str = "CANIRUN_LEDGER_LOCK_TIMEOUT_MS";
 /// How long `try_ledger` waits before giving up a round, short so a
 /// waiting `exec` still answers signals promptly.
 const TRY_ROUND: Duration = Duration::from_secs(1);
@@ -63,22 +61,17 @@ pub fn acquire(path: &Path, timeout: Duration) -> Result<Lock> {
     }
 }
 
-fn ledger_lock_timeout() -> Duration {
-    std::env::var(LEDGER_LOCK_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(LEDGER_LOCK_TIMEOUT)
-}
-
-pub fn ledger() -> Result<Lock> {
-    acquire(&paths::ledger_lock(), ledger_lock_timeout())
+pub fn ledger(ctx: &Context) -> Result<Lock> {
+    acquire(&ctx.paths.ledger_lock(), ctx.ledger_lock_timeout)
 }
 
 /// The ledger lock, or `None` when it stayed busy for a round (at most
 /// `TRY_ROUND`), for callers that can skip a round and try again later.
-pub fn try_ledger() -> Result<Option<Lock>> {
-    match acquire(&paths::ledger_lock(), ledger_lock_timeout().min(TRY_ROUND)) {
+pub fn try_ledger(ctx: &Context) -> Result<Option<Lock>> {
+    match acquire(
+        &ctx.paths.ledger_lock(),
+        ctx.ledger_lock_timeout.min(TRY_ROUND),
+    ) {
         Ok(lock) => Ok(Some(lock)),
         Err(Error::LockTimeout(_)) => Ok(None),
         Err(e) => Err(e),
@@ -86,8 +79,8 @@ pub fn try_ledger() -> Result<Option<Lock>> {
 }
 
 /// The ledger with dead entries removed, for readers.
-pub fn load_reaped() -> Result<Ledger> {
-    Ok(snapshot()?.ledger)
+pub fn load_reaped(ctx: &Context) -> Result<Ledger> {
+    Ok(snapshot(ctx)?.ledger)
 }
 
 /// A ledger read by `snapshot`.
@@ -102,18 +95,18 @@ pub struct Snapshot {
 /// saved. When the lock stays busy, the file is read without it (saves
 /// are atomic renames, so it is never half-written) and dead entries are
 /// only left out of the returned copy.
-pub fn snapshot() -> Result<Snapshot> {
-    let Some(_guard) = try_ledger()? else {
-        let mut ledger = Ledger::load(&paths::ledger_file())?;
-        ledger.entries.retain(|e| lease_is_held(&e.id));
+pub fn snapshot(ctx: &Context) -> Result<Snapshot> {
+    let Some(_guard) = try_ledger(ctx)? else {
+        let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
+        ledger.entries.retain(|e| lease_is_held(ctx, &e.id));
         return Ok(Snapshot {
             ledger,
             locked: false,
         });
     };
-    let mut ledger = Ledger::load(&paths::ledger_file())?;
-    if !reap_dead(&mut ledger).is_empty() {
-        ledger.save(&paths::ledger_file())?;
+    let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
+    if !reap_dead(ctx, &mut ledger).is_empty() {
+        ledger.save(&ctx.paths.ledger_file())?;
     }
     Ok(Snapshot {
         ledger,
@@ -124,8 +117,8 @@ pub fn snapshot() -> Result<Snapshot> {
 /// Take the lease for `id`. Held by the owning canirun process until it
 /// exits; the fd is close-on-exec (Rust std default) so children never
 /// inherit it.
-pub fn take_lease(id: &str) -> Result<Lock> {
-    let path = paths::lease_file(id);
+pub fn take_lease(ctx: &Context, id: &str) -> Result<Lock> {
+    let path = ctx.paths.lease_file(id);
     let file = open_lock_file(&path)?;
     file.try_lock_exclusive()
         .map_err(|e| Error::Ledger(format!("lease {} already held: {e}", path.display())))?;
@@ -133,8 +126,8 @@ pub fn take_lease(id: &str) -> Result<Lock> {
 }
 
 /// True when some process currently holds the lease lock for `id`.
-pub fn lease_is_held(id: &str) -> bool {
-    let path = paths::lease_file(id);
+pub fn lease_is_held(ctx: &Context, id: &str) -> bool {
+    let path = ctx.paths.lease_file(id);
     let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
         return false;
     };
@@ -170,24 +163,24 @@ pub fn is_held(path: &Path) -> bool {
 
 /// Remove ledger entries whose lease is not held, and their lease files.
 /// Returns the ids removed. Caller holds the ledger lock.
-pub fn reap_dead(ledger: &mut Ledger) -> Vec<String> {
+pub fn reap_dead(ctx: &Context, ledger: &mut Ledger) -> Vec<String> {
     let dead: Vec<String> = ledger
         .entries
         .iter()
-        .filter(|e| !lease_is_held(&e.id))
+        .filter(|e| !lease_is_held(ctx, &e.id))
         .map(|e| e.id.clone())
         .collect();
     for id in &dead {
         ledger.remove(id);
-        let _ = std::fs::remove_file(paths::lease_file(id));
+        let _ = std::fs::remove_file(ctx.paths.lease_file(id));
     }
     dead
 }
 
 /// Remove lease files that no ledger entry refers to (left by crashes
 /// between lease creation and ledger registration).
-pub fn sweep_orphan_leases(ledger: &Ledger) {
-    let Ok(rd) = std::fs::read_dir(paths::leases_dir()) else {
+pub fn sweep_orphan_leases(ctx: &Context, ledger: &Ledger) {
+    let Ok(rd) = std::fs::read_dir(ctx.paths.leases_dir()) else {
         return;
     };
     for ent in rd.flatten() {
@@ -195,7 +188,7 @@ pub fn sweep_orphan_leases(ledger: &Ledger) {
         let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".lock")) else {
             continue;
         };
-        if ledger.find(id).is_none() && !lease_is_held(id) {
+        if ledger.find(id).is_none() && !lease_is_held(ctx, id) {
             let _ = std::fs::remove_file(ent.path());
         }
     }

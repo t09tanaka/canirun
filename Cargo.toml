@@ -11,6 +11,14 @@ keywords = ["ci", "concurrency", "throttle", "semaphore", "dev-tools"]
 categories = ["command-line-utilities", "development-tools"]
 include = ["src/**/*", "tests/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
 
+[lib]
+name = "canirun"
+path = "src/lib.rs"
+
+[[bin]]
+name = "canirun"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

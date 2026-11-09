@@ -1,25 +1,11 @@
 //! canirun — "Can I run?" A local admission controller for heavy commands.
 
-mod admit;
 mod cmd;
-mod config;
-mod display;
-mod error;
-mod eta;
-mod gitctx;
-mod history;
-mod jobs;
-mod key;
-mod ledger;
-mod live;
-mod lock;
-mod paths;
-mod runner;
-mod usage;
-mod weight;
+mod env;
+mod signals;
 
+use canirun::{config::Config, error, exec::Opts};
 use clap::{Parser, Subcommand};
-use config::Config;
 
 #[derive(Parser)]
 #[command(
@@ -125,29 +111,23 @@ fn main() {
 }
 
 fn run(cli: Cli) -> error::Result<i32> {
-    let cfg = Config::load(&paths::config_file())?;
+    let ctx = env::context();
+    let cfg = Config::load(ctx.paths.config_file())?;
     match cli.cmd {
         Cmd::Exec {
             weight,
             front,
             key,
             command,
-        } => cmd::exec::run(
-            &cfg,
-            cmd::exec::Opts {
-                weight,
-                front,
-                key,
-                argv: command,
-            },
-        ),
-        Cmd::Status { json } => cmd::status::run(&cfg, json),
+        } => cmd::exec::run(&ctx, &cfg, opts(weight, front, key, command)?),
+        Cmd::Status { json } => cmd::status::run(&ctx, &cfg, json),
         Cmd::History {
             key,
             json,
             limit,
             command,
         } => cmd::history::run(
+            &ctx,
             &cfg,
             cmd::history::Opts {
                 key,
@@ -156,27 +136,34 @@ fn run(cli: Cli) -> error::Result<i32> {
                 limit,
             },
         ),
-        Cmd::Config { path } => cmd::config::run(&cfg, path),
-        Cmd::Gc => cmd::gc::run(&cfg),
+        Cmd::Config { path } => cmd::config::run(&ctx, &cfg, path),
+        Cmd::Gc => cmd::gc::run(&ctx, &cfg),
         Cmd::Submit {
             detach,
             weight,
             front,
             key,
             command,
-        } => cmd::job::submit(
-            &cfg,
-            cmd::exec::Opts {
-                weight,
-                front,
-                key,
-                argv: command,
-            },
-            detach,
-        ),
-        Cmd::Wait { no_output, ids } => cmd::job::wait(&ids, no_output),
-        Cmd::Jobs { json } => cmd::job::list(&cfg, json),
-        Cmd::Cancel { ids } => cmd::job::cancel(&ids),
-        Cmd::RunJob { id } => cmd::job::run_job(&cfg, &id),
+        } => cmd::job::submit(&ctx, &cfg, opts(weight, front, key, command)?, detach),
+        Cmd::Wait { no_output, ids } => cmd::job::wait(&ctx, &ids, no_output),
+        Cmd::Jobs { json } => cmd::job::list(&ctx, &cfg, json),
+        Cmd::Cancel { ids } => cmd::job::cancel(&ctx, &ids),
+        Cmd::RunJob { id } => cmd::job::run_job(&ctx, &cfg, &id),
     }
+}
+
+/// The command to run, from the current directory.
+fn opts(
+    weight: Option<u32>,
+    front: bool,
+    key: Option<String>,
+    argv: Vec<String>,
+) -> error::Result<Opts> {
+    Ok(Opts {
+        weight,
+        front,
+        key,
+        argv,
+        cwd: std::env::current_dir()?,
+    })
 }
