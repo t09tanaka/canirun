@@ -241,13 +241,43 @@ pub fn step(
 /// record does not change.
 pub const HEARTBEAT: Duration = Duration::from_secs(1);
 
-/// Is a write due after `step`? Always when the record changed. A good look
-/// that changed nothing still stamps `recorded_at` (it is a heartbeat: the
-/// tracker was alive then), but at most once per [`HEARTBEAT`]. A failed look
-/// that changed nothing stamps nothing: the tracker was not working.
-/// `since_write` is the time since the last write, `None` before the first.
-pub fn write_due(step: Step, since_write: Option<Duration>) -> bool {
-    step.changed || (!step.failed && since_write.is_none_or(|d| d >= HEARTBEAT))
+/// What one tick hands to the recorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Plan {
+    /// Persist the record now.
+    pub write: bool,
+    /// Stamp `recorded_at` with it: only a look that could be believed
+    /// shows the tracker was working.
+    pub stamp: bool,
+}
+
+/// What to write after `step`. Always when the record changed, and again
+/// every tick while the last attempt to persist it failed (`pending`). A good
+/// look that changed nothing still writes (a heartbeat: the tracker was
+/// alive then), but at most once per [`HEARTBEAT`]. A failed look stamps
+/// nothing, and writes only a change or a retry. `since_write` is the time
+/// since the last write that succeeded, `None` before the first.
+pub fn plan(step: Step, pending: bool, since_write: Option<Duration>) -> Plan {
+    Plan {
+        write: step.changed
+            || pending
+            || (!step.failed && since_write.is_none_or(|d| d >= HEARTBEAT)),
+        stamp: !step.failed,
+    }
+}
+
+/// Is a write still owed after the tick that made `plan` and whether its
+/// write (`persisted`) succeeded? A write that failed is retried by the next
+/// tick, which carries the then-current record and its `truncated` state.
+pub fn still_pending(plan: Plan, persisted: bool) -> bool {
+    plan.write && !persisted
+}
+
+/// Is the command gone? Known when we reaped it (`reaped`: its pid may be
+/// somebody else's by now, so it is not asked about); else only asked
+/// (`ask`) when the table does not list it (`listed`).
+pub fn root_is_gone(reaped: bool, listed: bool, ask: impl FnOnce() -> bool) -> bool {
+    reaped || (!listed && ask())
 }
 
 /// What recording `found` changes.
@@ -304,18 +334,24 @@ pub const RECORD_SLACK_SECS: u64 = 2;
 /// The window (`since`, `until`; seconds since the epoch, both inclusive)
 /// in which a hidden process may be a descendant nobody recorded: from the
 /// child's start (the launch intent when that is unknown, else 0) to the
-/// last tracker record plus [`RECORD_SLACK_SECS`]. Without a record (the
-/// supervisor died before the first) the end is open. Outside it, a hidden
-/// orphan is an unrelated process that merely started meanwhile, such as
-/// one the OS starts for the user all the time.
+/// last tracker record plus [`RECORD_SLACK_SECS`]. That end holds only when
+/// the tracker provably covered the child's whole life (`tracked_to_exit`:
+/// the runner saw it exit and took the last look). Otherwise (no record, or
+/// the supervisor died mid-run and the child may have forked later) the end
+/// is open. Outside the window, a hidden orphan is an unrelated process that
+/// merely started meanwhile, such as one the OS starts for the user all the
+/// time.
 pub fn suspicion_window(
     child_start: Option<u64>,
     intent: Option<u64>,
     recorded: Option<u64>,
+    tracked_to_exit: bool,
 ) -> (u64, Option<u64>) {
     (
         child_start.or(intent).unwrap_or(0),
-        recorded.map(|r| r.saturating_add(RECORD_SLACK_SECS)),
+        recorded
+            .filter(|_| tracked_to_exit)
+            .map(|r| r.saturating_add(RECORD_SLACK_SECS)),
     )
 }
 
@@ -531,17 +567,56 @@ mod tests {
             failed: true,
         };
         let ms = Duration::from_millis;
-        assert!(write_due(quiet, None), "the first look always writes");
-        assert!(!write_due(quiet, Some(ms(0))));
-        assert!(!write_due(quiet, Some(ms(999))));
-        assert!(write_due(quiet, Some(HEARTBEAT)));
-        assert!(write_due(quiet, Some(ms(5000))));
+        let w = |s, pending, since| plan(s, pending, since).write;
+        assert!(w(quiet, false, None), "the first look always writes");
+        assert!(!w(quiet, false, Some(ms(0))));
+        assert!(!w(quiet, false, Some(ms(999))));
+        assert!(w(quiet, false, Some(HEARTBEAT)));
+        assert!(w(quiet, false, Some(ms(5000))));
         // A change is written at once, whatever was written last.
-        assert!(write_due(grew, Some(ms(0))));
-        assert!(write_due(failed_now, Some(ms(0))));
-        // A failure that changed nothing stamps nothing.
-        assert!(!write_due(bad, None));
-        assert!(!write_due(bad, Some(ms(5000))));
+        assert!(w(grew, false, Some(ms(0))));
+        assert!(w(failed_now, false, Some(ms(0))));
+        // A failure that changed nothing writes nothing...
+        assert!(!w(bad, false, None));
+        assert!(!w(bad, false, Some(ms(5000))));
+        // ...unless an earlier write is owed: that is retried every tick.
+        assert!(w(bad, true, Some(ms(0))));
+        assert!(w(quiet, true, Some(ms(0))));
+        // Only a good look stamps.
+        assert!(plan(quiet, false, None).stamp);
+        assert!(plan(grew, false, None).stamp);
+        assert!(!plan(bad, true, None).stamp);
+        assert!(!plan(failed_now, false, None).stamp);
+    }
+
+    #[test]
+    fn a_write_that_failed_is_owed_until_one_succeeds() {
+        let p = |write| Plan { write, stamp: true };
+        assert!(still_pending(p(true), false));
+        assert!(!still_pending(p(true), true));
+        // Nothing was attempted: nothing is owed.
+        assert!(!still_pending(p(false), false));
+        assert!(!still_pending(p(false), true));
+    }
+
+    #[test]
+    fn a_reaped_root_is_gone_without_asking() {
+        let asked = std::cell::Cell::new(0);
+        let gone = |reaped, listed, answer| {
+            root_is_gone(reaped, listed, || {
+                asked.set(asked.get() + 1);
+                answer
+            })
+        };
+        assert!(gone(true, false, false));
+        assert!(gone(true, true, false));
+        assert_eq!(asked.get(), 0, "a reaped pid may be someone else's");
+        // Not reaped: listed means running, whatever the kernel would say.
+        assert!(!gone(false, true, true));
+        assert_eq!(asked.get(), 0);
+        assert!(gone(false, false, true));
+        assert!(!gone(false, false, false));
+        assert_eq!(asked.get(), 2);
     }
 
     #[test]
@@ -788,18 +863,19 @@ mod tests {
     }
 
     #[test]
-    fn the_window_starts_at_the_child_or_else_the_intent_and_is_open_without_a_record() {
-        assert_eq!(
-            suspicion_window(Some(50), Some(40), Some(100)),
-            (50, Some(102))
-        );
-        assert_eq!(suspicion_window(None, Some(40), Some(100)), (40, Some(102)));
-        assert_eq!(suspicion_window(None, None, Some(100)), (0, Some(102)));
-        assert_eq!(suspicion_window(Some(50), None, None), (50, None));
-        assert_eq!(
-            suspicion_window(None, None, Some(u64::MAX)),
-            (0, Some(u64::MAX))
-        );
+    fn the_window_starts_at_the_child_or_else_the_intent_and_ends_only_when_tracked_to_exit() {
+        let w = suspicion_window;
+        assert_eq!(w(Some(50), Some(40), Some(100), true), (50, Some(102)));
+        assert_eq!(w(None, Some(40), Some(100), true), (40, Some(102)));
+        assert_eq!(w(None, None, Some(100), true), (0, Some(102)));
+        // No record: open.
+        assert_eq!(w(Some(50), None, None, true), (50, None));
+        // Not tracked to the exit (the supervisor died mid-run): open, from
+        // the lower bound on, whatever was recorded.
+        assert_eq!(w(Some(50), Some(40), Some(100), false), (50, None));
+        assert_eq!(w(None, Some(40), Some(100), false), (40, None));
+        assert_eq!(w(None, None, None, false), (0, None));
+        assert_eq!(w(None, None, Some(u64::MAX), true), (0, Some(u64::MAX)));
         assert_eq!(RECORD_SLACK_SECS, 2);
     }
 

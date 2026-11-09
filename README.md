@@ -353,8 +353,11 @@ What is not found, and what follows:
   answers "could not be checked" (`ProbeUnknown`) and the entry stays held.
   Only a hidden process that started in a window counts: from the child's
   start (the launch intent when that is unknown) to two seconds after the
-  last time the recorder wrote (`recorded_at` in the sidecar); with no
-  record at all the window has no end. Such a hold is expected, not a bug,
+  last time the recorder wrote (`recorded_at` in the sidecar). That end
+  applies only when the supervisor saw the command exit and took the last
+  look (`tracked_to_exit` in the sidecar); with no record, or when the
+  supervisor died mid-run (the command may have forked later), the window
+  has no end. Such a hold is expected, not a bug,
   and the way out is `canirun resolve <id> --force`, after checking that
   nothing of the command still runs.
 - Recording the descendants that fails is written to the sidecar too
@@ -371,8 +374,14 @@ What is not found, and what follows:
   A look at the process table that fails, comes back empty, or does not list
   a command that still runs is a recorder failure too: it is written to the
   sidecar at once, during the run, so a supervisor that dies mid-run leaves
-  a hold, not a release. `recorded_at` is a heartbeat: every good look
-  stamps it (written about once a second), and the spawn writes the first.
+  a hold, not a release. A write that fails is retried every tick until one
+  succeeds. `recorded_at` is a heartbeat: every good look stamps it (written
+  about once a second; a failed look never stamps it), and the spawn writes
+  the first.
+- A single failed look is sticky on purpose: even a transient read failure
+  of the process table marks the record truncated, and the run is held until
+  `canirun resolve <id> --force`. The last look is told the command was
+  reaped, so it does not ask the kernel about a pid that may be reused.
 - **More than 4096 live descendants.** Only 4096 are recorded; past that the
   rest are unknown, so the record is marked truncated and the entry stays
   held after the command ends, by design. The way out is

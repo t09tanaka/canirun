@@ -50,6 +50,11 @@ pub struct Outcome {
     /// whether anything is left cannot be ruled out. [`crate::managed::finish`]
     /// then keeps the entry. Always false for a plain run.
     pub tracker_unknown: bool,
+    /// When the last look at the process table was taken, if the tracker
+    /// provably covered the command's whole life (see
+    /// [`crate::tracker::Finished::covered`]): the command had been reaped,
+    /// and nothing it started can have been missed after that time.
+    pub tracked_to_exit_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Run `argv` with inherited stdio in our process group, in `cwd`, with
@@ -287,17 +292,25 @@ pub fn run_with(
     // that left it, is confirmed stopped.
     // No tracker for a managed command is not "nothing recorded": a clear
     // scan cannot be believed.
-    let tracked = match tracker {
-        Some(t) => t.finish(),
-        None if spawn.own_process_group && spawn.marker_id.is_some() => Tracked::unknown(),
-        None => Tracked::default(),
+    // The command was reaped by `wait4`, so the final look is told it is
+    // gone rather than asking the kernel about a pid that may be reused.
+    let (tracked, covered) = match tracker {
+        Some(t) => {
+            let f = t.finish(true);
+            (f.tracked, f.covered)
+        }
+        None if spawn.own_process_group && spawn.marker_id.is_some() => (Tracked::unknown(), false),
+        None => (Tracked::default(), false),
     };
+    let tracked_to_exit_at = covered.then(|| ctx.clock.now());
     // A recorder that failed left nothing in the sidecar to say so: write
     // the unknown there too, or the reaper would read an empty record as
     // "nothing was running".
     if tracked.truncated {
         if let Some(record) = &spawn.on_descendants {
-            record(&tracked);
+            // Not stamped: nothing was seen. If this write fails too the
+            // supervisor still holds the entry (`tracker_unknown`).
+            let _ = record(&tracked, false);
         }
     }
     let tracker_unknown = tracked.truncated;
@@ -325,6 +338,7 @@ pub fn run_with(
         max_rss_bytes,
         descendants_left,
         tracker_unknown,
+        tracked_to_exit_at,
     })
 }
 

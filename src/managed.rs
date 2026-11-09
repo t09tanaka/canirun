@@ -143,6 +143,14 @@ pub struct Sidecar {
     /// descendant the tracker missed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_at: Option<DateTime<Utc>>,
+    /// The tracker provably covered the child's whole life: the supervisor
+    /// saw it exit, took the last look and persisted it, and `recorded_at`
+    /// is that look. Only then does the hidden-orphan window end at
+    /// `recorded_at`; without it (the supervisor died mid-run) a hidden
+    /// process that started at any time after the child may be its
+    /// descendant, so the entry stays held until `resolve --force`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tracked_to_exit: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -275,14 +283,15 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
             sc.child.clone(),
         ),
     };
-    let (tracked, intent, supervisor, recorded) = match &sidecar {
+    let (tracked, intent, supervisor, recorded, to_exit) = match &sidecar {
         Loaded::Ok(sc) => (
             sc.tracked(),
             sc.launch_intent_at,
             sc.owner_pid,
             sc.recorded_at,
+            sc.tracked_to_exit,
         ),
-        _ => (Tracked::default(), None, 0, None),
+        _ => (Tracked::default(), None, 0, None, false),
     };
     let secs = |t: DateTime<Utc>| t.timestamp().max(0) as u64;
     let (mut child_probe, mut group_probe, mut marker) =
@@ -313,6 +322,7 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                             child.as_ref().and_then(|c| c.start_time),
                             intent.map(secs),
                             recorded.map(secs),
+                            to_exit,
                         );
                         if lineage::suspicious_hidden(&scan.hidden, since, until, supervisor) {
                             marker = Probe::Unknown;
@@ -330,7 +340,7 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 // OS hides. One that began after the intent and is an
                 // orphan (or the dead supervisor's child) may be it.
                 let (since, until) =
-                    lineage::suspicion_window(None, intent.map(secs), recorded.map(secs));
+                    lineage::suspicion_window(None, intent.map(secs), recorded.map(secs), to_exit);
                 marker = if scan.probe == Probe::Gone
                     && lineage::suspicious_hidden(&scan.hidden, since, until, supervisor)
                 {
@@ -596,6 +606,7 @@ pub(crate) fn push_entry(
                     descendants: Vec::new(),
                     descendants_truncated: false,
                     recorded_at: None,
+                    tracked_to_exit: false,
                 },
             )?;
         }
@@ -849,17 +860,22 @@ pub fn run_command_with_tracker(
     };
     let record: crate::tracker::Record = {
         let (ctx, id) = (ctx.clone(), id.to_string());
-        std::sync::Arc::new(move |t: &Tracked| {
-            // Best effort: a missed write only means a later one carries
-            // the whole set.
-            if let Loaded::Ok(mut sc) = load_sidecar(&ctx, &id) {
-                if sc.phase != Phase::Terminal {
+        std::sync::Arc::new(move |t: &Tracked, stamp: bool| {
+            // Whether it was persisted: the tracker retries every tick
+            // until a write carrying its current state succeeds.
+            match load_sidecar(&ctx, &id) {
+                Loaded::Ok(mut sc) if sc.phase != Phase::Terminal => {
                     let kept = lineage::persisted(&sc.descendants, sc.descendants_truncated, t);
                     sc.descendants = kept.descendants;
                     sc.descendants_truncated = kept.truncated;
-                    sc.recorded_at = Some(ctx.clock.now());
-                    let _ = write_sidecar(&ctx, &sc);
+                    if stamp {
+                        sc.recorded_at = Some(ctx.clock.now());
+                    }
+                    write_sidecar(&ctx, &sc).is_ok()
                 }
+                // Nothing left to record into.
+                Loaded::Ok(_) => true,
+                _ => false,
             }
         })
     };
@@ -877,6 +893,18 @@ pub fn run_command_with_tracker(
             start_tracker,
         },
     )?;
+    if let Some(at) = outcome.tracked_to_exit_at {
+        // The tracker covered the child's whole life and the last look was
+        // at `at`: close the hidden-orphan window there. Best effort: if
+        // this fails the window stays open, which only holds the entry.
+        if let Loaded::Ok(mut sc) = load_sidecar(ctx, id) {
+            if sc.phase != Phase::Terminal {
+                sc.tracked_to_exit = true;
+                sc.recorded_at = Some(at);
+                let _ = write_sidecar(ctx, &sc);
+            }
+        }
+    }
     if outcome.tracker_unknown {
         guard
             .tracker_unknown
@@ -994,6 +1022,7 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
                     descendants: Vec::new(),
                     descendants_truncated: false,
                     recorded_at: None,
+                    tracked_to_exit: false,
                 },
             )?;
         }

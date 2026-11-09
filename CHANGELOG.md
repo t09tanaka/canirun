@@ -9,11 +9,25 @@ the minor version).
 
 ### Changed
 
+- `runner::Outcome` gained `tracked_to_exit_at`, and `tracker::Record` now
+  takes a stamp flag and returns whether it persisted; `Tracker::finish`
+  takes whether the command was reaped. Pre-1.0: breaking.
 - `runner::Spawn` gained a field, `start_tracker`, so a struct literal built
   outside the crate no longer compiles. Pre-1.0: this is a breaking change.
 
 ### Fixed
 
+- A failed write of the descendant record is retried every tick until one
+  succeeds (it used to be dropped, and the heartbeat clock advanced anyway).
+- The hidden-orphan window ends at `recorded_at` + 2 s only when the
+  supervisor saw the command exit and took the last look (new sidecar field
+  `tracked_to_exit`). If the supervisor died mid-run the window is open
+  from the child's start, so a hidden process forked late holds the entry
+  (`canirun resolve <id> --force` is the way out).
+- The last look is told the command was reaped (`wait4`) instead of asking
+  the kernel about its pid, which may have been reused and made a normal run
+  look failed. A single failed look stays sticky (fail closed).
+- A failed look no longer stamps `recorded_at`.
 - `recorded_at` is a heartbeat, not the time of the last growth: every good
   look stamps it (written at most about once a second), and the spawn writes
   the first one, so every managed run has an upper bound on the
