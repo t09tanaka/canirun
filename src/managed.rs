@@ -56,7 +56,9 @@ use crate::eta;
 use crate::exec::{self, Opts, Plan};
 use crate::history::{self, Record};
 use crate::ledger::{Entry, Ledger};
+use crate::lineage::{self, Tracked};
 use crate::lock::{self, Lock};
+use crate::marker::ProcRef;
 use crate::process::{self, ChildIdentity};
 use crate::reap::{self, Probe, SidecarFacts, Verdict};
 use crate::receipt::{self, Phase};
@@ -128,6 +130,28 @@ pub struct Sidecar {
     pub child: Option<ChildIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalRecord>,
+    /// Descendants of the child seen while it ran (pid and start time), at
+    /// most [`lineage::MAX_DESCENDANTS`]. Optional: older sidecars have
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descendants: Vec<ProcRef>,
+    /// More were seen than fit: the rest are not recorded.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub descendants_truncated: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl Sidecar {
+    /// The recorded descendants, for the process scan.
+    pub fn tracked(&self) -> Tracked {
+        Tracked {
+            descendants: self.descendants.clone(),
+            truncated: self.descendants_truncated,
+        }
+    }
 }
 
 /// What reading a sidecar found.
@@ -246,6 +270,10 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
             sc.child.clone(),
         ),
     };
+    let (tracked, intent, supervisor) = match &sidecar {
+        Loaded::Ok(sc) => (sc.tracked(), sc.launch_intent_at, sc.owner_pid),
+        _ => (Tracked::default(), None, 0),
+    };
     let (mut child_probe, mut group_probe, mut marker) =
         (Probe::Unknown, Probe::Unknown, Probe::Unknown);
     if !lease_held {
@@ -260,7 +288,7 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 }
                 // A live child or group already keeps the entry.
                 if child_probe != Probe::Alive && group_probe != Probe::Alive {
-                    marker = runner::settled_scan(ctx, id).probe;
+                    marker = runner::settled_scan(ctx, id, &tracked).probe;
                 }
             }
             SidecarFacts::Managed {
@@ -268,9 +296,22 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 launch_age_secs,
                 ..
             } if manual || reap::grace_passed(*launch_age_secs) => {
-                marker = runner::settled_scan(ctx, id).probe;
+                let scan = runner::settled_scan(ctx, id, &tracked);
+                // A clear scan does not show a child whose environment the
+                // OS hides. One that began after the intent and is an
+                // orphan (or the dead supervisor's child) may be it.
+                let since = intent.map_or(0, |t| t.timestamp().max(0) as u64);
+                marker = if scan.probe == Probe::Gone
+                    && lineage::suspicious_hidden(&scan.hidden, since, supervisor)
+                {
+                    Probe::Unknown
+                } else {
+                    scan.probe
+                };
             }
-            SidecarFacts::Corrupt if manual => marker = runner::settled_scan(ctx, id).probe,
+            SidecarFacts::Corrupt if manual => {
+                marker = runner::settled_scan(ctx, id, &Tracked::default()).probe
+            }
             _ => {}
         }
     }
@@ -518,6 +559,8 @@ pub(crate) fn push_entry(
                     launch_intent_at: None,
                     child: None,
                     terminal: None,
+                    descendants: Vec::new(),
+                    descendants_truncated: false,
                 },
             )?;
         }
@@ -750,6 +793,20 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
         // the reaper keeps (quarantine) rather than frees.
         let _ = advance_sidecar(ctx, id, Phase::ChildStarted, |s| s.child = Some(identity));
     };
+    let record: crate::tracker::Record = {
+        let (ctx, id) = (ctx.clone(), id.to_string());
+        std::sync::Arc::new(move |t: &Tracked| {
+            // Best effort: a missed write only means a later one carries
+            // the whole set.
+            if let Loaded::Ok(mut sc) = load_sidecar(&ctx, &id) {
+                if sc.phase != Phase::Terminal {
+                    sc.descendants = t.descendants.clone();
+                    sc.descendants_truncated = t.truncated;
+                    let _ = write_sidecar(&ctx, &sc);
+                }
+            }
+        })
+    };
     let outcome = runner::run_with(
         ctx,
         &opts.argv,
@@ -760,6 +817,7 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
             own_process_group: guard.managed,
             marker_id: guard.managed.then_some(id),
             on_spawn: guard.managed.then_some(&on_spawn),
+            on_descendants: guard.managed.then_some(record),
         },
     )?;
     Ok(Ran {
@@ -792,7 +850,7 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
                     }
                 }
                 // Before the launch intent nothing can have been started.
-                if sc.phase != Phase::Registered && !runner::stop_marked(ctx, &id) {
+                if sc.phase != Phase::Registered && !runner::stop_marked(ctx, &id, &sc.tracked()) {
                     return Err(Error::Ledger(format!(
                         "{id}: a process carrying {} still runs or could not be checked; \
                          the entry keeps its budget (see `canirun resolve {id}`)",
@@ -862,6 +920,8 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
                     launch_intent_at: None,
                     child: None,
                     terminal: Some(terminal),
+                    descendants: Vec::new(),
+                    descendants_truncated: false,
                 },
             )?;
         }
@@ -885,6 +945,9 @@ pub struct Resolution {
     /// checked or changed).
     pub found: bool,
     pub released: bool,
+    /// Released by `--force` although a process could not be checked.
+    #[serde(default)]
+    pub forced: bool,
     /// The decision, as the reaper names it.
     pub verdict: String,
     /// What was checked and what it showed.
@@ -901,7 +964,8 @@ fn describe(v: Verdict) -> &'static str {
             "the child, its process group or a process carrying the id is still running"
         }
         Verdict::Keep(Keep::ProbeUnknown) => {
-            "a process could not be checked (the scan could not read every process of this user)"
+            "a process could not be checked (a scan could not read every process of this user, \
+             the descendants recorded were more than fit, or a hidden process may be the child)"
         }
         Verdict::Release(Release::Plain) => "a plain entry whose owner is gone",
         Verdict::Release(Release::Terminal) => "the outcome was already recorded",
@@ -926,6 +990,16 @@ fn describe(v: Verdict) -> &'static str {
 /// read every process all keep the entry. When released, the outcome is
 /// recorded as `Interrupted` with the reason.
 pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
+    resolve_checked_with(ctx, id, false)
+}
+
+/// [`resolve_checked`]; with `force`, an entry kept only because a process
+/// *could not be checked* (an unreadable process, descendants that did not
+/// fit the record, a hidden process that may be the child) is released
+/// anyway, recorded as `Interrupted` with `forced: <reason>`. Nothing known
+/// to be running is ever forced: a held lease, a running child, group,
+/// marked process or recorded descendant keeps the entry.
+pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Resolution> {
     check_id("command_id", id)?;
     let _guard = lock::ledger(ctx)?;
     let ledger = Ledger::load(&ctx.paths.ledger_file())?;
@@ -936,6 +1010,7 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
             lease_held: false,
             found: false,
             released: false,
+            forced: false,
             verdict: "NoEntry".into(),
             checked: "there is no ledger entry with this id".into(),
         });
@@ -951,10 +1026,25 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
         lease_held: a.verdict == Verdict::Keep(reap::Keep::LeaseHeld),
         found: true,
         released: false,
+        forced: false,
         verdict: format!("{:?}", a.verdict),
         checked: describe(a.verdict).to_string(),
     };
+    if force && a.verdict == Verdict::Keep(reap::Keep::ProbeUnknown) {
+        let detail = format!("forced: {}", describe(a.verdict));
+        settle_by_hand(ctx, id, TerminalKind::Interrupted, &detail)?;
+        r.released = true;
+        r.forced = true;
+        r.checked = detail;
+        return Ok(r);
+    }
     let Verdict::Release(why) = a.verdict else {
+        if force {
+            r.checked = format!(
+                "{} (--force releases only what could not be checked, not this)",
+                r.checked
+            );
+        }
         return Ok(r);
     };
     let kind = match why {

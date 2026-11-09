@@ -10,6 +10,7 @@
 //! hook of [`crate::exec::run_gated`] and kills by pid instead.)
 
 use crate::error::{Error, Result};
+use crate::lineage::Tracked;
 use crate::marker;
 use crate::reap::Probe;
 use crate::Context;
@@ -74,6 +75,11 @@ pub struct Spawn<'a> {
     pub marker_id: Option<&'a str>,
     /// Called with the child's pid right after the spawn.
     pub on_spawn: Option<&'a dyn Fn(u32)>,
+    /// With `own_process_group` and `marker_id`: the descendants of the
+    /// child are recorded while it runs (see [`crate::tracker`]) and handed
+    /// to this each time the set grows. Those still running are stopped
+    /// together with the marked ones.
+    pub on_descendants: Option<crate::tracker::Record>,
 }
 
 /// Grace between SIGTERM and SIGKILL for descendants that outlive a
@@ -122,15 +128,16 @@ fn clear_group(ctx: &Context, pgid: libc::pid_t) -> bool {
     false
 }
 
-/// Scan for the processes of managed command `id` until the answer can be
+/// Scan for the processes of managed command `id` (marked, or recorded in
+/// `tracked`) until the answer can be
 /// believed. A process that exits while the scan reads it can make one scan
 /// `Unknown` (only an answer that stays unknown through
 /// [`UNKNOWN_RETRIES`] rescans counts) or miss a process that was just
 /// forked (so `Gone` must come twice in a row). `Alive` is believed at once.
-pub(crate) fn settled_scan(ctx: &Context, id: &str) -> crate::marker::Scan {
+pub(crate) fn settled_scan(ctx: &Context, id: &str, tracked: &Tracked) -> crate::marker::Scan {
     let (mut gone, mut unknown) = (0, 0);
     loop {
-        let scan = ctx.scan_marked(id);
+        let scan = ctx.scan_tracked(id, tracked);
         match scan.probe {
             Probe::Alive => return scan,
             Probe::Gone => {
@@ -155,8 +162,8 @@ pub(crate) fn settled_scan(ctx: &Context, id: &str) -> crate::marker::Scan {
 /// state directory's scope): SIGTERM, a grace, then SIGKILL, signalling
 /// only a pid that is still the process that was seen. True only when
 /// scans then find none, twice in a row, and every process could be read.
-pub(crate) fn stop_marked(ctx: &Context, id: &str) -> bool {
-    let mut scan = settled_scan(ctx, id);
+pub(crate) fn stop_marked(ctx: &Context, id: &str, tracked: &Tracked) -> bool {
+    let mut scan = settled_scan(ctx, id, tracked);
     if scan.probe != Probe::Alive {
         return scan.probe == Probe::Gone;
     }
@@ -170,7 +177,7 @@ pub(crate) fn stop_marked(ctx: &Context, id: &str) -> bool {
         let until = ctx.clock.monotonic() + wait;
         loop {
             ctx.clock.sleep(MARKER_POLL);
-            scan = settled_scan(ctx, id);
+            scan = settled_scan(ctx, id, tracked);
             if scan.probe != Probe::Alive {
                 return scan.probe == Probe::Gone;
             }
@@ -212,6 +219,18 @@ pub fn run_with(
     if let Some(f) = spawn.on_spawn {
         f(child.id());
     }
+    // Records what the child starts, to find it again if it leaves the
+    // group. Stopped and joined once the child has been reaped.
+    let tracker = match (
+        &spawn.on_descendants,
+        spawn.own_process_group,
+        spawn.marker_id,
+    ) {
+        (Some(record), true, Some(_)) => {
+            Some(crate::tracker::Tracker::start(child.id(), record.clone()))
+        }
+        _ => None,
+    };
     // Dropped (stopped and joined) once the child has been reaped.
     let _monitor =
         measure.then(|| crate::usage::Monitor::start(ctx.clone(), lease.to_string(), child.id()));
@@ -253,9 +272,12 @@ pub fn run_with(
     // The leader is gone, but a managed command's descendants may not be:
     // the budget is only free once the whole group, and anything marked
     // that left it, is confirmed stopped.
+    let tracked = tracker.map(|t| t.finish()).unwrap_or_default();
     let descendants_left = spawn.own_process_group && {
         let group = clear_group(ctx, pid);
-        let marked = spawn.marker_id.is_none_or(|id| stop_marked(ctx, id));
+        let marked = spawn
+            .marker_id
+            .is_none_or(|id| stop_marked(ctx, id, &tracked));
         !(group && marked)
     };
 
@@ -339,7 +361,7 @@ mod tests {
             } else {
                 Vec::new()
             };
-            Scan { probe, alive }
+            Scan::new(probe, alive)
         }
     }
 
@@ -364,40 +386,51 @@ mod tests {
 
     #[test]
     fn gone_is_believed_only_when_it_comes_twice_in_a_row() {
-        let (s, n) = scripted(&[Gone, Gone], |c| settled_scan(c, "i"));
+        let (s, n) = scripted(&[Gone, Gone], |c| settled_scan(c, "i", &Tracked::default()));
         assert_eq!((s.probe, n), (Gone, 2));
-        let (s, n) = scripted(&[Gone, Alive], |c| settled_scan(c, "i"));
+        let (s, n) = scripted(&[Gone, Alive], |c| {
+            settled_scan(c, "i", &Tracked::default())
+        });
         assert_eq!((s.probe, n), (Alive, 2));
         // An unknown between two clear scans starts the count again.
-        let (s, n) = scripted(&[Gone, Unknown, Gone, Gone], |c| settled_scan(c, "i"));
+        let (s, n) = scripted(&[Gone, Unknown, Gone, Gone], |c| {
+            settled_scan(c, "i", &Tracked::default())
+        });
         assert_eq!((s.probe, n), (Gone, 4));
-        let (s, n) = scripted(&[Alive], |c| settled_scan(c, "i"));
+        let (s, n) = scripted(&[Alive], |c| settled_scan(c, "i", &Tracked::default()));
         assert_eq!((s.probe, n), (Alive, 1));
     }
 
     #[test]
     fn unknown_is_rescanned_a_few_times_before_it_is_believed() {
-        let (s, n) = scripted(&[Unknown], |c| settled_scan(c, "i"));
+        let (s, n) = scripted(&[Unknown], |c| settled_scan(c, "i", &Tracked::default()));
         assert_eq!((s.probe, n), (Unknown, UNKNOWN_RETRIES + 1));
         let (s, n) = scripted(&[Unknown, Unknown, Unknown, Gone, Gone], |c| {
-            settled_scan(c, "i")
+            settled_scan(c, "i", &Tracked::default())
         });
         assert_eq!((s.probe, n), (Gone, 5));
     }
 
     #[test]
     fn stop_marked_confirms_gone_twice_and_retries_unknown_after_signalling() {
-        assert!(!scripted(&[Unknown], |c| stop_marked(c, "i")).0);
-        assert!(scripted(&[Gone, Gone], |c| stop_marked(c, "i")).0);
-        assert!(!scripted(&[Gone, Alive, Alive], |c| stop_marked(c, "i")).0);
+        assert!(!scripted(&[Unknown], |c| stop_marked(c, "i", &Tracked::default())).0);
+        assert!(scripted(&[Gone, Gone], |c| stop_marked(c, "i", &Tracked::default())).0);
+        assert!(
+            !scripted(&[Gone, Alive, Alive], |c| stop_marked(
+                c,
+                "i",
+                &Tracked::default()
+            ))
+            .0
+        );
         // After the signals an unknown is rescanned like the first one, and
         // a single clear scan is not enough.
         let after = [Alive, Unknown, Unknown, Unknown, Gone, Gone];
-        assert!(scripted(&after, |c| stop_marked(c, "i")).0);
+        assert!(scripted(&after, |c| stop_marked(c, "i", &Tracked::default())).0);
         let one_clear = [Alive, Gone, Alive];
-        assert!(!scripted(&one_clear, |c| stop_marked(c, "i")).0);
+        assert!(!scripted(&one_clear, |c| stop_marked(c, "i", &Tracked::default())).0);
         let stays_unknown = [Alive, Unknown];
-        assert!(!scripted(&stays_unknown, |c| stop_marked(c, "i")).0);
+        assert!(!scripted(&stays_unknown, |c| stop_marked(c, "i", &Tracked::default())).0);
     }
 
     fn argv(a: &[&str]) -> Vec<String> {

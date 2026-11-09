@@ -2,6 +2,7 @@
 //! recorded child. A pid alone is not an identity (pids are reused), so a
 //! child is recognised by pid plus start time.
 
+use crate::lineage::{self, Row};
 use crate::marker::{self, Marker, ProcRef, Scan, Seen};
 use crate::reap::Probe;
 use serde::{Deserialize, Serialize};
@@ -98,9 +99,95 @@ pub fn scan_system(id: &str, scope: &str) -> Scan {
     marker::classify(&observe_all(), id, scope, std::process::id())
 }
 
+/// The process table: pid, start time and parent of every live,
+/// non-zombie process. Reuse the reader to keep the allocations.
+pub struct TableReader {
+    sys: System,
+}
+
+impl Default for TableReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TableReader {
+    pub fn new() -> Self {
+        TableReader { sys: System::new() }
+    }
+
+    pub fn read(&mut self) -> Vec<Row> {
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        rows(&self.sys)
+    }
+}
+
+fn rows(sys: &System) -> Vec<Row> {
+    sys.processes()
+        .iter()
+        .filter(|(_, p)| !matches!(p.status(), ProcessStatus::Zombie) && !is_thread(p))
+        .map(|(pid, p)| Row {
+            proc: ProcRef {
+                pid: pid.as_u32(),
+                start_time: Some(p.start_time()),
+            },
+            parent: p.parent().map(|x| x.as_u32()),
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn is_thread(p: &sysinfo::Process) -> bool {
+    p.thread_kind().is_some()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_thread(_: &sysinfo::Process) -> bool {
+    false
+}
+
+/// Which of `recorded` are still running (same pid and start time).
+pub fn alive_among(recorded: &[ProcRef]) -> Vec<ProcRef> {
+    let pids: Vec<Pid> = recorded.iter().map(|p| Pid::from_u32(p.pid)).collect();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    lineage::alive_in(&rows(&sys), recorded)
+}
+
+/// The owner of `pid`, from the kernel (macOS: `proc_pidinfo`).
+#[cfg(target_os = "macos")]
+fn kernel_uid(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info.pbi_uid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_uid(_pid: u32) -> Option<u32> {
+    None
+}
+
 /// The environment marker of every live, non-zombie process of this user.
-/// A process that exits while being looked at is left out; one that cannot
-/// be read is reported as such.
+/// A process of another user is left out (it cannot be ours); one that
+/// exits while being looked at is left out too; one of ours whose
+/// environment is withheld is reported as hidden.
 fn observe_all() -> Vec<Seen> {
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -111,26 +198,18 @@ fn observe_all() -> Vec<Seen> {
     let me = unsafe { libc::getuid() };
     let mut out = Vec::new();
     for (pid, p) in sys.processes() {
-        #[cfg(target_os = "linux")]
-        if p.thread_kind().is_some() {
-            continue;
-        }
-        if matches!(p.status(), ProcessStatus::Zombie) {
+        if is_thread(p) || matches!(p.status(), ProcessStatus::Zombie) {
             continue;
         }
         let pid = pid.as_u32();
-        // A process whose owner could not be read is not skipped: it is
-        // read, and what the kernel refuses of a process that is not
-        // certainly ours reads as unmarked (on macOS this is every process
-        // of another user, `launchd` included: sysinfo reports no owner for
-        // them and `KERN_PROCARGS2` fails with `EINVAL`). A process known to
-        // be ours that cannot be read is unreadable.
-        let ours = match p.user_id() {
-            Some(u) if **u != me => continue,
-            Some(_) => true,
-            None => false,
-        };
-        let Some(marker) = read_marker(pid, ours) else {
+        // The kernel's answer first (sysinfo reports no owner for another
+        // user's process on macOS, which would make it look like ours).
+        // A process whose owner is not known is read anyway.
+        match kernel_uid(pid).or_else(|| p.user_id().map(|u| **u)) {
+            Some(u) if u != me => continue,
+            _ => {}
+        }
+        let Some(marker) = read_marker(pid) else {
             continue;
         };
         out.push(Seen {
@@ -138,6 +217,7 @@ fn observe_all() -> Vec<Seen> {
                 pid,
                 start_time: Some(p.start_time()),
             },
+            parent: p.parent().map(|x| x.as_u32()),
             marker,
         });
     }
@@ -152,10 +232,9 @@ fn vanished(pid: u32) -> bool {
         || start_time(pid).is_none()
 }
 
-/// `None` when the process is gone. `ours`: the process is known to belong
-/// to this user.
+/// `None` when the process is gone.
 #[cfg(target_os = "linux")]
-fn read_marker(pid: u32, _ours: bool) -> Option<Marker> {
+fn read_marker(pid: u32) -> Option<Marker> {
     match std::fs::read(format!("/proc/{pid}/environ")) {
         Ok(bytes) => Some(marker::find_marker(&bytes)),
         Err(_) if vanished(pid) => None,
@@ -168,10 +247,11 @@ fn read_marker(pid: u32, _ours: bool) -> Option<Marker> {
     }
 }
 
-/// `None` when the process is gone. `ours`: the process is known to belong
-/// to this user.
+/// `None` when the process is gone. A process of ours whose environment the
+/// kernel will not give (an Apple platform binary, a hardened-runtime app)
+/// is [`Marker::Hidden`], as is one whose environment is empty.
 #[cfg(target_os = "macos")]
-fn read_marker(pid: u32, ours: bool) -> Option<Marker> {
+fn read_marker(pid: u32) -> Option<Marker> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut len: libc::size_t = 0;
     let sized = unsafe {
@@ -201,27 +281,19 @@ fn read_marker(pid: u32, ours: bool) -> Option<Marker> {
         -1
     };
     if rc != 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error();
-        // Another user's process is refused with `EINVAL`.
-        let denied = errno == Some(libc::EPERM) || (!ours && errno == Some(libc::EINVAL));
         return if vanished(pid) {
             None
-        } else if denied {
-            Some(Marker::Absent)
         } else {
-            Some(Marker::Unreadable)
+            Some(Marker::Hidden)
         };
     }
     buf.truncate(len);
-    // Apple's own binaries (`sh`, `sleep`, ...) hide their environment from
-    // other processes: their block ends after the arguments, which reads as
-    // no marker.
     Some(marker::parse_procargs(&buf))
 }
 
 /// No reader for this OS: nothing can be ruled out.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_marker(pid: u32, _ours: bool) -> Option<Marker> {
+fn read_marker(pid: u32) -> Option<Marker> {
     (!vanished(pid)).then_some(Marker::Unreadable)
 }
 

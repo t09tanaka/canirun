@@ -42,6 +42,7 @@ pub mod inspect;
 pub mod jobs;
 pub mod key;
 pub mod ledger;
+pub mod lineage;
 pub mod live;
 pub mod lock;
 pub mod managed;
@@ -51,6 +52,7 @@ pub mod process;
 pub mod reap;
 pub mod receipt;
 pub mod runner;
+pub mod tracker;
 pub mod usage;
 pub mod weight;
 

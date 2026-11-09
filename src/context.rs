@@ -142,6 +142,10 @@ impl BootIdProvider for FixedBoot {
 /// scope in its environment?" comes from (see [`crate::marker`]).
 pub trait ProcessScan: Send + Sync {
     fn scan(&self, id: &str, scope: &str) -> crate::marker::Scan;
+    /// Which of the recorded descendants are still running.
+    fn alive_recorded(&self, recorded: &[crate::marker::ProcRef]) -> Vec<crate::marker::ProcRef> {
+        crate::process::alive_among(recorded)
+    }
 }
 
 /// This machine's processes of the current user.
@@ -160,10 +164,7 @@ pub struct FixedScan(pub crate::marker::Scan);
 
 impl FixedScan {
     pub fn probe(probe: crate::reap::Probe) -> Self {
-        FixedScan(crate::marker::Scan {
-            probe,
-            alive: Vec::new(),
-        })
+        FixedScan(crate::marker::Scan::new(probe, Vec::new()))
     }
 }
 
@@ -228,6 +229,19 @@ impl Context {
     pub fn scan_marked(&self, id: &str) -> crate::marker::Scan {
         self.scan
             .scan(id, &crate::marker::scope(self.paths.state_dir()))
+    }
+
+    /// [`Context::scan_marked`] plus the recorded descendants of the
+    /// command: any of them running makes it `Alive`, and dropped ones make
+    /// a clear scan `Unknown`.
+    pub fn scan_tracked(&self, id: &str, tracked: &crate::lineage::Tracked) -> crate::marker::Scan {
+        let scan = self.scan_marked(id);
+        let alive = if tracked.descendants.is_empty() {
+            Vec::new()
+        } else {
+            self.scan.alive_recorded(&tracked.descendants)
+        };
+        crate::lineage::with_recorded(scan, alive, tracked.truncated)
     }
 
     /// Real clocks, real machine metrics, no signal handling.

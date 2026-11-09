@@ -8,6 +8,7 @@ use canirun::exec::{self, Gated, Hooks, Opts};
 use canirun::history::{self, Record};
 use canirun::ledger::Ledger;
 use canirun::managed::{self, CommandSpec, Loaded, Measured, Registration, TerminalKind, TryAdmit};
+use canirun::marker::{HiddenProc, ProcRef, Scan};
 use canirun::reap::Probe;
 use canirun::receipt::Phase;
 use canirun::{lock, Context, FakeClock, FixedBoot, FixedLive, FixedScan, Paths, Supervisor};
@@ -651,6 +652,12 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     let (_, g) =
         registered(managed::register(&lib, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
     orphan(&lib, "c", Phase::LaunchIntent, None);
+    // The real scan of this machine sees hidden processes that are
+    // orphans; an intent in the future keeps those out of the picture so
+    // the outcome does not depend on what else is running.
+    let mut sc = sidecar(&lib, "c");
+    sc.launch_intent_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    managed::write_sidecar(&lib, &sc).unwrap();
     drop(g);
     let run = |args: &[&str]| {
         let o = Command::new(env!("CARGO_BIN_EXE_canirun"))
@@ -1199,4 +1206,264 @@ fn gc_keeps_only_the_newest_applied_markers() {
     assert_eq!(managed::gc_measurements(&ctx, 0).unwrap(), 3);
     let none = ctx_with_boot(tempfile::tempdir().unwrap().path(), None);
     assert_eq!(managed::gc_measurements(&none, 3).unwrap(), 0);
+}
+
+// ---- descendants recorded while the command runs, and `resolve --force` ----
+
+/// Runs only when re-executed by the test below, as the supervisor of a
+/// command whose child starts a descendant in a session of its own (so it
+/// leaves the process group) and writes its pid to a file. perl and sleep
+/// are what Apple ships: their environment is hidden from other processes
+/// on macOS, so the marker cannot find the descendant there.
+#[test]
+fn setsid_supervisor_entry() {
+    let Some(dir) = std::env::var_os("CANIRUN_TEST_SETSID_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let (ctx, cfg) = (ctx(&dir), Config::default());
+    let script = "use POSIX qw(setsid); my $p = fork(); if (!$p) { setsid(); \
+        open(F, '>', $ARGV[0] . '.tmp'); print F $$; close F; \
+        rename($ARGV[0] . '.tmp', $ARGV[0]); exec('sleep', '60'); } sleep 60;";
+    let pidfile = dir.join("sleeper.pid");
+    let s = spec(
+        &dir,
+        "sup-2",
+        "d",
+        &["perl", "-e", script, pidfile.to_str().unwrap()],
+    );
+    let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    admit_now(&ctx, &cfg, "sup-2");
+    let _ = managed::run_command(&ctx, &guard, &s.opts, cfg.limits());
+}
+
+#[test]
+fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let mut sup = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "setsid_supervisor_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("CANIRUN_TEST_SETSID_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pidfile = dir.path().join("sleeper.pid");
+    let sleeper = || -> Option<u32> { std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok() };
+    assert!(
+        until(20, || sleeper().is_some()),
+        "the descendant never started"
+    );
+    let sleeper = sleeper().unwrap();
+    // Recorded within a few sampling intervals.
+    let recorded = until(20, || match managed::load_sidecar(&ctx, "sup-2") {
+        Loaded::Ok(sc) => sc.descendants.iter().any(|p| p.pid == sleeper),
+        _ => false,
+    });
+    assert!(recorded, "the descendant was not recorded");
+    let pgid = sidecar(&ctx, "sup-2").child.unwrap().pgid.unwrap();
+
+    // The supervisor dies, then the leader: only the descendant is left,
+    // orphaned and outside the group.
+    unsafe { libc::kill(sup.id() as libc::pid_t, libc::SIGKILL) };
+    sup.wait().unwrap();
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    assert!(until(20, || unsafe { libc::killpg(pgid, 0) } == -1));
+    if cfg!(target_os = "macos") {
+        // Without the record nothing would show it: its environment is
+        // hidden.
+        assert!(until(10, || ctx.scan_marked("sup-2").probe == Probe::Gone));
+    }
+    for _ in 0..3 {
+        assert!(
+            reaped(&ctx).find("sup-2").is_some(),
+            "released while the descendant runs"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let v = managed::views(&ctx, &ledger(&ctx).entries);
+    assert!(v[0].reason.contains("DescendantsAlive"), "{:?}", v[0]);
+
+    unsafe { libc::kill(sleeper as libc::pid_t, libc::SIGKILL) };
+    assert!(
+        until(20, || reaped(&ctx).find("sup-2").is_none()),
+        "not released after the descendant stopped"
+    );
+}
+
+fn ctx_with_fixed(dir: &Path, clock: Arc<FakeClock>, scan: Scan) -> Context {
+    ctx(dir)
+        .with_clock(clock)
+        .with_scan(Arc::new(FixedScan(scan)))
+}
+
+/// A registered entry whose supervisor died with the child gone (no
+/// process, no group), `edit`ed afterwards.
+fn dead_child(
+    dir: &Path,
+    clock: &Arc<FakeClock>,
+    id: &str,
+    edit: impl FnOnce(&mut managed::Sidecar),
+) {
+    let c = ctx_with_fixed(dir, clock.clone(), Scan::new(Probe::Alive, vec![]));
+    let (_, g) = registered(
+        managed::register(&c, &Config::default(), &spec(dir, id, "d", &["true"])).unwrap(),
+    );
+    let mut sc = sidecar(&c, id);
+    sc.phase = Phase::ChildStarted;
+    sc.child = Some(canirun::process::ChildIdentity {
+        pid: 0x3fff_fff0,
+        start_time: Some(1),
+        pgid: Some(0x3fff_fff0),
+    });
+    edit(&mut sc);
+    managed::write_sidecar(&c, &sc).unwrap();
+    drop(g);
+}
+
+#[test]
+fn dropped_descendants_make_a_clear_scan_unknown_and_only_force_releases_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_child(dir.path(), &clock, "tr", |sc| {
+        sc.descendants_truncated = true
+    });
+    let c = ctx_with_fixed(dir.path(), clock.clone(), Scan::new(Probe::Gone, vec![]));
+    assert!(reaped(&c).find("tr").is_some(), "freed on a clear scan");
+    let kept = managed::resolve_checked(&c, "tr").unwrap();
+    assert!(!kept.released && !kept.forced);
+    assert!(kept.verdict.contains("ProbeUnknown"), "{kept:?}");
+    let forced = managed::resolve_checked_with(&c, "tr", true).unwrap();
+    assert!(forced.released && forced.forced, "{forced:?}");
+    assert!(forced.checked.starts_with("forced: "), "{forced:?}");
+    assert!(ledger(&c).find("tr").is_none());
+    let sc = sidecar(&c, "tr");
+    assert_eq!(sc.phase, Phase::Terminal);
+    let t = sc.terminal.unwrap();
+    assert_eq!(t.kind, TerminalKind::Interrupted);
+    assert!(t.detail.unwrap().starts_with("forced: "));
+}
+
+#[test]
+fn force_never_releases_what_is_known_to_be_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    // A marked process, a live recorded descendant, even with the record
+    // truncated.
+    let mut live = Command::new("sleep").arg("60").spawn().unwrap();
+    let rec = ProcRef {
+        pid: live.id(),
+        start_time: canirun::process::start_time(live.id()),
+    };
+    dead_child(dir.path(), &clock, "m1", |_| {});
+    dead_child(dir.path(), &clock, "m2", |sc| {
+        sc.descendants = vec![rec];
+        sc.descendants_truncated = true;
+    });
+    let gone = ctx_with_fixed(dir.path(), clock.clone(), Scan::new(Probe::Gone, vec![]));
+    let marked = ctx_with_fixed(
+        dir.path(),
+        clock.clone(),
+        Scan::new(
+            Probe::Alive,
+            vec![ProcRef {
+                pid: 1,
+                start_time: Some(1),
+            }],
+        ),
+    );
+    let r = managed::resolve_checked_with(&marked, "m1", true).unwrap();
+    assert!(
+        !r.released && !r.forced && r.verdict.contains("DescendantsAlive"),
+        "{r:?}"
+    );
+    assert!(r.checked.contains("--force"), "{r:?}");
+    let r = managed::resolve_checked_with(&gone, "m2", true).unwrap();
+    assert!(
+        !r.released && !r.forced && r.verdict.contains("DescendantsAlive"),
+        "{r:?}"
+    );
+    // Reused pid (start time differs): not the recorded process.
+    let mut sc = sidecar(&gone, "m2");
+    sc.descendants[0].start_time = rec.start_time.map(|t| t + 1000);
+    managed::write_sidecar(&gone, &sc).unwrap();
+    let r = managed::resolve_checked_with(&gone, "m2", false).unwrap();
+    assert!(!r.released && r.verdict.contains("ProbeUnknown"), "{r:?}");
+    // The recorded one is gone: a clear, complete record releases.
+    live.kill().unwrap();
+    live.wait().unwrap();
+    let mut sc = sidecar(&gone, "m2");
+    sc.descendants[0].start_time = rec.start_time;
+    sc.descendants_truncated = false;
+    managed::write_sidecar(&gone, &sc).unwrap();
+    let r = managed::resolve_checked_with(&gone, "m2", false).unwrap();
+    assert!(r.released && !r.forced, "{r:?}");
+}
+
+#[test]
+fn force_leaves_a_held_lease_and_a_missing_entry_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    let c = ctx_with_fixed(dir.path(), clock, Scan::new(Probe::Unknown, vec![]));
+    let (_, guard) = registered(
+        managed::register(
+            &c,
+            &Config::default(),
+            &spec(dir.path(), "h", "d", &["true"]),
+        )
+        .unwrap(),
+    );
+    let r = managed::resolve_checked_with(&c, "h", true).unwrap();
+    assert!(r.lease_held && !r.released && !r.forced, "{r:?}");
+    let n = managed::resolve_checked_with(&c, "nope", true).unwrap();
+    assert!(!n.found && !n.released && !n.forced);
+    drop(guard);
+}
+
+#[test]
+fn a_hidden_orphan_started_since_the_intent_keeps_a_launch_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_at_launch(dir.path(), &clock, "hid", true);
+    clock.advance(Duration::from_secs(120));
+    let intent = sidecar(&ctx(dir.path()), "hid")
+        .launch_intent_at
+        .unwrap()
+        .timestamp() as u64;
+    let hidden = |parent: u32, start: u64| {
+        let mut s = Scan::new(Probe::Gone, vec![]);
+        s.hidden.push(HiddenProc {
+            proc: ProcRef {
+                pid: 4242,
+                start_time: Some(start),
+            },
+            parent: Some(parent),
+        });
+        ctx_with_fixed(dir.path(), clock.clone(), s)
+    };
+    // Started before the intent, or somebody else's child: not it.
+    let before = hidden(1, intent - 5);
+    let other = hidden(31337, intent + 5);
+    let orphan = hidden(1, intent + 5);
+    let v = managed::views(&orphan, &ledger(&orphan).entries);
+    assert!(
+        v[0].quarantined && v[0].reason.contains("ProbeUnknown"),
+        "{v:?}"
+    );
+    let r = managed::resolve_checked(&orphan, "hid").unwrap();
+    assert!(!r.released, "{r:?}");
+    let forced = managed::resolve_checked_with(&orphan, "hid", true).unwrap();
+    assert!(forced.released && forced.forced, "{forced:?}");
+    // A second entry, with the unrelated hidden processes: settled.
+    dead_at_launch(dir.path(), &clock, "hid2", true);
+    clock.advance(Duration::from_secs(120));
+    assert!(reaped(&before).find("hid2").is_none());
+    dead_at_launch(dir.path(), &clock, "hid3", true);
+    clock.advance(Duration::from_secs(120));
+    assert!(reaped(&other).find("hid3").is_none());
 }

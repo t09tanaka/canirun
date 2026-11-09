@@ -14,6 +14,7 @@
 //! the innermost is tracked.
 
 use crate::reap::Probe;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -32,7 +33,7 @@ pub fn scope(state_dir: &Path) -> String {
 }
 
 /// A process, identified by pid plus start time (pids are reused).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcRef {
     pub pid: u32,
     pub start_time: Option<u64>,
@@ -47,14 +48,30 @@ pub enum Marker {
         scope: Option<String>,
     },
     Absent,
-    /// The environment could not be read although the process exists.
+    /// The OS shows the arguments but withholds the environment (or it is
+    /// empty: the two cannot be told apart). On macOS this is every Apple
+    /// platform binary and hardened-runtime app. It says nothing about
+    /// the marker, so it never makes a scan unknown, but it is not proof of
+    /// absence either (see [`suspicious_hidden`]).
+    Hidden,
+    /// The environment could not be read although the process exists, and
+    /// the cause is not one of the above (a garbled buffer).
     Unreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
     pub proc: ProcRef,
+    /// The parent pid, if the OS gave one.
+    pub parent: Option<u32>,
     pub marker: Marker,
+}
+
+/// A process whose environment is hidden, with its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HiddenProc {
+    pub proc: ProcRef,
+    pub parent: Option<u32>,
 }
 
 /// The outcome of looking for the processes marked with one id.
@@ -66,6 +83,19 @@ pub struct Scan {
     pub probe: Probe,
     /// The marked processes found (empty unless `probe` is `Alive`).
     pub alive: Vec<ProcRef>,
+    /// Processes whose environment is hidden from us.
+    pub hidden: Vec<HiddenProc>,
+}
+
+impl Scan {
+    /// A scan result that saw no hidden process.
+    pub fn new(probe: Probe, alive: Vec<ProcRef>) -> Self {
+        Scan {
+            probe,
+            alive,
+            hidden: Vec::new(),
+        }
+    }
 }
 
 /// Decide from what was `seen`. A process counts only when its id and its
@@ -74,6 +104,7 @@ pub struct Scan {
 /// started inside a managed command.
 pub fn classify(seen: &[Seen], id: &str, scope: &str, own_pid: u32) -> Scan {
     let mut alive = Vec::new();
+    let mut hidden = Vec::new();
     let mut unreadable = false;
     for s in seen.iter().filter(|s| s.proc.pid != own_pid) {
         match &s.marker {
@@ -81,6 +112,10 @@ pub fn classify(seen: &[Seen], id: &str, scope: &str, own_pid: u32) -> Scan {
                 alive.push(s.proc)
             }
             Marker::Unreadable => unreadable = true,
+            Marker::Hidden => hidden.push(HiddenProc {
+                proc: s.proc,
+                parent: s.parent,
+            }),
             Marker::Marked { .. } | Marker::Absent => {}
         }
     }
@@ -91,7 +126,11 @@ pub fn classify(seen: &[Seen], id: &str, scope: &str, own_pid: u32) -> Scan {
     } else {
         Probe::Gone
     };
-    Scan { probe, alive }
+    Scan {
+        probe,
+        alive,
+        hidden,
+    }
 }
 
 /// The marker in a block of NUL-separated `KEY=VALUE` strings (Linux's
@@ -116,8 +155,9 @@ pub fn find_marker(env: &[u8]) -> Marker {
 /// The marker in macOS's `KERN_PROCARGS2` buffer: an `i32` argument count,
 /// the executable path (NUL-padded), `argc` argument strings, then the
 /// environment. Only the environment is searched: an argument that looks
-/// like the marker is not one. A buffer that ends before the arguments do
-/// cannot be told from a hidden environment, so it is unreadable.
+/// like the marker is not one. An environment of no strings at all is
+/// [`Marker::Hidden`] (the OS withholds it, or it is truly empty). A buffer
+/// that ends before the arguments do is unreadable.
 pub fn parse_procargs(buf: &[u8]) -> Marker {
     let Some(head) = buf.get(..4) else {
         return Marker::Unreadable;
@@ -140,7 +180,11 @@ pub fn parse_procargs(buf: &[u8]) -> Marker {
         };
         off += nul + 1;
     }
-    find_marker(&rest[off..])
+    let env = &rest[off..];
+    if env.iter().all(|b| *b == 0) {
+        return Marker::Hidden;
+    }
+    find_marker(env)
 }
 
 #[cfg(test)]
@@ -153,6 +197,7 @@ mod tests {
                 pid,
                 start_time: Some(100 + pid as u64),
             },
+            parent: Some(1000 + pid),
             marker,
         }
     }
@@ -359,11 +404,43 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_hidden_environment_has_no_marker() {
+    fn an_empty_or_withheld_environment_is_hidden_not_absent() {
         let buf = procargs(2, b"/bin/sh", &[b"sh", b"-c"]);
-        assert_eq!(parse_procargs(&buf), Marker::Absent);
+        assert_eq!(parse_procargs(&buf), Marker::Hidden);
         let none = procargs(0, b"/bin/sh", &[]);
-        assert_eq!(parse_procargs(&none), Marker::Absent);
+        assert_eq!(parse_procargs(&none), Marker::Hidden);
+        // An environment with strings but no marker is a real absence.
+        let plain = procargs(1, b"/bin/x", &[b"x", b"PATH=/bin"]);
+        assert_eq!(parse_procargs(&plain), Marker::Absent);
+    }
+
+    #[test]
+    fn a_hidden_process_never_makes_a_scan_unknown_but_is_listed() {
+        let s = classify(
+            &[
+                seen(1, Marker::Hidden),
+                seen(2, Marker::Absent),
+                seen(7, Marker::Hidden),
+            ],
+            "a",
+            "s",
+            7,
+        );
+        assert_eq!(s.probe, Probe::Gone);
+        assert_eq!(s.hidden.len(), 1);
+        assert_eq!(s.hidden[0].proc.pid, 1);
+        assert_eq!(s.hidden[0].parent, Some(1001));
+        assert_eq!(s.hidden[0].proc.start_time, Some(101));
+        // With a marked process the scan is still alive.
+        let m = classify(
+            &[seen(1, Marker::Hidden), seen(2, marked("a", "s"))],
+            "a",
+            "s",
+            99,
+        );
+        assert_eq!(m.probe, Probe::Alive);
+        assert_eq!(m.hidden.len(), 1);
+        assert!(Scan::new(Probe::Gone, vec![]).hidden.is_empty());
     }
 
     #[test]

@@ -79,6 +79,10 @@ enum Cmd {
         id: String,
         #[arg(long)]
         json: bool,
+        /// Release an entry kept only because a process could not be
+        /// checked (never one that is known to be running)
+        #[arg(long)]
+        force: bool,
     },
     /// Print the effective configuration
     Config {
@@ -170,7 +174,7 @@ fn run(cli: Cli) -> error::Result<i32> {
             key,
             command,
         } => cmd::estimate::run(&ctx, &cfg, opts(weight, front, key, command)?, json),
-        Cmd::Resolve { id, json } => cmd::resolve::run(&ctx, &id, json),
+        Cmd::Resolve { id, json, force } => cmd::resolve::run(&ctx, &id, json, force),
         Cmd::Config { path } => cmd::config::run(&ctx, &cfg, path),
         Cmd::Gc => cmd::gc::run(&ctx, &cfg),
         Cmd::Submit {

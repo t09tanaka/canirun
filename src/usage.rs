@@ -111,7 +111,7 @@ impl Drop for Monitor {
     }
 }
 
-fn block_all_signals() -> libc::sigset_t {
+pub(crate) fn block_all_signals() -> libc::sigset_t {
     unsafe {
         let mut all: libc::sigset_t = std::mem::zeroed();
         let mut old: libc::sigset_t = std::mem::zeroed();
@@ -121,7 +121,7 @@ fn block_all_signals() -> libc::sigset_t {
     }
 }
 
-fn restore_signals(old: &libc::sigset_t) {
+pub(crate) fn restore_signals(old: &libc::sigset_t) {
     unsafe {
         libc::pthread_sigmask(libc::SIG_SETMASK, old, std::ptr::null_mut());
     }
