@@ -114,6 +114,61 @@ pub fn snapshot(ctx: &Context) -> Result<Snapshot> {
     })
 }
 
+/// A ledger read without changing anything on disk.
+pub struct ReadOnlySnapshot {
+    pub ledger: Ledger,
+    /// False when the lock file is missing or stayed exclusively held for
+    /// a round, so the file was read without it.
+    pub locked: bool,
+    /// Ids whose lease is not held. They are kept in `ledger`: whether the
+    /// owner is gone is the reaper's call, a reader must not count them as
+    /// free capacity.
+    pub suspect_dead: Vec<String>,
+}
+
+/// The ledger as it is, for readers that must not write (forecast). Unlike
+/// [`snapshot`] nothing is created, reaped or saved: the lock file is only
+/// opened if it already exists, and a shared lock (never an exclusive one)
+/// is held while reading.
+pub fn snapshot_read_only(ctx: &Context) -> Result<ReadOnlySnapshot> {
+    let guard = match OpenOptions::new().read(true).open(ctx.paths.ledger_lock()) {
+        Ok(file) => {
+            let start = Instant::now();
+            loop {
+                match FileExt::try_lock_shared(&file) {
+                    Ok(()) => break Some(file),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if start.elapsed() >= ctx.ledger_lock_timeout.min(TRY_ROUND) {
+                            break None;
+                        }
+                        thread::sleep(POLL);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let locked = guard.is_some();
+    let ledger = Ledger::load(&ctx.paths.ledger_file());
+    if let Some(f) = &guard {
+        let _ = FileExt::unlock(f);
+    }
+    let ledger = ledger?;
+    let suspect_dead = ledger
+        .entries
+        .iter()
+        .filter(|e| !lease_is_held(ctx, &e.id))
+        .map(|e| e.id.clone())
+        .collect();
+    Ok(ReadOnlySnapshot {
+        ledger,
+        locked,
+        suspect_dead,
+    })
+}
+
 /// Take the lease for `id`. Held by the owning canirun process until it
 /// exits; the fd is close-on-exec (Rust std default) so children never
 /// inherit it.

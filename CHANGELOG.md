@@ -7,6 +7,23 @@ the minor version).
 
 ## [Unreleased]
 
+### Added
+
+- `canirun inspect --json`: a read-only, versioned snapshot of the ledger,
+  limits, live metrics and referenced history, with snapshot and policy
+  digests. It never reaps or writes; entries without a held lease are
+  flagged `suspect_dead` and still counted.
+- `canirun estimate --json -- <command>`: when would this command start and
+  finish if queued now? Replays the ledger through `admit` with the same
+  limits and queue rules. Unknown values are `null` with a reason, a fallback
+  runtime is only ever a `ranking`, and overrunning entries have unknown
+  remaining time.
+- Library: `inspect`, `forecast` (WorkloadPlan with dependencies, external
+  delays, shared setup, an overlay of future demand with de-duplication
+  against the ledger, and `coverage`), `estimate::command_plan` and
+  `lock::snapshot_read_only`. `Limits` and `LiveSnapshot` are now
+  serializable. `error::Error` gained a `Plan` variant.
+
 ## [0.4.2] - 2026-11-05
 
 ### Fixed

@@ -235,6 +235,31 @@ The runner is the same admission path as `exec`: weights, guards, history
 and liveness all apply. Job files live in `jobs/` under the state
 directory; `gc` removes those finished more than `jobs_keep_days` ago.
 
+### `canirun inspect --json` and `canirun estimate --json -- <command>`
+
+Both only read; they never register an entry, take a lease, reap a dead
+entry or write history (`status` reaps, `inspect` does not).
+
+`inspect` prints the ledger (a `suspect_dead` flag on entries whose lease is
+not held, which are kept and counted as busy), the limits, the live
+machine metrics and the history the ledger entries refer to, with a
+`snapshot_digest` and a `policy_digest`.
+
+`estimate` predicts when the command would start and finish if it were
+queued now, by replaying the ledger through the same admission function
+`exec` uses. Times are milliseconds from now; a value that cannot be
+computed is `null` with the reason in `null_reasons`. With no usable history
+`runtime_source` is `fallback`: the finish time is `null` and only
+`ranking` carries a number (a 60 s default, good for ordering candidate
+machines, not an ETA). A running entry past its recorded runtime has an
+unknown remaining time, not zero. Live memory and CPU guards are read once;
+what depends on them is marked `conditional`.
+
+The same machinery is available to Rust callers as `canirun::inspect` and
+`canirun::forecast` (a multi-node `WorkloadPlan` with dependencies, external
+delays and shared setup, plus an overlay of demands the ledger does not
+show yet). The crate is 0.x and that API is not stable.
+
 ### `canirun config [--path]` and `canirun gc`
 
 `config` prints the effective configuration (defaults merged with the
@@ -423,15 +448,15 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ./scripts/coverage-gate.sh      # 100% lines on admit / weight / key / eta
 cargo install cargo-schemata --locked --version 0.1.0   # once
-cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs -- --lib
+cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs --file src/forecast.rs -- --lib
 ```
 
 On a Homebrew Rust toolchain (no `llvm-tools-preview`), point `cargo llvm-cov`
 at Homebrew's LLVM: `LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata
 LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov ./scripts/coverage-gate.sh`.
 
-The admission decision, weight derivation, command key and estimate are
-pure modules with 100% line coverage and a zero-survivor mutation gate in CI.
+The admission decision, weight derivation, command key, estimate and
+forecast simulation are pure modules with 100% line coverage and a zero-survivor mutation gate in CI.
 `tests/cli.rs` drives the binary end-to-end with isolated XDG directories.
 
 ## License

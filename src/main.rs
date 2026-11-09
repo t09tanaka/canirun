@@ -54,6 +54,25 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Read-only snapshot of the ledger, policy and live metrics (JSON)
+    Inspect {
+        /// Accepted for symmetry with `status`; the output is always JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Predict when a command would start and finish, without queueing it
+    Estimate {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        weight: Option<u32>,
+        #[arg(long)]
+        front: bool,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     /// Print the effective configuration
     Config {
         /// Print only the config file path
@@ -136,6 +155,14 @@ fn run(cli: Cli) -> error::Result<i32> {
                 limit,
             },
         ),
+        Cmd::Inspect { json: _ } => cmd::inspect::run(&ctx, &cfg),
+        Cmd::Estimate {
+            json,
+            weight,
+            front,
+            key,
+            command,
+        } => cmd::estimate::run(&ctx, &cfg, opts(weight, front, key, command)?, json),
         Cmd::Config { path } => cmd::config::run(&ctx, &cfg, path),
         Cmd::Gc => cmd::gc::run(&ctx, &cfg),
         Cmd::Submit {
