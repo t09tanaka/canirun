@@ -260,7 +260,7 @@ The same machinery is available to Rust callers as `canirun::inspect` and
 delays and shared setup, plus an overlay of demands the ledger does not
 show yet). The crate is 0.x and that API is not stable.
 
-### `canirun resolve <id> [--json]`
+### `canirun resolve <id> [--json] [--force]`
 
 A managed command (one driven through `canirun::managed` by another
 program) keeps its budget while its supervisor is gone, until nothing it
@@ -269,9 +269,9 @@ and `inspect` marks them `quarantined` with a `hint`. Most are released by
 themselves once their processes stop. Two kinds are not: an entry whose
 sidecar cannot be read, and a launch intent whose timestamp is missing. For
 those, `canirun resolve <id>` runs the same checks on demand: the owner's
-lease must be gone, and the child, its process group and every process of
+lease must be gone, and the child, its process group, every process of
 yours carrying `CANIRUN_MANAGED_ID=<id>` (and this state directory's
-`CANIRUN_MANAGED_SCOPE`) must be gone, with every process readable. It prints the entry's state, what was checked and the result, and
+`CANIRUN_MANAGED_SCOPE`) and every recorded descendant must be gone. It prints the entry's state, what was checked and the result, and
 records the outcome as `interrupted`. Exit 0 means released, 1 means kept
 (still charged), 2 an error, 3 that the ledger has no entry with that id
 (it prints `no such entry`, and `--json` has `"found": false` and
@@ -283,36 +283,70 @@ gone, at least 60 seconds have passed since the intent and no process
 carries the id. An unknown scan, or no timestamp, keeps it: time alone never
 releases it. `resolve` skips the 60 seconds.
 
-What this cannot see, and the safe-side behaviour that results:
+`resolve --force` is for an entry kept only because something **could not be
+checked**: a process that could not be read, a launch intent that a hidden
+process may belong to, or a record of descendants that did not fit. It
+releases the entry anyway and records `interrupted` with `forced: <reason>`
+(`--json` has `"forced": true`). It never releases what is known to be
+running: a held lease, a running child, group, marked process or recorded
+descendant keeps the entry (exit 1), with or without `--force`. Exit codes
+are the same (0 released, 1 kept, 2 error, 3 no such entry).
 
+How descendants are found, and what this cannot see:
+
+- **Marker.** A managed command carries `CANIRUN_MANAGED_ID` and
+  `CANIRUN_MANAGED_SCOPE` (the first 16 hex digits of the SHA-256 of the
+  state directory's canonical path), which its descendants inherit. Two
+  state directories that use the same command id do not see, hold or stop
+  each other's processes. Only the innermost managed command is tracked:
+  one started inside another overwrites the outer id and scope.
+- **Hidden environments.** On macOS the kernel withholds the environment of
+  Apple's own binaries (`/bin/sh`, `/bin/bash`, `/usr/bin/env`, `perl`,
+  `sleep`, ...) and of hardened-runtime apps. Such a process is *hidden*:
+  neither marked nor proven unmarked. A hidden process alone never makes a
+  scan "unknown" (on one measured Mac about two thirds of the user's
+  processes are hidden; that would block every release), and an empty
+  environment cannot be told from a hidden one, so it counts as hidden too.
+  Processes of other users are not scanned. On Linux every process of the
+  user is readable, except one that made itself non-dumpable (an agent or
+  sandboxed helper), which is read as unmarked.
+- **Descendants are recorded while the command runs.** The runner reads the
+  process table every 250 ms and records every process below the command
+  (pid plus start time, following parent links) in the sidecar's
+  `descendants` (at most 4096; more are not recorded and
+  `descendants_truncated` is set; processes that exited are dropped from the
+  record). A recorded process that still runs keeps the budget, however it
+  left the process group (`setsid`, double fork), whatever its environment
+  hides, and it is stopped like a marked one (SIGTERM, then SIGKILL, after
+  checking pid and start time again). If descendants were dropped, a clear
+  scan cannot be believed and the entry is kept as "could not be checked".
+- **A launch intent and hidden processes.** A launch intent (the supervisor
+  died around the spawn) is released by the reaper once the lease is gone,
+  60 seconds have passed, no marked or recorded process runs, *and* no
+  hidden process that started after the intent has `launchd`/`init` or the
+  dead supervisor as its parent. Any such process keeps the entry (it may be
+  the child); `resolve --force` overrides that. No timestamp keeps it.
+  `resolve` skips the 60 seconds.
+- A scan that finds nothing is repeated once and believed only if it finds
+  nothing again; an unknown one is repeated a few times first.
+- On macOS a process of yours whose environment cannot be read at all is
+  hidden. The owner of a process comes from the kernel (`proc_pidinfo`).
+
+What is not found, and what follows:
+
+- A descendant that forks and loses its parent within one sampling interval
+  (250 ms), before it was recorded, and whose environment is hidden or
+  cleared: not found. The marker finds it if its environment is readable.
+- A hidden descendant whose parent was never recorded and which is an orphan
+  of something other than `launchd` (for example reparented to a user
+  subreaper): not found once the command's own record is gone.
 - A descendant that cleared its environment (`env -i ...`) loses the
-  marker and is not found once it has left the process group.
-- On macOS, Apple's own binaries (`/bin/sh`, `sleep`, ...) do not show their
-  environment to other processes, so such a descendant is not found either
-  (node, python, Rust or Go binaries and the like are). On Linux every
-  process of the user is readable, except one that made itself non-dumpable
-  (an agent or sandboxed helper), which the kernel also withholds and which
-  is read as unmarked.
+  marker; it is still found if it was recorded while its parent lived.
 - The process group check does not compare start times, so a pid that was
   reused by an unrelated process in the same group id can keep an entry held
   for a while. That errs on the side of keeping the budget.
-- The marker is the id plus a scope, `CANIRUN_MANAGED_SCOPE`: the first 16
-  hex digits of the SHA-256 of the state directory's canonical path. Two
-  state directories that use the same command id do not see, hold or stop
-  each other's processes.
-- Only the innermost managed command is tracked: one started inside another
-  managed command overwrites the outer id and scope in its environment.
-- On macOS the arguments of a process are read apart from its environment,
-  so an argument that looks like the marker is not mistaken for it.
-- A process whose owner the OS does not report is read anyway, not skipped.
-  If the kernel refuses its environment it is taken for another user's and
-  read as unmarked; one known to be yours that cannot be read makes the scan
-  "unknown".
-- A scan that finds nothing is repeated once and believed only if it finds
-  nothing again; an unknown one is repeated a few times first.
-- Only processes of the same user are scanned. If one of them fails to be
-  read for a reason other than the OS withholding its environment, the scan
-  is "unknown" and nothing is released on its account.
+- A scan that could not read some process of the user is unknown and
+  releases nothing, until `resolve --force`.
 
 ### `canirun config [--path]` and `canirun gc`
 

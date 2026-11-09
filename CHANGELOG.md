@@ -32,8 +32,11 @@ the minor version).
   owner's lease gone, 60 seconds since the intent and no marked process, the
   reaper settles it as `Interrupted`. A missing timestamp or an unknown scan
   keeps it.
-- `canirun resolve <id> [--json]` releases an entry whose owner is gone
-  after the same checks, and says what it checked. `status` lists held
+- `canirun resolve <id> [--json] [--force]` releases an entry whose owner is
+  gone after the same checks, and says what it checked. `--force` also
+  releases an entry kept only because something could not be checked
+  (recorded as `interrupted`, `forced: <reason>`); never one known to be
+  running. `status` lists held
   entries and `inspect` adds a `hint` to them.
 - `history.jsonl` records written by `managed::record_measurement` carry a
   `measurement_id` (optional; older history still reads). A repeated
@@ -56,6 +59,20 @@ the minor version).
 
 ### Fixed
 
+- Managed commands, hidden environments: on macOS the kernel withholds the
+  environment of Apple's own binaries and hardened-runtime apps (about two
+  thirds of one measured user's processes), and these were read as "no
+  marker", so a `sh -c` command whose child left the process group went
+  unseen and its budget was freed while it ran. Such a process is now
+  *hidden*, kept apart from absent (and never makes a scan unknown). The
+  runner also records the descendants of a running command (pid plus start
+  time, read from the process table every 250 ms, at most 4096) in the
+  sidecar; a recorded process that still runs keeps the budget and is
+  stopped with the marked ones, and a record that overflowed keeps the entry
+  as "could not be checked". A launch intent is now also kept while a hidden
+  process that began after it is an orphan or the dead supervisor's child.
+  Another user's processes are told apart by the kernel's owner (macOS:
+  `proc_pidinfo`), not skipped by guesswork.
 - Managed commands, review fixes: on macOS the arguments of a process were
   searched for the marker as well as its environment, so an argument could
   hide or fake it; only the environment is read now. The marker also

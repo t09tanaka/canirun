@@ -71,17 +71,28 @@ pub fn descendants_of(table: &[Row], root: ProcRef, known: &[ProcRef]) -> Vec<Pr
         .filter(|p| p.pid != root.pid)
         .copied()
         .collect();
-    let mut queue = seeds;
-    while let Some(parent) = queue.pop() {
-        for child in children.get(&parent.pid).into_iter().flatten() {
-            let older =
-                matches!((child.proc.start_time, parent.start_time), (Some(c), Some(p)) if c < p);
-            if older || !seen.insert(child.proc.pid) {
-                continue;
+    // Level by level, at most as many levels as there are rows: a loop in
+    // the table (which a real one never has) cannot run away.
+    let mut frontier = seeds;
+    for _ in 0..table.len() {
+        let mut next = Vec::new();
+        for parent in &frontier {
+            for child in children.get(&parent.pid).into_iter().flatten() {
+                let older = matches!(
+                    (child.proc.start_time, parent.start_time),
+                    (Some(c), Some(p)) if c < p
+                );
+                if older || !seen.insert(child.proc.pid) {
+                    continue;
+                }
+                out.push(child.proc);
+                next.push(child.proc);
             }
-            out.push(child.proc);
-            queue.push(child.proc);
         }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
     }
     out
 }

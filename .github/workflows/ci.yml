@@ -68,4 +68,4 @@ jobs:
       - name: install cargo-schemata
         run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
       - name: zero survivors in admit / weight / key / eta / forecast / reap / receipt
-        run: cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs --file src/forecast.rs --file src/reap.rs --file src/receipt.rs -- --lib
+        run: cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs --file src/forecast.rs --file src/reap.rs --file src/receipt.rs --file src/marker.rs --file src/lineage.rs -- --lib

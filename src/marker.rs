@@ -409,6 +409,23 @@ mod tests {
         assert_eq!(parse_procargs(&buf), Marker::Hidden);
         let none = procargs(0, b"/bin/sh", &[]);
         assert_eq!(parse_procargs(&none), Marker::Hidden);
+        // Only padding after the arguments is still no environment, and a
+        // string with no terminator is still a string.
+        let mut padded = procargs(1, b"/bin/x", &[b"x"]);
+        padded.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(parse_procargs(&padded), Marker::Hidden);
+        let mut bare = procargs(1, b"/bin/x", &[b"x"]);
+        bare.extend_from_slice(b"CANIRUN_MANAGED_ID=u");
+        assert_eq!(
+            parse_procargs(&bare),
+            Marker::Marked {
+                id: "u".into(),
+                scope: None
+            }
+        );
+        let mut other = procargs(1, b"/bin/x", &[b"x"]);
+        other.extend_from_slice(b"PATH=/bin");
+        assert_eq!(parse_procargs(&other), Marker::Absent);
         // An environment with strings but no marker is a real absence.
         let plain = procargs(1, b"/bin/x", &[b"x", b"PATH=/bin"]);
         assert_eq!(parse_procargs(&plain), Marker::Absent);
