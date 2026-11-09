@@ -58,6 +58,12 @@ impl Supervisor for ProcessSignals {
     }
 }
 
+/// The run is recorded: put the handled signals back to their defaults so
+/// a SIGINT is not swallowed on the way to exit.
+pub fn restore() {
+    ProcessSignals.finished();
+}
+
 /// Terminate ourselves the way the child did, so the calling shell sees
 /// the same signal death. Falls back to exiting 128+N.
 pub fn reraise(sig: i32) -> ! {

@@ -195,7 +195,12 @@ fn advance_sidecar(
             "sidecar for {id} is missing or unreadable"
         )));
     };
-    receipt::advance(sc.phase, to).map_err(|e| Error::Ledger(format!("{id}: {e}")))?;
+    let moved = receipt::advance(sc.phase, to).map_err(|e| Error::Ledger(format!("{id}: {e}")))?;
+    if moved == receipt::Advance::Noop {
+        // Already there: what is recorded (a terminal outcome above all)
+        // stays as it is.
+        return Ok(*sc);
+    }
     sc.phase = to;
     f(&mut sc);
     write_sidecar(ctx, &sc)?;
@@ -670,6 +675,24 @@ pub struct Ran {
 pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limits) -> Result<Ran> {
     let id = guard.command_id();
     if guard.managed {
+        // Only a command that never reached its launch may spawn. After a
+        // LaunchIntent a child may already exist, and a spawn would run it
+        // twice; `resolve` is how a human settles that.
+        match load_sidecar(ctx, id) {
+            Loaded::Ok(sc) if sc.phase == Phase::Registered => {}
+            Loaded::Ok(sc) => {
+                return Err(Error::Ledger(format!(
+                    "{id} is in phase {:?}: a child may already exist, so it is not started \
+                     again; settle it with `resolve` after checking",
+                    sc.phase
+                )))
+            }
+            _ => {
+                return Err(Error::Ledger(format!(
+                    "sidecar for {id} is missing or unreadable; settle it with `resolve`"
+                )))
+            }
+        }
         let at = ctx.clock.now();
         advance_sidecar(ctx, id, Phase::LaunchIntent, |s| {
             s.launch_intent_at = Some(at)
@@ -714,6 +737,22 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
 pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()> {
     let id = guard.id.clone();
     if guard.managed {
+        // Budget is only released once the whole process group is known to
+        // be stopped. `run_command` stops what it can; if members remain
+        // the entry is kept (the reaper then holds it as DescendantsAlive
+        // until they are gone) and nothing is recorded as terminal.
+        if let Loaded::Ok(sc) = load_sidecar(ctx, &id) {
+            if sc.phase != Phase::Terminal {
+                if let Some(pgid) = sc.child.as_ref().and_then(|c| c.pgid) {
+                    if process::probe_group(Some(pgid)) == Probe::Alive {
+                        return Err(Error::Ledger(format!(
+                            "{id}: process group {pgid} still has members; the entry keeps \
+                             its budget until they stop"
+                        )));
+                    }
+                }
+            }
+        }
         let at = ctx.clock.now();
         advance_sidecar(ctx, &id, Phase::Terminal, |s| {
             s.terminal = Some(TerminalRecord {

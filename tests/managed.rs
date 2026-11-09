@@ -617,3 +617,110 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     assert!(status.get("managed").is_none());
     assert!(status["entries"][0].get("managed").is_none());
 }
+
+fn run_to_end(
+    ctx: &Context,
+    cfg: &Config,
+    s: &CommandSpec,
+) -> (canirun::managed::Ran, managed::OwnerGuard) {
+    let (_, guard) = registered(managed::register(ctx, cfg, s).unwrap());
+    admit_now(ctx, cfg, &s.command_id);
+    let ran = managed::run_command(ctx, &guard, &s.opts, cfg.limits()).unwrap();
+    (ran, guard)
+}
+
+#[test]
+fn a_clean_exit_stops_the_leftover_group_before_the_budget_is_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "bg", "d", &["sh", "-c", "sleep 20 & exit 0"]);
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    assert_eq!(ran.outcome.exit.code(), 0);
+    assert!(!ran.outcome.group_left);
+    let pgid = sidecar(&ctx, "bg").child.unwrap().pgid.unwrap();
+    assert_eq!(
+        unsafe { libc::killpg(pgid, 0) },
+        -1,
+        "the background sleep was left running"
+    );
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    assert!(ledger(&ctx).find("bg").is_none());
+}
+
+#[test]
+fn finish_keeps_the_entry_while_the_group_has_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "live", "d", &["true"]);
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    // A stand-in survivor in a group of its own, recorded as the child's.
+    let mut survivor = {
+        let mut c = Command::new("sleep");
+        c.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        c.spawn().unwrap()
+    };
+    let mut sc = sidecar(&ctx, "live");
+    sc.child.as_mut().unwrap().pgid = Some(survivor.id() as i32);
+    managed::write_sidecar(&ctx, &sc).unwrap();
+
+    let err = managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap_err();
+    assert!(err.to_string().contains("still has members"), "{err}");
+    assert!(ledger(&ctx).find("live").is_some(), "released too early");
+    assert_eq!(sidecar(&ctx, "live").phase, Phase::ChildStarted);
+
+    survivor.kill().unwrap();
+    survivor.wait().unwrap();
+    assert!(until(20, || reaped(&ctx).find("live").is_none()));
+    assert_eq!(
+        sidecar(&ctx, "live").terminal.unwrap().kind,
+        TerminalKind::Interrupted
+    );
+}
+
+#[test]
+fn a_launch_intent_is_never_spawned_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let marker = dir.path().join("spawned");
+    let s = spec(
+        dir.path(),
+        "again",
+        "d",
+        &["touch", marker.to_str().unwrap()],
+    );
+    let (_, g) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    orphan(&ctx, "again", Phase::LaunchIntent, None);
+    drop(g);
+    // The supervisor comes back and adopts the entry.
+    let (rc, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    assert_eq!(rc.phase, Phase::LaunchIntent);
+    admit_now(&ctx, &cfg, "again");
+    let err = managed::run_command(&ctx, &guard, &s.opts, cfg.limits()).unwrap_err();
+    assert!(err.to_string().contains("resolve"), "{err}");
+    assert!(!marker.exists(), "the command was started a second time");
+    assert_eq!(sidecar(&ctx, "again").phase, Phase::LaunchIntent);
+}
+
+#[test]
+fn finishing_a_terminal_sidecar_keeps_what_was_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "t", "d", &["true"]);
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    let mut sc = sidecar(&ctx, "t");
+    sc.phase = Phase::Terminal;
+    sc.terminal = Some(managed::TerminalRecord {
+        kind: TerminalKind::Exited { code: 0 },
+        at: chrono::Utc::now(),
+        detail: None,
+    });
+    managed::write_sidecar(&ctx, &sc).unwrap();
+    let _ = ran;
+    managed::finish(&ctx, guard, TerminalKind::Cancelled).unwrap();
+    assert_eq!(
+        sidecar(&ctx, "t").terminal.unwrap().kind,
+        TerminalKind::Exited { code: 0 }
+    );
+    assert!(ledger(&ctx).find("t").is_none());
+}

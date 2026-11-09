@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::Context;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Exit {
@@ -36,6 +37,10 @@ pub struct Outcome {
     pub wall_secs: f64,
     pub cpu_secs: f64,
     pub max_rss_bytes: u64,
+    /// A managed command's process group still had members after the
+    /// leader was reaped and they were sent SIGTERM, then SIGKILL, and the
+    /// group did not empty in time. Always false for a plain run.
+    pub group_left: bool,
 }
 
 /// Run `argv` with inherited stdio in our process group, in `cwd`, with
@@ -61,6 +66,43 @@ pub struct Spawn<'a> {
     pub own_process_group: bool,
     /// Called with the child's pid right after the spawn.
     pub on_spawn: Option<&'a dyn Fn(u32)>,
+}
+
+/// Grace between SIGTERM and SIGKILL for descendants that outlive a
+/// managed command's leader, and how long to wait for the group to empty
+/// after SIGKILL.
+const GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
+const GROUP_KILL_WAIT: Duration = Duration::from_secs(3);
+
+fn group_empty(pgid: libc::pid_t) -> bool {
+    crate::process::probe_group(Some(pgid)) == crate::reap::Probe::Gone
+}
+
+/// Stop whatever is left of the process group `pgid` once its leader is
+/// gone; true if it is confirmed empty.
+fn clear_group(ctx: &Context, pgid: libc::pid_t) -> bool {
+    if group_empty(pgid) {
+        return true;
+    }
+    for (sig, wait) in [
+        (libc::SIGTERM, GROUP_TERM_GRACE),
+        (libc::SIGKILL, GROUP_KILL_WAIT),
+    ] {
+        unsafe {
+            libc::killpg(pgid, sig);
+        }
+        let until = ctx.clock.monotonic() + wait;
+        while ctx.clock.monotonic() < until {
+            if group_empty(pgid) {
+                return true;
+            }
+            ctx.clock.sleep(Duration::from_millis(20));
+        }
+        if group_empty(pgid) {
+            return true;
+        }
+    }
+    false
 }
 
 /// [`run`] with spawn options.
@@ -95,10 +137,18 @@ pub fn run_with(
     // A signal delivered between handler installation and spawn is
     // forwarded now rather than waiting for the next EINTR.
     let early = ctx.supervisor.take_pending();
-    if early != 0 {
-        unsafe {
-            libc::kill(pid, early);
+    // A managed command leads its own group, so the signal goes to all of
+    // it; a plain run keeps the terminal's own delivery and signals the
+    // child alone.
+    let forward = |sig: libc::c_int| unsafe {
+        if spawn.own_process_group {
+            libc::killpg(pid, sig);
+        } else {
+            libc::kill(pid, sig);
         }
+    };
+    if early != 0 {
+        forward(early);
     }
 
     let mut status: libc::c_int = 0;
@@ -112,15 +162,16 @@ pub fn run_with(
         if err.raw_os_error() == Some(libc::EINTR) {
             let sig = ctx.supervisor.take_pending();
             if sig != 0 {
-                unsafe {
-                    libc::kill(pid, sig);
-                }
+                forward(sig);
             }
             continue;
         }
         return Err(Error::Spawn(format!("wait4 failed: {err}")));
     }
     let wall_secs = (ctx.clock.monotonic().saturating_sub(start)).as_secs_f64();
+    // The leader is gone, but a managed command's descendants may not be:
+    // the budget is only free once the whole group is confirmed stopped.
+    let group_left = spawn.own_process_group && !clear_group(ctx, pid);
 
     let exit = if libc::WIFEXITED(status) {
         Exit::Code(libc::WEXITSTATUS(status))
@@ -136,6 +187,7 @@ pub fn run_with(
         wall_secs,
         cpu_secs,
         max_rss_bytes,
+        group_left,
     })
 }
 

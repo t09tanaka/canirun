@@ -52,7 +52,10 @@ pub fn run_gated(
 
 pub fn finish(exit: Exit) -> i32 {
     match exit {
-        Exit::Code(c) => c,
+        Exit::Code(c) => {
+            crate::signals::restore();
+            c
+        }
         Exit::Signal(s) => reraise(s),
     }
 }

@@ -1,5 +1,10 @@
-//! A queued job that gets SIGTERM twice in a row is still recorded as 143,
-//! never as lost.
+//! Regression insurance: a queued job that gets SIGTERM twice in a row is
+//! still recorded as 143, never as lost.
+//!
+//! This does not hit the window between the supervisor's handlers and the
+//! caller's own exit (it passes without the fix too). That window is pinned
+//! by `an_interrupted_wait_leaves_the_signal_handlers_to_the_caller` in
+//! tests/managed.rs.
 
 use std::fs;
 use std::process::{Command, Stdio};

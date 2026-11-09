@@ -104,7 +104,10 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
     };
     jobs::write_exit(ctx, id, exit.code());
     match exit {
-        Exit::Code(c) => Ok(c),
+        Exit::Code(c) => {
+            crate::signals::restore();
+            Ok(c)
+        }
         Exit::Signal(s) => reraise(s),
     }
 }
