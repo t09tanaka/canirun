@@ -439,6 +439,27 @@ fn inspect_reports_a_quarantined_entry_and_still_counts_it() {
     assert!(ledger(&ctx).find("c").is_some());
 }
 
+#[test]
+fn a_quarantined_entry_is_demand_not_free_capacity_in_a_forecast() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.budget = 1;
+    let ctx = ctx(dir.path());
+    let (_, g) =
+        registered(managed::register(&ctx, &cfg, &spec(dir.path(), "q", "d", &["true"])).unwrap());
+    admit_now(&ctx, &cfg, "q");
+    orphan(&ctx, "q", Phase::LaunchIntent, None);
+    drop(g);
+    let plan =
+        canirun::estimate::command_plan(&ctx, &cfg, &opts(dir.path(), &["fixture-tool"])).unwrap();
+    let insp = canirun::inspect::inspect_with(&ctx, &cfg).unwrap();
+    assert!(insp.entries[0].suspect_dead);
+    let f = canirun::forecast::forecast(&ctx, &insp, &plan, &[]).unwrap();
+    // The only slot is held by the quarantined entry: no start is promised.
+    assert_eq!(f.target.timing.start_in_ms, None);
+    assert!(ledger(&ctx).find("q").is_some());
+}
+
 /// Runs only when re-executed by the SIGKILL test below, as the supervisor.
 #[test]
 fn supervisor_entry() {
