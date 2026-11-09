@@ -264,8 +264,12 @@ fn a_measurement_interrupted_after_the_append_is_not_applied_twice() {
     );
     // A crash before the append: the retry appends.
     std::fs::write(ctx.paths.measurements_dir().join("n.pending"), b"").unwrap();
+    let rec2 = Record {
+        wall_secs: 2.5,
+        ..rec
+    };
     assert_eq!(
-        managed::record_measurement(&ctx, "n", &rec).unwrap(),
+        managed::record_measurement(&ctx, "n", &rec2).unwrap(),
         Measured::Applied
     );
     assert_eq!(

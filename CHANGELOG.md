@@ -9,6 +9,18 @@ the minor version).
 
 ### Added
 
+- Library: managed commands (`canirun::managed`). `register` takes a
+  caller-chosen command id and spec digest (idempotent; a different digest
+  is a conflict) and returns a registered receipt only once the ledger
+  entry exists. `try_admit`, `run_command`, `finish` and `record_measurement`
+  split the admission path into stages. Ownership lives in a sidecar
+  (`managed/<id>.json`); ledger v1 is unchanged, so an older binary saving
+  the ledger leaves it alone.
+- The reaper no longer frees a managed entry just because its owner's lease
+  is gone: it keeps the charge until the recorded child and its process
+  group are gone, or the boot id changed. An unreadable sidecar is never
+  treated as free. `inspect` lists such entries under `managed`. Plain
+  `exec` entries are reaped as before.
 - `canirun inspect --json`: a read-only, versioned snapshot of the ledger,
   limits, live metrics and referenced history, with snapshot and policy
   digests. It never reaps or writes; entries without a held lease are
@@ -23,6 +35,13 @@ the minor version).
   against the ledger, and `coverage`), `estimate::command_plan` and
   `lock::snapshot_read_only`. `Limits` and `LiveSnapshot` are now
   serializable. `error::Error` gained a `Plan` variant.
+
+### Fixed
+
+- A job that received SIGTERM twice in a row while queued could die before
+  its exit file was written and show as lost. The library no longer restores
+  default signal handling on its own; the CLI does it just before it
+  re-raises.
 
 ## [0.4.2] - 2026-11-05
 
