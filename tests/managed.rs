@@ -442,8 +442,10 @@ fn inspect_reports_a_quarantined_entry_and_still_counts_it() {
 #[test]
 fn a_quarantined_entry_is_demand_not_free_capacity_in_a_forecast() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.budget = 1;
+    let cfg = Config {
+        budget: 1,
+        ..Config::default()
+    };
     let ctx = ctx(dir.path());
     let (_, g) =
         registered(managed::register(&ctx, &cfg, &spec(dir.path(), "q", "d", &["true"])).unwrap());
