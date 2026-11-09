@@ -4,7 +4,7 @@ use canirun::display::{
     fmt_bytes, fmt_duration, is_idle, label, running_for, truncate, IDLE_AFTER, IDLE_CORES,
 };
 use canirun::error::Result;
-use canirun::{exec, lock, Context};
+use canirun::{exec, lock, managed, Context};
 
 pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     let ledger = lock::load_reaped(ctx)?;
@@ -81,6 +81,18 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
             truncate(&label(&e.repo, &e.subdir, &e.argv), 70),
             eta_of(&e.id)
         );
+    }
+    let held: Vec<_> = managed::views(ctx, &ledger.entries)
+        .into_iter()
+        .filter(|v| v.quarantined)
+        .collect();
+    if !held.is_empty() {
+        println!();
+        println!("held, owner gone ({})", held.len());
+        for v in &held {
+            println!("  {}  {}  -> {}", v.command_id, v.reason, v.hint);
+        }
+        println!("  (still charged until their processes stop; `resolve` checks and releases)");
     }
     if let Some(head) = order.first() {
         let decision = admit::admit(&queue, &head.id, 0, head.waited_secs, limits, None);

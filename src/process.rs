@@ -2,9 +2,10 @@
 //! recorded child. A pid alone is not an identity (pids are reused), so a
 //! child is recognised by pid plus start time.
 
+use crate::marker::{self, Marker, ProcRef, Scan, Seen};
 use crate::reap::Probe;
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 /// Start time of `pid` in seconds since the epoch, or `None` if there is no
 /// such live (non-zombie) process.
@@ -76,6 +77,128 @@ pub fn probe_group(pgid: Option<i32>) -> Probe {
         Some(libc::EPERM) => Probe::Alive,
         _ => Probe::Unknown,
     }
+}
+
+/// Send `sig` to `p` only if the pid still belongs to the process that was
+/// seen (same start time): a reused pid is somebody else. A process whose
+/// start time was never learned is not signalled.
+pub fn signal_if_same(p: &ProcRef, sig: libc::c_int) -> bool {
+    let Some(then) = p.start_time else {
+        return false;
+    };
+    if p.pid <= 1 || start_time(p.pid) != Some(then) {
+        return false;
+    }
+    unsafe { libc::kill(p.pid as libc::pid_t, sig) == 0 }
+}
+
+/// Look for processes of this user carrying `CANIRUN_MANAGED_ID=<id>`.
+pub fn scan_system(id: &str) -> Scan {
+    marker::classify(&observe_all(), id, std::process::id())
+}
+
+/// The environment marker of every live, non-zombie process of this user.
+/// A process that exits while being looked at is left out; one that cannot
+/// be read is reported as such.
+fn observe_all() -> Vec<Seen> {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_user(UpdateKind::OnlyIfNotSet),
+    );
+    let me = unsafe { libc::getuid() };
+    let mut out = Vec::new();
+    for (pid, p) in sys.processes() {
+        #[cfg(target_os = "linux")]
+        if p.thread_kind().is_some() {
+            continue;
+        }
+        if matches!(p.status(), ProcessStatus::Zombie) || p.user_id().is_none_or(|u| **u != me) {
+            continue;
+        }
+        let pid = pid.as_u32();
+        let Some(marker) = read_marker(pid) else {
+            continue;
+        };
+        out.push(Seen {
+            proc: ProcRef {
+                pid,
+                start_time: Some(p.start_time()),
+            },
+            marker,
+        });
+    }
+    out
+}
+
+/// Did `pid` vanish since it was listed? A process that became a zombie
+/// meanwhile counts: its environment is unreadable but it runs nothing.
+fn vanished(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    (rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+        || start_time(pid).is_none()
+}
+
+/// `None` when the process is gone.
+#[cfg(target_os = "linux")]
+fn read_marker(pid: u32) -> Option<Marker> {
+    match std::fs::read(format!("/proc/{pid}/environ")) {
+        Ok(bytes) => Some(marker::find_marker(&bytes, 0)),
+        Err(_) if vanished(pid) => None,
+        Err(_) => Some(Marker::Unreadable),
+    }
+}
+
+/// `None` when the process is gone.
+#[cfg(target_os = "macos")]
+fn read_marker(pid: u32) -> Option<Marker> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut len: libc::size_t = 0;
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let mut buf = vec![0u8; len + 4096];
+    len = buf.len();
+    let rc = if sized == 0 {
+        unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+    } else {
+        -1
+    };
+    if rc != 0 {
+        return if vanished(pid) {
+            None
+        } else {
+            Some(Marker::Unreadable)
+        };
+    }
+    buf.truncate(len);
+    // The argument count (an i32) comes first. Apple's own binaries (`sh`,
+    // `sleep`, ...) hide their environment from other processes: their block
+    // ends after the arguments, which reads as no marker.
+    Some(marker::find_marker(&buf, 4))
+}
+
+/// No reader for this OS: nothing can be ruled out.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_marker(pid: u32) -> Option<Marker> {
+    (!vanished(pid)).then_some(Marker::Unreadable)
 }
 
 /// This machine's boot session id, if the OS gives one.
@@ -159,6 +282,48 @@ mod tests {
         c.wait().unwrap();
         assert_eq!(probe_group(id.pgid), Probe::Gone);
         assert_eq!(probe_child(&id), Probe::Gone);
+    }
+
+    /// Runs only when re-executed by the test below: a process that
+    /// blocks. The test executable is used because, on macOS, Apple's own
+    /// binaries (`sleep`) do not show their environment to anyone.
+    #[test]
+    fn marker_sleeper_entry() {
+        if std::env::var_os("CANIRUN_TEST_SLEEPER").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn a_marked_process_is_found_until_it_dies() {
+        let id = format!("scan-test-{}", std::process::id());
+        let mut c = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::tests::marker_sleeper_entry",
+                "--nocapture",
+            ])
+            .env("CANIRUN_TEST_SLEEPER", "1")
+            .env(marker::ENV_VAR, &id)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let found = scan_system(&id);
+        assert_eq!(found.probe, Probe::Alive, "{found:?}");
+        assert_eq!(found.alive.len(), 1);
+        assert_eq!(found.alive[0].pid, c.id());
+        assert!(found.alive[0].start_time.is_some());
+        assert_eq!(scan_system(&format!("{id}-other")).probe, Probe::Gone);
+        // Only a pid that is still the same process is signalled.
+        let mut stale = found.alive[0];
+        stale.start_time = stale.start_time.map(|t| t + 1000);
+        assert!(!signal_if_same(&stale, libc::SIGKILL));
+        stale.start_time = None;
+        assert!(!signal_if_same(&stale, libc::SIGKILL));
+        assert!(c.try_wait().unwrap().is_none());
+        assert!(signal_if_same(&found.alive[0], libc::SIGKILL));
+        c.wait().unwrap();
+        assert_eq!(scan_system(&id).probe, Probe::Gone);
     }
 
     #[test]

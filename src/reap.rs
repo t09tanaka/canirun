@@ -9,6 +9,16 @@
 //! (quarantined, charge held) until the tree is known to be stopped or the
 //! machine rebooted.
 //!
+//! Descendants that left the process group (`setsid`, double fork) are found
+//! by the `CANIRUN_MANAGED_ID` marker in their environment ([`crate::marker`]):
+//! a started child is only free when the child, its group *and* every marked
+//! process are gone.
+//!
+//! A launch intent (the spawn may or may not have happened) is settled the
+//! same way: with no lease holder, no marked process, and enough time since
+//! the intent, nothing is running that the entry could be charging for. An
+//! unknown scan or a missing timestamp never releases it.
+//!
 //! When the boot id cannot be read (on either side) the reboot shortcut is
 //! off: only the process checks can release. Nothing is then released
 //! across a reboot by accident, and nothing leaks forever because the
@@ -24,6 +34,16 @@ pub enum Probe {
     Unknown,
 }
 
+/// Seconds after a launch intent before it may be settled as "no process
+/// is running", so a supervisor that died in the middle of its spawn is not
+/// mistaken for one that never spawned.
+pub const LAUNCH_INTENT_GRACE_SECS: i64 = 60;
+
+/// Has a launch intent aged enough to be settled? An unknown age has not.
+pub fn grace_passed(age_secs: Option<i64>) -> bool {
+    age_secs.is_some_and(|a| a >= LAUNCH_INTENT_GRACE_SECS)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarFacts {
     /// No sidecar file: a plain entry.
@@ -34,6 +54,8 @@ pub enum SidecarFacts {
         phase: Phase,
         /// Boot id recorded when the command was registered.
         boot_id: Option<String>,
+        /// Seconds since the launch intent was recorded, if it was.
+        launch_age_secs: Option<i64>,
     },
 }
 
@@ -46,6 +68,11 @@ pub struct Inputs {
     pub child: Probe,
     /// Anyone left in the recorded process group.
     pub group: Probe,
+    /// Any process still carrying the command's `CANIRUN_MANAGED_ID`.
+    pub marker: Probe,
+    /// A person asked to settle this entry (`canirun resolve`): the grace
+    /// period is skipped and an unreadable sidecar is judged by the scan.
+    pub manual: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,8 +96,14 @@ pub enum Release {
     BootChanged,
     /// Nothing was ever spawned.
     NeverLaunched,
-    /// The child and its process group are gone.
+    /// The child, its process group and every marked process are gone.
     Stopped,
+    /// A launch intent with no lease holder, no marked process, and past the
+    /// grace period (or settled by hand): nothing was started, or it is over.
+    LaunchSettled,
+    /// An unreadable sidecar, settled by hand after a scan found no marked
+    /// process.
+    NoMarkedProcess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,10 +122,21 @@ pub fn verdict(i: &Inputs) -> Verdict {
     if i.lease_held {
         return Verdict::Keep(Keep::LeaseHeld);
     }
-    let (phase, boot) = match &i.sidecar {
+    let (phase, boot, launch_age) = match &i.sidecar {
         SidecarFacts::Missing => return Verdict::Release(Release::Plain),
-        SidecarFacts::Corrupt => return Verdict::Keep(Keep::SidecarCorrupt),
-        SidecarFacts::Managed { phase, boot_id } => (*phase, boot_id),
+        SidecarFacts::Corrupt if !i.manual => return Verdict::Keep(Keep::SidecarCorrupt),
+        SidecarFacts::Corrupt => {
+            return match i.marker {
+                Probe::Alive => Verdict::Keep(Keep::DescendantsAlive),
+                Probe::Unknown => Verdict::Keep(Keep::ProbeUnknown),
+                Probe::Gone => Verdict::Release(Release::NoMarkedProcess),
+            }
+        }
+        SidecarFacts::Managed {
+            phase,
+            boot_id,
+            launch_age_secs,
+        } => (*phase, boot_id, *launch_age_secs),
     };
     if phase == Phase::Terminal {
         return Verdict::Release(Release::Terminal);
@@ -104,11 +148,22 @@ pub fn verdict(i: &Inputs) -> Verdict {
     }
     match phase {
         Phase::Registered => Verdict::Release(Release::NeverLaunched),
-        Phase::LaunchIntent => Verdict::Keep(Keep::LaunchUnknown),
+        // Too soon (or no timestamp) to tell "never spawned" from "spawned":
+        // the scan is not even needed.
+        Phase::LaunchIntent if !i.manual && !grace_passed(launch_age) => {
+            Verdict::Keep(Keep::LaunchUnknown)
+        }
+        Phase::LaunchIntent => match i.marker {
+            Probe::Alive => Verdict::Keep(Keep::DescendantsAlive),
+            Probe::Unknown => Verdict::Keep(Keep::ProbeUnknown),
+            Probe::Gone => Verdict::Release(Release::LaunchSettled),
+        },
         // Terminal returned above; ChildStarted is what is left.
-        Phase::ChildStarted | Phase::Terminal => match (i.child, i.group) {
-            (Probe::Alive, _) | (_, Probe::Alive) => Verdict::Keep(Keep::DescendantsAlive),
-            (Probe::Gone, Probe::Gone) => Verdict::Release(Release::Stopped),
+        Phase::ChildStarted | Phase::Terminal => match (i.child, i.group, i.marker) {
+            (Probe::Alive, _, _) | (_, Probe::Alive, _) | (_, _, Probe::Alive) => {
+                Verdict::Keep(Keep::DescendantsAlive)
+            }
+            (Probe::Gone, Probe::Gone, Probe::Gone) => Verdict::Release(Release::Stopped),
             _ => Verdict::Keep(Keep::ProbeUnknown),
         },
     }
@@ -125,6 +180,8 @@ mod tests {
             current_boot: Some("b1".into()),
             child: Probe::Gone,
             group: Probe::Gone,
+            marker: Probe::Gone,
+            manual: false,
         }
     }
 
@@ -132,6 +189,15 @@ mod tests {
         SidecarFacts::Managed {
             phase,
             boot_id: boot.map(String::from),
+            launch_age_secs: None,
+        }
+    }
+
+    fn launch(age: Option<i64>) -> SidecarFacts {
+        SidecarFacts::Managed {
+            phase: Phase::LaunchIntent,
+            boot_id: Some("b1".into()),
+            launch_age_secs: age,
         }
     }
 
@@ -177,6 +243,7 @@ mod tests {
             let mut i = base(managed(phase, Some("old")));
             i.child = Probe::Alive;
             i.group = Probe::Unknown;
+            i.marker = Probe::Alive;
             assert_eq!(verdict(&i), Verdict::Release(Release::BootChanged));
         }
     }
@@ -188,6 +255,9 @@ mod tests {
         i.sidecar = managed(Phase::LaunchIntent, Some("old"));
         i.current_boot = None;
         assert_eq!(verdict(&i), Verdict::Keep(Keep::LaunchUnknown));
+        // Equal ids are no change either.
+        i.current_boot = Some("old".into());
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::LaunchUnknown));
     }
 
     #[test]
@@ -197,9 +267,66 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_intent_without_a_child_identity_is_kept() {
-        let i = base(managed(Phase::LaunchIntent, Some("b1")));
-        assert_eq!(verdict(&i), Verdict::Keep(Keep::LaunchUnknown));
+    fn a_launch_intent_is_settled_only_by_a_clear_scan_after_the_grace() {
+        let at = |age: Option<i64>, marker: Probe| {
+            let mut i = base(launch(age));
+            i.marker = marker;
+            verdict(&i)
+        };
+        let settled = Verdict::Release(Release::LaunchSettled);
+        let young = Verdict::Keep(Keep::LaunchUnknown);
+        assert_eq!(at(Some(LAUNCH_INTENT_GRACE_SECS), Probe::Gone), settled);
+        assert_eq!(at(Some(LAUNCH_INTENT_GRACE_SECS + 1), Probe::Gone), settled);
+        // Too young, negative (clock skew) or unstamped: kept, whatever the
+        // scan says.
+        for marker in [Probe::Gone, Probe::Unknown, Probe::Alive] {
+            assert_eq!(at(Some(LAUNCH_INTENT_GRACE_SECS - 1), marker), young);
+            assert_eq!(at(Some(-5), marker), young);
+            assert_eq!(at(None, marker), young);
+        }
+        // Old enough, but the scan cannot say or finds a marked process.
+        assert_eq!(
+            at(Some(3600), Probe::Unknown),
+            Verdict::Keep(Keep::ProbeUnknown)
+        );
+        assert_eq!(
+            at(Some(3600), Probe::Alive),
+            Verdict::Keep(Keep::DescendantsAlive)
+        );
+    }
+
+    #[test]
+    fn the_grace_is_sixty_seconds() {
+        assert_eq!(LAUNCH_INTENT_GRACE_SECS, 60);
+        assert!(!grace_passed(None));
+        assert!(!grace_passed(Some(59)));
+        assert!(grace_passed(Some(60)));
+    }
+
+    #[test]
+    fn a_person_settling_a_launch_intent_skips_the_grace_not_the_scan() {
+        let mut i = base(launch(None));
+        i.manual = true;
+        assert_eq!(verdict(&i), Verdict::Release(Release::LaunchSettled));
+        i.marker = Probe::Unknown;
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::ProbeUnknown));
+        i.marker = Probe::Alive;
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::DescendantsAlive));
+    }
+
+    #[test]
+    fn an_unreadable_sidecar_is_settled_by_hand_only_after_a_clear_scan() {
+        let mut i = base(SidecarFacts::Corrupt);
+        i.manual = true;
+        assert_eq!(verdict(&i), Verdict::Release(Release::NoMarkedProcess));
+        i.marker = Probe::Unknown;
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::ProbeUnknown));
+        i.marker = Probe::Alive;
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::DescendantsAlive));
+        // The reaper alone never does.
+        i.manual = false;
+        i.marker = Probe::Gone;
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::SidecarCorrupt));
     }
 
     #[test]
@@ -207,18 +334,32 @@ mod tests {
         let started = managed(Phase::ChildStarted, Some("b1"));
         let mut i = base(started);
         assert_eq!(verdict(&i), Verdict::Release(Release::Stopped));
-        for (c, g, want) in [
-            (Probe::Alive, Probe::Gone, Keep::DescendantsAlive),
-            (Probe::Gone, Probe::Alive, Keep::DescendantsAlive),
-            (Probe::Alive, Probe::Unknown, Keep::DescendantsAlive),
-            (Probe::Unknown, Probe::Alive, Keep::DescendantsAlive),
-            (Probe::Unknown, Probe::Gone, Keep::ProbeUnknown),
-            (Probe::Gone, Probe::Unknown, Keep::ProbeUnknown),
-            (Probe::Unknown, Probe::Unknown, Keep::ProbeUnknown),
-        ] {
-            i.child = c;
-            i.group = g;
-            assert_eq!(verdict(&i), Verdict::Keep(want), "{c:?} {g:?}");
+        let probes = [Probe::Alive, Probe::Gone, Probe::Unknown];
+        for c in probes {
+            for g in probes {
+                for m in probes {
+                    i.child = c;
+                    i.group = g;
+                    i.marker = m;
+                    let want = if [c, g, m].contains(&Probe::Alive) {
+                        Verdict::Keep(Keep::DescendantsAlive)
+                    } else if [c, g, m].iter().all(|p| *p == Probe::Gone) {
+                        Verdict::Release(Release::Stopped)
+                    } else {
+                        Verdict::Keep(Keep::ProbeUnknown)
+                    };
+                    assert_eq!(verdict(&i), want, "{c:?} {g:?} {m:?}");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn a_marked_descendant_outside_the_group_keeps_the_entry() {
+        let mut i = base(managed(Phase::ChildStarted, Some("b1")));
+        i.marker = Probe::Alive;
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::DescendantsAlive));
+        i.marker = Probe::Unknown;
+        assert_eq!(verdict(&i), Verdict::Keep(Keep::ProbeUnknown));
     }
 }

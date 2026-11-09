@@ -17,7 +17,7 @@
 //! 4. [`finish`]: records the terminal outcome, *then* removes the ledger
 //!    entry and the lease.
 //! 5. [`record_measurement`]: applies the measurement to the history once
-//!    per measurement id. A failure here never re-runs anything.
+//!    per measurement id (the id is stored in the history record). A failure here never re-runs anything.
 //!
 //! # The sidecar
 //!
@@ -33,11 +33,18 @@
 //! The reaper releases a plain entry as soon as its lease is gone. A
 //! managed entry is released only when [`crate::reap::verdict`] says so:
 //! terminal recorded, machine rebooted, never launched, or the recorded
-//! child and its process group are gone. Otherwise it stays in the ledger
-//! with its charge (quarantine), and `inspect` reports it. Descendants that
-//! left the process group (`setsid`) are not tracked; an unreadable sidecar
-//! is never treated as free capacity. [`resolve`] is how a recovery process
-//! that has investigated settles a quarantined entry by hand.
+//! child, its process group and every process carrying the command's
+//! `CANIRUN_MANAGED_ID` are gone. Otherwise it stays in the ledger with its
+//! charge (quarantine), and `inspect` reports it. The marker finds
+//! descendants that left the process group (`setsid`, double fork); one that
+//! cleared its environment (`env -i`) is not found. A launch intent (the
+//! spawn may or may not have happened) is settled as "nothing is running"
+//! once the lease is gone, 60 seconds have passed and no marked process
+//! exists; an unknown scan or a missing timestamp never releases it. An
+//! unreadable sidecar is never treated as free capacity by the reaper.
+//! [`resolve_checked`] (`canirun resolve <id>`) settles a quarantined entry
+//! by hand after the same checks; [`resolve`] is for a recovery process that
+//! has investigated on its own.
 //!
 //! A `command_id` is single use: once its terminal outcome is recorded,
 //! registering it again returns [`Registration::AlreadyTerminal`] and never
@@ -215,8 +222,14 @@ pub struct Assessment {
 }
 
 /// Gather the facts for `id` and decide. Probes processes only for a
-/// managed entry with a started child and no lease holder. Writes nothing.
+/// managed entry with no lease holder, and only as far as the answer can
+/// still change. Writes nothing.
 pub fn assess(ctx: &Context, id: &str) -> Assessment {
+    assess_with(ctx, id, false)
+}
+
+/// [`assess`], for a person settling the entry by hand when `manual`.
+fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
     let lease_held = lock::lease_is_held(ctx, id);
     let sidecar = load_sidecar(ctx, id);
     let (facts, child) = match &sidecar {
@@ -226,23 +239,39 @@ pub fn assess(ctx: &Context, id: &str) -> Assessment {
             SidecarFacts::Managed {
                 phase: sc.phase,
                 boot_id: sc.boot_id.clone(),
+                launch_age_secs: sc
+                    .launch_intent_at
+                    .map(|t| (ctx.clock.now() - t).num_seconds()),
             },
             sc.child.clone(),
         ),
     };
-    let (mut child_probe, mut group_probe) = (Probe::Unknown, Probe::Unknown);
-    if !lease_held
-        && matches!(
-            facts,
+    let (mut child_probe, mut group_probe, mut marker) =
+        (Probe::Unknown, Probe::Unknown, Probe::Unknown);
+    if !lease_held {
+        match &facts {
             SidecarFacts::Managed {
                 phase: Phase::ChildStarted,
                 ..
+            } => {
+                if let Some(c) = &child {
+                    child_probe = process::probe_child(c);
+                    group_probe = process::probe_group(c.pgid);
+                }
+                // A live child or group already keeps the entry.
+                if child_probe != Probe::Alive && group_probe != Probe::Alive {
+                    marker = ctx.scan.scan(id).probe;
+                }
             }
-        )
-    {
-        if let Some(c) = &child {
-            child_probe = process::probe_child(c);
-            group_probe = process::probe_group(c.pgid);
+            SidecarFacts::Managed {
+                phase: Phase::LaunchIntent,
+                launch_age_secs,
+                ..
+            } if manual || reap::grace_passed(*launch_age_secs) => {
+                marker = ctx.scan.scan(id).probe;
+            }
+            SidecarFacts::Corrupt if manual => marker = ctx.scan.scan(id).probe,
+            _ => {}
         }
     }
     let verdict = reap::verdict(&reap::Inputs {
@@ -251,6 +280,8 @@ pub fn assess(ctx: &Context, id: &str) -> Assessment {
         current_boot: ctx.boot.boot_id(),
         child: child_probe,
         group: group_probe,
+        marker,
+        manual,
     });
     Assessment { verdict, sidecar }
 }
@@ -287,6 +318,8 @@ pub struct ManagedView {
     pub quarantined: bool,
     /// Empty when not quarantined.
     pub reason: String,
+    /// How to settle a quarantined entry; empty otherwise.
+    pub hint: String,
     pub child: Option<ChildIdentity>,
     pub boot_id: Option<String>,
 }
@@ -311,6 +344,11 @@ pub fn views(ctx: &Context, entries: &[Entry]) -> Vec<ManagedView> {
                 quarantined,
                 reason: if quarantined {
                     format!("{:?}", a.verdict)
+                } else {
+                    String::new()
+                },
+                hint: if quarantined {
+                    format!("canirun resolve {}", e.id)
                 } else {
                     String::new()
                 },
@@ -720,6 +758,7 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
         true,
         runner::Spawn {
             own_process_group: guard.managed,
+            marker_id: guard.managed.then_some(id),
             on_spawn: guard.managed.then_some(&on_spawn),
         },
     )?;
@@ -737,10 +776,11 @@ pub fn run_command(ctx: &Context, guard: &OwnerGuard, opts: &Opts, limits: Limit
 pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()> {
     let id = guard.id.clone();
     if guard.managed {
-        // Budget is only released once the whole process group is known to
-        // be stopped. `run_command` stops what it can; if members remain
-        // the entry is kept (the reaper then holds it as DescendantsAlive
-        // until they are gone) and nothing is recorded as terminal.
+        // Budget is only released once the whole process group, and anything
+        // marked that left it, is known to be stopped. `run_command` stops
+        // what it can; if members remain the entry is kept (the reaper then
+        // holds it as DescendantsAlive until they are gone) and nothing is
+        // recorded as terminal.
         if let Loaded::Ok(sc) = load_sidecar(ctx, &id) {
             if sc.phase != Phase::Terminal {
                 if let Some(pgid) = sc.child.as_ref().and_then(|c| c.pgid) {
@@ -750,6 +790,14 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
                              its budget until they stop"
                         )));
                     }
+                }
+                // Before the launch intent nothing can have been started.
+                if sc.phase != Phase::Registered && !runner::stop_marked(ctx, &id) {
+                    return Err(Error::Ledger(format!(
+                        "{id}: a process carrying {} still runs or could not be checked; \
+                         the entry keeps its budget (see `canirun resolve {id}`)",
+                        crate::marker::ENV_VAR
+                    )));
                 }
             }
         }
@@ -770,13 +818,20 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
 /// Settle a managed entry by hand after investigating it (for example a
 /// quarantined one whose sidecar is unreadable): record `kind` as its
 /// terminal outcome, rewriting the sidecar if need be, and release the
-/// entry. Refuses while the owner's lease is held.
+/// entry. Refuses while the owner's lease is held. It trusts the caller;
+/// [`resolve_checked`] is the version that checks first.
 pub fn resolve(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> Result<()> {
     check_id("command_id", id)?;
     let _guard = lock::ledger(ctx)?;
     if lock::lease_is_held(ctx, id) {
         return Err(Error::AlreadyOwned(format!("{id} still has a live owner")));
     }
+    settle_by_hand(ctx, id, kind, detail)
+}
+
+/// The body of [`resolve`], with the ledger lock held and the lease known
+/// to be free.
+fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> Result<()> {
     let at = ctx.clock.now();
     let terminal = TerminalRecord {
         kind,
@@ -819,6 +874,99 @@ pub fn resolve(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> Res
     Ok(())
 }
 
+/// What [`resolve_checked`] found and did, for `canirun resolve`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Resolution {
+    pub command_id: String,
+    /// The sidecar's stage; `None` when there is no readable sidecar.
+    pub phase: Option<Phase>,
+    pub lease_held: bool,
+    pub released: bool,
+    /// The decision, as the reaper names it.
+    pub verdict: String,
+    /// What was checked and what it showed.
+    pub checked: String,
+}
+
+fn describe(v: Verdict) -> &'static str {
+    use reap::{Keep, Release};
+    match v {
+        Verdict::Keep(Keep::LeaseHeld) => "its owner is still running",
+        Verdict::Keep(Keep::SidecarCorrupt) => "the sidecar is unreadable",
+        Verdict::Keep(Keep::LaunchUnknown) => "the launch intent is too recent to settle",
+        Verdict::Keep(Keep::DescendantsAlive) => {
+            "the child, its process group or a process carrying the id is still running"
+        }
+        Verdict::Keep(Keep::ProbeUnknown) => {
+            "a process could not be checked (the scan could not read every process of this user)"
+        }
+        Verdict::Release(Release::Plain) => "a plain entry whose owner is gone",
+        Verdict::Release(Release::Terminal) => "the outcome was already recorded",
+        Verdict::Release(Release::BootChanged) => "the machine rebooted since registration",
+        Verdict::Release(Release::NeverLaunched) => "nothing was ever started",
+        Verdict::Release(Release::Stopped) => {
+            "the child, its process group and every process carrying the id are gone"
+        }
+        Verdict::Release(Release::LaunchSettled) => {
+            "no process carries the id and the owner is gone: nothing is running"
+        }
+        Verdict::Release(Release::NoMarkedProcess) => {
+            "no process carries the id (the sidecar was unreadable, so nothing else could be checked)"
+        }
+    }
+}
+
+/// Settle the entry `id` by hand, but only if it is safe: the same decision
+/// as the reaper's, except that the launch-intent grace period is skipped
+/// and an unreadable sidecar is judged by the process scan alone. A held
+/// lease, a running child, group or marked process, or a scan that could not
+/// read every process all keep the entry. When released, the outcome is
+/// recorded as `Interrupted` with the reason.
+pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
+    check_id("command_id", id)?;
+    let _guard = lock::ledger(ctx)?;
+    let ledger = Ledger::load(&ctx.paths.ledger_file())?;
+    let a = assess_with(ctx, id, true);
+    let phase = match &a.sidecar {
+        Loaded::Ok(sc) => Some(sc.phase),
+        _ => None,
+    };
+    let mut r = Resolution {
+        command_id: id.to_string(),
+        phase,
+        lease_held: a.verdict == Verdict::Keep(reap::Keep::LeaseHeld),
+        released: false,
+        verdict: format!("{:?}", a.verdict),
+        checked: describe(a.verdict).to_string(),
+    };
+    if ledger.find(id).is_none() {
+        r.verdict = "NoEntry".into();
+        r.checked = "there is no ledger entry with this id".into();
+        return Ok(r);
+    }
+    let Verdict::Release(why) = a.verdict else {
+        return Ok(r);
+    };
+    let kind = match why {
+        reap::Release::NeverLaunched => TerminalKind::Abandoned,
+        _ => TerminalKind::Interrupted,
+    };
+    let detail = format!("settled by `canirun resolve`: {}", describe(a.verdict));
+    match (&a.sidecar, why) {
+        // Nothing to record: a plain entry, or an outcome already written.
+        (Loaded::Missing, _) | (_, reap::Release::Terminal) => {
+            let mut ledger = ledger;
+            if ledger.remove(id) {
+                ledger.save(&ctx.paths.ledger_file())?;
+            }
+            let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+        }
+        _ => settle_by_hand(ctx, id, kind, &detail)?,
+    }
+    r.released = true;
+    Ok(r)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Measured {
     Applied,
@@ -828,8 +976,10 @@ pub enum Measured {
 
 /// Apply `rec` to the history once per `measurement_id`. Safe to call
 /// again after a crash or a failure: a marker is written before the append
-/// and another after, and a half-done attempt is recognised by finding the
-/// identical record already in the history.
+/// and another after, and a half-done attempt is recognised by finding a
+/// history record that carries this measurement id. The id is written into
+/// the record; a record without one (older history) or with another id is
+/// never taken for this measurement, even when its content is identical.
 pub fn record_measurement(ctx: &Context, measurement_id: &str, rec: &Record) -> Result<Measured> {
     check_id("measurement_id", measurement_id)?;
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
@@ -843,7 +993,7 @@ pub fn record_measurement(ctx: &Context, measurement_id: &str, rec: &Record) -> 
     if pending.exists() {
         let present = history::read_all(ctx.paths.history_file())?
             .iter()
-            .any(|r| r == rec);
+            .any(|r| r.measurement_id.as_deref() == Some(measurement_id));
         if present {
             std::fs::write(&applied, b"")?;
             let _ = std::fs::remove_file(&pending);
@@ -851,7 +1001,11 @@ pub fn record_measurement(ctx: &Context, measurement_id: &str, rec: &Record) -> 
         }
     }
     std::fs::write(&pending, b"")?;
-    history::append(ctx.paths.history_file(), rec)?;
+    let rec = Record {
+        measurement_id: Some(measurement_id.to_string()),
+        ..rec.clone()
+    };
+    history::append(ctx.paths.history_file(), &rec)?;
     std::fs::write(&applied, b"")?;
     let _ = std::fs::remove_file(&pending);
     Ok(Measured::Applied)

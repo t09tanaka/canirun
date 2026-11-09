@@ -10,6 +10,8 @@
 //! hook of [`crate::exec::run_gated`] and kills by pid instead.)
 
 use crate::error::{Error, Result};
+use crate::marker;
+use crate::reap::Probe;
 use crate::Context;
 use std::path::Path;
 use std::process::Command;
@@ -37,10 +39,12 @@ pub struct Outcome {
     pub wall_secs: f64,
     pub cpu_secs: f64,
     pub max_rss_bytes: u64,
-    /// A managed command's process group still had members after the
-    /// leader was reaped and they were sent SIGTERM, then SIGKILL, and the
-    /// group did not empty in time. Always false for a plain run.
-    pub group_left: bool,
+    /// A managed command still had descendants after the leader was reaped
+    /// (in its process group, or carrying its `CANIRUN_MANAGED_ID`
+    /// elsewhere) and they were sent SIGTERM, then SIGKILL, but were not
+    /// confirmed gone in time or could not be checked. Always false for a
+    /// plain run.
+    pub descendants_left: bool,
 }
 
 /// Run `argv` with inherited stdio in our process group, in `cwd`, with
@@ -64,6 +68,10 @@ pub struct Spawn<'a> {
     /// the whole tree can be probed and stopped by group). Off for a plain
     /// `exec`, where terminal signals must keep reaching the child.
     pub own_process_group: bool,
+    /// Put `CANIRUN_MANAGED_ID=<id>` in the child's environment, and after
+    /// the leader exits also stop any process still carrying it, even one
+    /// that left the process group.
+    pub marker_id: Option<&'a str>,
     /// Called with the child's pid right after the spawn.
     pub on_spawn: Option<&'a dyn Fn(u32)>,
 }
@@ -73,6 +81,15 @@ pub struct Spawn<'a> {
 /// after SIGKILL.
 const GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 const GROUP_KILL_WAIT: Duration = Duration::from_secs(3);
+
+/// How often the marker scan is repeated while waiting for marked
+/// processes to exit.
+const MARKER_POLL: Duration = Duration::from_millis(100);
+/// How long to wait for marked processes to be gone after SIGKILL; a scan
+/// reads every process of the user, so it is slower than a group probe.
+const MARKER_KILL_WAIT: Duration = Duration::from_secs(8);
+/// Rescans before an unknown answer is believed.
+const UNKNOWN_RETRIES: usize = 3;
 
 fn group_empty(pgid: libc::pid_t) -> bool {
     crate::process::probe_group(Some(pgid)) == crate::reap::Probe::Gone
@@ -105,6 +122,46 @@ fn clear_group(ctx: &Context, pgid: libc::pid_t) -> bool {
     false
 }
 
+/// Stop every process still carrying `CANIRUN_MANAGED_ID=<id>`: SIGTERM,
+/// a grace, then SIGKILL, signalling only a pid that is still the process
+/// that was seen. True only when a scan then finds none and every process
+/// could be read.
+pub(crate) fn stop_marked(ctx: &Context, id: &str) -> bool {
+    // A process that exits while the scan reads it can make one scan
+    // "unknown"; only an answer that stays unknown counts.
+    let mut scan = ctx.scan.scan(id);
+    for _ in 0..UNKNOWN_RETRIES {
+        if scan.probe != Probe::Unknown {
+            break;
+        }
+        ctx.clock.sleep(MARKER_POLL);
+        scan = ctx.scan.scan(id);
+    }
+    if scan.probe != Probe::Alive {
+        return scan.probe == Probe::Gone;
+    }
+    for (sig, wait) in [
+        (libc::SIGTERM, GROUP_TERM_GRACE),
+        (libc::SIGKILL, MARKER_KILL_WAIT),
+    ] {
+        for p in &scan.alive {
+            crate::process::signal_if_same(p, sig);
+        }
+        let until = ctx.clock.monotonic() + wait;
+        loop {
+            ctx.clock.sleep(MARKER_POLL);
+            scan = ctx.scan.scan(id);
+            if scan.probe != Probe::Alive {
+                return scan.probe == Probe::Gone;
+            }
+            if ctx.clock.monotonic() >= until {
+                break;
+            }
+        }
+    }
+    false
+}
+
 /// [`run`] with spawn options.
 pub fn run_with(
     ctx: &Context,
@@ -123,6 +180,9 @@ pub fn run_with(
     cmd.args(args).current_dir(cwd).env("CANIRUN_LEASE", lease);
     if spawn.own_process_group {
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    }
+    if let Some(id) = spawn.marker_id {
+        cmd.env(marker::ENV_VAR, id);
     }
     let child = cmd
         .spawn()
@@ -170,8 +230,13 @@ pub fn run_with(
     }
     let wall_secs = (ctx.clock.monotonic().saturating_sub(start)).as_secs_f64();
     // The leader is gone, but a managed command's descendants may not be:
-    // the budget is only free once the whole group is confirmed stopped.
-    let group_left = spawn.own_process_group && !clear_group(ctx, pid);
+    // the budget is only free once the whole group, and anything marked
+    // that left it, is confirmed stopped.
+    let descendants_left = spawn.own_process_group && {
+        let group = clear_group(ctx, pid);
+        let marked = spawn.marker_id.is_none_or(|id| stop_marked(ctx, id));
+        !(group && marked)
+    };
 
     let exit = if libc::WIFEXITED(status) {
         Exit::Code(libc::WEXITSTATUS(status))
@@ -187,7 +252,7 @@ pub fn run_with(
         wall_secs,
         cpu_secs,
         max_rss_bytes,
-        group_left,
+        descendants_left,
     })
 }
 

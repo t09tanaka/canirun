@@ -138,6 +138,41 @@ impl BootIdProvider for FixedBoot {
     }
 }
 
+/// Where the answer to "is anything still running with this managed id in
+/// its environment?" comes from (see [`crate::marker`]).
+pub trait ProcessScan: Send + Sync {
+    fn scan(&self, id: &str) -> crate::marker::Scan;
+}
+
+/// This machine's processes of the current user.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemScan;
+
+impl ProcessScan for SystemScan {
+    fn scan(&self, id: &str) -> crate::marker::Scan {
+        crate::process::scan_system(id)
+    }
+}
+
+/// Always the same answer. For tests.
+#[derive(Debug, Clone)]
+pub struct FixedScan(pub crate::marker::Scan);
+
+impl FixedScan {
+    pub fn probe(probe: crate::reap::Probe) -> Self {
+        FixedScan(crate::marker::Scan {
+            probe,
+            alive: Vec::new(),
+        })
+    }
+}
+
+impl ProcessScan for FixedScan {
+    fn scan(&self, _id: &str) -> crate::marker::Scan {
+        self.0.clone()
+    }
+}
+
 /// Receives the stop signals meant for one gated run and decides how the
 /// process reacts to them. A run goes through three phases, and the
 /// supervisor can change its signal dispositions at each.
@@ -179,6 +214,7 @@ pub struct Context {
     pub live: Arc<dyn LiveProvider>,
     pub supervisor: Arc<dyn Supervisor>,
     pub boot: Arc<dyn BootIdProvider>,
+    pub scan: Arc<dyn ProcessScan>,
     /// Temp-directory prefixes recognised when normalising a command into
     /// its history key (the CLI passes `$TMPDIR`).
     pub tmp_roots: Vec<String>,
@@ -195,6 +231,7 @@ impl Context {
             live: Arc::new(SystemLive),
             supervisor: Arc::new(NoSupervisor),
             boot: Arc::new(SystemBoot),
+            scan: Arc::new(SystemScan),
             tmp_roots: Vec::new(),
             ledger_lock_timeout: crate::lock::LEDGER_LOCK_TIMEOUT,
         }
@@ -217,6 +254,11 @@ impl Context {
 
     pub fn with_boot(mut self, boot: Arc<dyn BootIdProvider>) -> Self {
         self.boot = boot;
+        self
+    }
+
+    pub fn with_scan(mut self, scan: Arc<dyn ProcessScan>) -> Self {
+        self.scan = scan;
         self
     }
 

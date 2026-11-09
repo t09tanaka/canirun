@@ -45,6 +45,7 @@ pub mod ledger;
 pub mod live;
 pub mod lock;
 pub mod managed;
+pub mod marker;
 pub mod paths;
 pub mod process;
 pub mod reap;
@@ -54,7 +55,7 @@ pub mod usage;
 pub mod weight;
 
 pub use context::{
-    BootIdProvider, Clock, Context, FakeClock, FixedBoot, FixedLive, LiveProvider, NoSupervisor,
-    Supervisor, SystemBoot, SystemClock, SystemLive,
+    BootIdProvider, Clock, Context, FakeClock, FixedBoot, FixedLive, FixedScan, LiveProvider,
+    NoSupervisor, ProcessScan, Supervisor, SystemBoot, SystemClock, SystemLive, SystemScan,
 };
 pub use paths::Paths;

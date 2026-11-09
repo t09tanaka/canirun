@@ -73,6 +73,13 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Release a ledger entry whose owner is gone, after checking that
+    /// nothing it started is still running
+    Resolve {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the effective configuration
     Config {
         /// Print only the config file path
@@ -163,6 +170,7 @@ fn run(cli: Cli) -> error::Result<i32> {
             key,
             command,
         } => cmd::estimate::run(&ctx, &cfg, opts(weight, front, key, command)?, json),
+        Cmd::Resolve { id, json } => cmd::resolve::run(&ctx, &id, json),
         Cmd::Config { path } => cmd::config::run(&ctx, &cfg, path),
         Cmd::Gc => cmd::gc::run(&ctx, &cfg),
         Cmd::Submit {

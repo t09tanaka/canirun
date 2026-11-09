@@ -71,6 +71,7 @@ fn record(key: &str, wall: f64) -> Record {
         exit_code: 0,
         weight_used: 1,
         contended: false,
+        measurement_id: None,
     }
 }
 

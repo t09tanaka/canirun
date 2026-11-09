@@ -260,6 +260,43 @@ The same machinery is available to Rust callers as `canirun::inspect` and
 delays and shared setup, plus an overlay of demands the ledger does not
 show yet). The crate is 0.x and that API is not stable.
 
+### `canirun resolve <id> [--json]`
+
+A managed command (one driven through `canirun::managed` by another
+program) keeps its budget while its supervisor is gone, until nothing it
+started is still running. `status` lists such entries as `held, owner gone`,
+and `inspect` marks them `quarantined` with a `hint`. Most are released by
+themselves once their processes stop. Two kinds are not: an entry whose
+sidecar cannot be read, and a launch intent whose timestamp is missing. For
+those, `canirun resolve <id>` runs the same checks on demand: the owner's
+lease must be gone, and the child, its process group and every process of
+yours carrying `CANIRUN_MANAGED_ID=<id>` must be gone, with every process
+readable. It prints the entry's state, what was checked and the result, and
+records the outcome as `interrupted`. Exit 0 means released, 1 means kept
+(still charged), 2 an error. It never kills anything.
+
+A launch intent (the supervisor died around the spawn, so it is unknown
+whether a child exists) is released by the reaper itself once the lease is
+gone, at least 60 seconds have passed since the intent and no process
+carries the id. An unknown scan, or no timestamp, keeps it: time alone never
+releases it. `resolve` skips the 60 seconds.
+
+What this cannot see, and the safe-side behaviour that results:
+
+- A descendant that cleared its environment (`env -i ...`) loses the
+  marker and is not found once it has left the process group.
+- On macOS, Apple's own binaries (`/bin/sh`, `sleep`, ...) do not show their
+  environment to other processes, so such a descendant is not found either
+  (node, python, Rust or Go binaries and the like are). On Linux every
+  process of the user is readable.
+- The process group check does not compare start times, so a pid that was
+  reused by an unrelated process in the same group id can keep an entry held
+  for a while. That errs on the side of keeping the budget.
+- The marker is the id alone. Two canirun state directories that use the
+  same command id can hold each other's entries; that is also the safe side.
+- Only processes of the same user are scanned. If one of them cannot be read
+  the scan is "unknown" and nothing is released on its account.
+
 ### `canirun config [--path]` and `canirun gc`
 
 `config` prints the effective configuration (defaults merged with the

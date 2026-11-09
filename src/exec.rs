@@ -307,6 +307,7 @@ pub fn run_gated(
             exit_code: out.exit.code(),
             weight_used: plan.weight,
             contended,
+            measurement_id: None,
         },
     );
     Ok(Gated::Finished(out.exit))

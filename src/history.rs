@@ -28,6 +28,10 @@ pub struct Record {
     /// CPU was above the threshold when the run started.
     #[serde(default)]
     pub contended: bool,
+    /// Set by `managed::record_measurement`: the id that applied this
+    /// record. History written before it existed has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_id: Option<String>,
 }
 
 impl Record {
@@ -130,6 +134,7 @@ mod tests {
             exit_code: 0,
             weight_used: 1,
             contended: false,
+            measurement_id: None,
         }
     }
 
@@ -144,6 +149,25 @@ mod tests {
         assert_eq!(a.len(), 2);
         assert_eq!(a[1].wall_secs, 3.0);
         assert!(read_all(&d.path().join("missing")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_without_a_measurement_id_still_reads_and_none_is_not_written() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("history.jsonl");
+        let old = r#"{"key":"k","repo":"r","argv":"x","started_at":"2026-01-01T00:00:00Z","wall_secs":1.0,"cpu_secs":1.0,"max_rss_bytes":1,"exit_code":0,"weight_used":1}"#;
+        std::fs::write(&p, format!("{old}\n")).unwrap();
+        let all = read_all(&p).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].measurement_id, None);
+        append(&p, &rec("a", 1.0)).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("measurement_id"), "{text}");
+        let mut with_id = rec("b", 1.0);
+        with_id.measurement_id = Some("m-1".into());
+        append(&p, &with_id).unwrap();
+        let back = read_all(&p).unwrap();
+        assert_eq!(back[2].measurement_id.as_deref(), Some("m-1"));
     }
 
     #[test]

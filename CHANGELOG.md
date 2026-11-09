@@ -21,6 +21,24 @@ the minor version).
   group are gone, or the boot id changed. An unreadable sidecar is never
   treated as free. `inspect` lists such entries under `managed`. Plain
   `exec` entries are reaped as before.
+- Managed commands carry `CANIRUN_MANAGED_ID=<id>` in their environment.
+  After the leader exits, and before a managed entry is released, every
+  process of the user still carrying the id is stopped (SIGTERM, then
+  SIGKILL, only when pid and start time still match) and the entry is kept
+  until none is left. This covers descendants that left the process group
+  (`setsid`, double fork); one that cleared its environment is not found.
+  A scan that cannot read every process never releases anything.
+- A launch intent no longer blocks the shared budget forever: with the
+  owner's lease gone, 60 seconds since the intent and no marked process, the
+  reaper settles it as `Interrupted`. A missing timestamp or an unknown scan
+  keeps it.
+- `canirun resolve <id> [--json]` releases an entry whose owner is gone
+  after the same checks, and says what it checked. `status` lists held
+  entries and `inspect` adds a `hint` to them.
+- `history.jsonl` records written by `managed::record_measurement` carry a
+  `measurement_id` (optional; older history still reads). A repeated
+  measurement is a duplicate only when its id is in the history, never
+  because another record has the same content.
 - `canirun inspect --json`: a read-only, versioned snapshot of the ledger,
   limits, live metrics and referenced history, with snapshot and policy
   digests. It never reaps or writes; entries without a held lease are

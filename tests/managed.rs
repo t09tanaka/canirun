@@ -8,8 +8,9 @@ use canirun::exec::{self, Gated, Hooks, Opts};
 use canirun::history::{self, Record};
 use canirun::ledger::Ledger;
 use canirun::managed::{self, CommandSpec, Loaded, Measured, Registration, TerminalKind, TryAdmit};
+use canirun::reap::Probe;
 use canirun::receipt::Phase;
-use canirun::{lock, Context, FixedBoot, FixedLive, Paths, Supervisor};
+use canirun::{lock, Context, FakeClock, FixedBoot, FixedLive, FixedScan, Paths, Supervisor};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -208,6 +209,7 @@ fn a_full_run_records_terminal_before_releasing_and_measures_once() {
         exit_code: 3,
         weight_used: 1,
         contended: ran.contended,
+        measurement_id: None,
     };
     assert_eq!(
         managed::record_measurement(&ctx, "m-1", &rec).unwrap(),
@@ -249,11 +251,16 @@ fn a_measurement_interrupted_after_the_append_is_not_applied_twice() {
         exit_code: 0,
         weight_used: 1,
         contended: false,
+        measurement_id: None,
     };
     // A crash after the append, before the "applied" marker.
     std::fs::create_dir_all(ctx.paths.measurements_dir()).unwrap();
     std::fs::write(ctx.paths.measurements_dir().join("m.pending"), b"").unwrap();
-    history::append(ctx.paths.history_file(), &rec).unwrap();
+    let with_id = Record {
+        measurement_id: Some("m".into()),
+        ..rec.clone()
+    };
+    history::append(ctx.paths.history_file(), &with_id).unwrap();
     assert_eq!(
         managed::record_measurement(&ctx, "m", &rec).unwrap(),
         Measured::Duplicate
@@ -275,6 +282,56 @@ fn a_measurement_interrupted_after_the_append_is_not_applied_twice() {
     assert_eq!(
         history::read_all(ctx.paths.history_file()).unwrap().len(),
         2
+    );
+}
+
+#[test]
+fn an_identical_record_under_another_id_or_none_is_not_this_measurement() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let rec = Record {
+        key: "k".into(),
+        repo: String::new(),
+        subdir: String::new(),
+        argv: "x".into(),
+        key_argv: String::new(),
+        started_at: chrono::Utc::now(),
+        wall_secs: 1.5,
+        cpu_secs: 1.0,
+        max_rss_bytes: 10,
+        exit_code: 0,
+        weight_used: 1,
+        contended: false,
+        measurement_id: None,
+    };
+    // Two identical records already there: one from another measurement,
+    // one from history written before measurement ids existed.
+    history::append(
+        ctx.paths.history_file(),
+        &Record {
+            measurement_id: Some("other".into()),
+            ..rec.clone()
+        },
+    )
+    .unwrap();
+    history::append(ctx.paths.history_file(), &rec).unwrap();
+    // A crashed attempt of "m" that never reached the append.
+    std::fs::create_dir_all(ctx.paths.measurements_dir()).unwrap();
+    std::fs::write(ctx.paths.measurements_dir().join("m.pending"), b"").unwrap();
+    assert_eq!(
+        managed::record_measurement(&ctx, "m", &rec).unwrap(),
+        Measured::Applied
+    );
+    let all = history::read_all(ctx.paths.history_file()).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[2].measurement_id.as_deref(), Some("m"));
+    assert_eq!(
+        managed::record_measurement(&ctx, "m", &rec).unwrap(),
+        Measured::Duplicate
+    );
+    assert_eq!(
+        history::read_all(ctx.paths.history_file()).unwrap().len(),
+        3
     );
 }
 
@@ -616,6 +673,40 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     assert_eq!(status["entries"][0]["id"], "c", "still charged");
     assert!(status.get("managed").is_none());
     assert!(status["entries"][0].get("managed").is_none());
+    assert_eq!(insp["managed"][0]["hint"], "canirun resolve c");
+    let text = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_canirun"))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8(o.stdout).unwrap(),
+        )
+    };
+    let (_, shown) = text(&["status"]);
+    assert!(shown.contains("held, owner gone (1)"), "{shown}");
+    assert!(shown.contains("canirun resolve c"), "{shown}");
+    // Nothing runs, so `resolve` releases the launch intent and says why.
+    let (code, said) = text(&["resolve", "c"]);
+    assert_eq!(code, 0, "{said}");
+    assert!(
+        said.contains("checked:") && said.contains("released"),
+        "{said}"
+    );
+    let (code, said) = text(&["resolve", "c"]);
+    assert_eq!(code, 1, "{said}");
+    assert!(said.contains("no ledger entry"), "{said}");
+    assert!(ledger(&lib).find("c").is_none());
+    assert_eq!(
+        sidecar(&lib, "c").terminal.unwrap().kind,
+        TerminalKind::Interrupted
+    );
 }
 
 fn run_to_end(
@@ -636,7 +727,7 @@ fn a_clean_exit_stops_the_leftover_group_before_the_budget_is_released() {
     let s = spec(dir.path(), "bg", "d", &["sh", "-c", "sleep 20 & exit 0"]);
     let (ran, guard) = run_to_end(&ctx, &cfg, &s);
     assert_eq!(ran.outcome.exit.code(), 0);
-    assert!(!ran.outcome.group_left);
+    assert!(!ran.outcome.descendants_left);
     let pgid = sidecar(&ctx, "bg").child.unwrap().pgid.unwrap();
     assert_eq!(
         unsafe { libc::killpg(pgid, 0) },
@@ -723,4 +814,278 @@ fn finishing_a_terminal_sidecar_keeps_what_was_recorded() {
         TerminalKind::Exited { code: 0 }
     );
     assert!(ledger(&ctx).find("t").is_none());
+}
+
+fn ctx_with_scan(dir: &Path, clock: Arc<FakeClock>, scan: Probe) -> Context {
+    ctx(dir)
+        .with_clock(clock)
+        .with_scan(Arc::new(FixedScan::probe(scan)))
+}
+
+/// A registered entry whose supervisor died at its launch intent, `age`
+/// seconds ago (never, when `None`).
+fn dead_at_launch(dir: &Path, clock: &Arc<FakeClock>, id: &str, intent: bool) {
+    let c = ctx_with_scan(dir, clock.clone(), Probe::Gone);
+    let (_, g) = registered(
+        managed::register(&c, &Config::default(), &spec(dir, id, "d", &["true"])).unwrap(),
+    );
+    let mut sc = sidecar(&c, id);
+    sc.phase = Phase::LaunchIntent;
+    sc.launch_intent_at = intent.then(|| c.clock.now());
+    managed::write_sidecar(&c, &sc).unwrap();
+    drop(g);
+}
+
+#[test]
+fn a_launch_intent_is_released_only_after_the_grace_with_a_clear_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_at_launch(dir.path(), &clock, "l", true);
+    let with = |scan| ctx_with_scan(dir.path(), clock.clone(), scan);
+    assert!(reaped(&with(Probe::Gone)).find("l").is_some(), "too recent");
+    clock.advance(Duration::from_secs(59));
+    assert!(reaped(&with(Probe::Gone)).find("l").is_some(), "59s");
+    clock.advance(Duration::from_secs(2));
+    // Old enough, but the scan cannot say or finds a marked process.
+    assert!(reaped(&with(Probe::Unknown)).find("l").is_some());
+    assert!(reaped(&with(Probe::Alive)).find("l").is_some());
+    let v = managed::views(&with(Probe::Unknown), &ledger(&with(Probe::Gone)).entries);
+    assert!(
+        v[0].quarantined && v[0].reason.contains("ProbeUnknown"),
+        "{v:?}"
+    );
+    assert_eq!(v[0].hint, "canirun resolve l");
+    // Clear: nothing is running, so it is settled and recorded.
+    assert!(reaped(&with(Probe::Gone)).find("l").is_none());
+    let sc = sidecar(&with(Probe::Gone), "l");
+    assert_eq!(sc.phase, Phase::Terminal);
+    let t = sc.terminal.unwrap();
+    assert_eq!(t.kind, TerminalKind::Interrupted);
+    assert!(t.detail.unwrap().contains("LaunchSettled"));
+}
+
+#[test]
+fn time_alone_never_releases_a_launch_intent_without_a_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_at_launch(dir.path(), &clock, "n", false);
+    clock.advance(Duration::from_secs(86_400));
+    let c = ctx_with_scan(dir.path(), clock, Probe::Gone);
+    assert!(reaped(&c).find("n").is_some());
+}
+
+#[test]
+fn resolve_checked_releases_only_what_the_checks_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_at_launch(dir.path(), &clock, "r", false);
+    let with = |scan| ctx_with_scan(dir.path(), clock.clone(), scan);
+    let unknown = managed::resolve_checked(&with(Probe::Unknown), "r").unwrap();
+    assert!(!unknown.released && unknown.verdict.contains("ProbeUnknown"));
+    let alive = managed::resolve_checked(&with(Probe::Alive), "r").unwrap();
+    assert!(!alive.released && alive.verdict.contains("DescendantsAlive"));
+    assert!(ledger(&with(Probe::Gone)).find("r").is_some());
+    // No timestamp and a clear scan: a person may settle it at once.
+    let done = managed::resolve_checked(&with(Probe::Gone), "r").unwrap();
+    assert!(done.released, "{done:?}");
+    assert_eq!(done.phase, Some(Phase::LaunchIntent));
+    assert!(ledger(&with(Probe::Gone)).find("r").is_none());
+    let sc = sidecar(&with(Probe::Gone), "r");
+    assert_eq!(
+        sc.terminal.as_ref().unwrap().kind,
+        TerminalKind::Interrupted
+    );
+    assert!(sc
+        .terminal
+        .unwrap()
+        .detail
+        .unwrap()
+        .contains("canirun resolve"));
+    let again = managed::resolve_checked(&with(Probe::Gone), "r").unwrap();
+    assert!(!again.released && again.verdict == "NoEntry");
+}
+
+#[test]
+fn resolve_checked_judges_an_unreadable_sidecar_by_the_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    let c = ctx_with_scan(dir.path(), clock.clone(), Probe::Gone);
+    let (_, g) = registered(
+        managed::register(
+            &c,
+            &Config::default(),
+            &spec(dir.path(), "u", "d", &["true"]),
+        )
+        .unwrap(),
+    );
+    std::fs::write(c.paths.managed_file("u"), b"{ not json").unwrap();
+    // A live owner is never touched.
+    let held = managed::resolve_checked(&c, "u").unwrap();
+    assert!(!held.released && held.lease_held);
+    drop(g);
+    let alive = ctx_with_scan(dir.path(), clock, Probe::Alive);
+    assert!(!managed::resolve_checked(&alive, "u").unwrap().released);
+    assert!(ledger(&c).find("u").is_some());
+    let done = managed::resolve_checked(&c, "u").unwrap();
+    assert!(done.released && done.phase.is_none());
+    assert_eq!(sidecar(&c, "u").phase, Phase::Terminal);
+    assert!(ledger(&c).find("u").is_none());
+}
+
+#[test]
+fn resolve_checked_keeps_the_recorded_outcome_of_a_terminal_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "term", "d", &["true"]);
+    let (_, g) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    let mut sc = sidecar(&ctx, "term");
+    sc.phase = Phase::Terminal;
+    sc.terminal = Some(managed::TerminalRecord {
+        kind: TerminalKind::Exited { code: 7 },
+        at: chrono::Utc::now(),
+        detail: None,
+    });
+    managed::write_sidecar(&ctx, &sc).unwrap();
+    drop(g);
+    assert!(managed::resolve_checked(&ctx, "term").unwrap().released);
+    assert_eq!(
+        sidecar(&ctx, "term").terminal.unwrap().kind,
+        TerminalKind::Exited { code: 7 }
+    );
+    assert!(ledger(&ctx).find("term").is_none());
+}
+
+#[test]
+fn a_managed_command_carries_its_id_in_its_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let out = dir.path().join("id.txt");
+    let script = format!("printf %s \"$CANIRUN_MANAGED_ID\" > {}", out.display());
+    let s = spec(dir.path(), "env-id", "d", &["sh", "-c", &script]);
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    assert!(!ran.outcome.descendants_left);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "env-id");
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+}
+
+/// Runs only when re-executed as a helper by the tests below (the test
+/// executable is used because, on macOS, Apple's own binaries do not show
+/// their environment, so a `sleep` could not be found by its marker).
+/// `escape` starts a `sleep` role in a session of its own and exits at once;
+/// `sleep` blocks, optionally ignoring SIGTERM, and records its pid.
+// The escaped child is meant to be orphaned, not waited for.
+#[allow(clippy::zombie_processes)]
+#[test]
+fn helper_entry() {
+    let Ok(role) = std::env::var("CANIRUN_TEST_ROLE") else {
+        return;
+    };
+    let pidfile = std::env::var_os("CANIRUN_TEST_PIDFILE");
+    if role == "escape" {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", "helper_entry", "--nocapture"])
+            .env("CANIRUN_TEST_ROLE", "sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut c, || {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        c.spawn().unwrap();
+    } else {
+        if std::env::var_os("CANIRUN_TEST_IGNORE_TERM").is_some() {
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+        }
+        if let Some(f) = pidfile {
+            std::fs::write(f, std::process::id().to_string()).unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn helper_command(role: &str, pidfile: &Path, ignore_term: bool) -> Vec<String> {
+    let mut v = vec!["env".to_string(), format!("CANIRUN_TEST_ROLE={role}")];
+    v.push(format!("CANIRUN_TEST_PIDFILE={}", pidfile.display()));
+    if ignore_term {
+        v.push("CANIRUN_TEST_IGNORE_TERM=1".into());
+    }
+    v.push(std::env::current_exe().unwrap().display().to_string());
+    v.extend(["--exact", "helper_entry", "--nocapture"].map(String::from));
+    v
+}
+
+fn pid_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn escaped_case(id: &str, ignore_term: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let pidfile = dir.path().join("pid");
+    let argv = helper_command("escape", &pidfile, ignore_term);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let s = spec(dir.path(), id, "d", &argv);
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    assert!(until(5, || pidfile.exists()));
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(ran.outcome.exit.code(), 0);
+    assert!(
+        !ran.outcome.descendants_left,
+        "the escaped sleeper survived"
+    );
+    assert!(
+        until(5, || !pid_alive(pid)),
+        "the sleeper outside the group was left running"
+    );
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    assert!(ledger(&ctx).find(id).is_none());
+}
+
+#[test]
+fn a_descendant_that_left_the_process_group_is_stopped_before_release() {
+    escaped_case("escaped-term", false);
+}
+
+#[test]
+fn a_descendant_that_ignores_sigterm_is_killed() {
+    escaped_case("escaped-kill", true);
+}
+
+#[test]
+fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let cfg = Config::default();
+    let s = spec(dir.path(), "esc-held", "d", &["true"]);
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    // A stand-in survivor outside the group, marked like the real thing.
+    let mut survivor = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "helper_entry", "--nocapture"])
+        .env("CANIRUN_TEST_ROLE", "sleep")
+        .env(canirun::marker::ENV_VAR, "esc-held")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(guard);
+    assert!(
+        reaped(&ctx).find("esc-held").is_some(),
+        "released too early"
+    );
+    let v = managed::views(&ctx, &ledger(&ctx).entries);
+    assert!(v[0].reason.contains("DescendantsAlive"), "{v:?}");
+    let r = managed::resolve_checked(&ctx, "esc-held").unwrap();
+    assert!(!r.released);
+    let _ = ran;
+    survivor.kill().unwrap();
+    survivor.wait().unwrap();
+    assert!(until(20, || reaped(&ctx).find("esc-held").is_none()));
 }
