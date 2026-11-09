@@ -61,6 +61,10 @@ impl Supervisor for ProcessSignals {
 /// Terminate ourselves the way the child did, so the calling shell sees
 /// the same signal death. Falls back to exiting 128+N.
 pub fn reraise(sig: i32) -> ! {
+    // Only now, with the outcome recorded, do the handled signals go back
+    // to their defaults: earlier, a second SIGTERM would kill the process
+    // before the exit file was written.
+    ProcessSignals.finished();
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);

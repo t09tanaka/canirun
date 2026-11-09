@@ -98,7 +98,11 @@ pub struct Snapshot {
 pub fn snapshot(ctx: &Context) -> Result<Snapshot> {
     let Some(_guard) = try_ledger(ctx)? else {
         let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
-        ledger.entries.retain(|e| lease_is_held(ctx, &e.id));
+        // Without the lock nothing is reaped: a managed entry is kept
+        // whatever its lease says (the reaper decides under the lock).
+        ledger
+            .entries
+            .retain(|e| lease_is_held(ctx, &e.id) || ctx.paths.managed_file(&e.id).exists());
         return Ok(Snapshot {
             ledger,
             locked: false,
@@ -179,10 +183,22 @@ pub fn snapshot_read_only(ctx: &Context) -> Result<ReadOnlySnapshot> {
 /// inherit it.
 pub fn take_lease(ctx: &Context, id: &str) -> Result<Lock> {
     let path = ctx.paths.lease_file(id);
+    try_take_lease(ctx, id)?
+        .ok_or_else(|| Error::Ledger(format!("lease {} already held", path.display())))
+}
+
+/// [`take_lease`], but `None` when another process holds it.
+pub fn try_take_lease(ctx: &Context, id: &str) -> Result<Option<Lock>> {
+    let path = ctx.paths.lease_file(id);
     let file = open_lock_file(&path)?;
-    file.try_lock_exclusive()
-        .map_err(|e| Error::Ledger(format!("lease {} already held: {e}", path.display())))?;
-    Ok(Lock { file })
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(Lock { file })),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(Error::Ledger(format!(
+            "lease {} cannot be locked: {e}",
+            path.display()
+        ))),
+    }
 }
 
 /// True when some process currently holds the lease lock for `id`.
@@ -221,15 +237,25 @@ pub fn is_held(path: &Path) -> bool {
     }
 }
 
-/// Remove ledger entries whose lease is not held, and their lease files.
+/// Remove ledger entries whose owner is gone, and their lease files.
 /// Returns the ids removed. Caller holds the ledger lock.
+///
+/// A plain entry is gone when its lease is not held. A managed entry (one
+/// with a sidecar, see [`crate::managed`]) also needs its child process
+/// tree to be known stopped, or the machine to have rebooted; until then it
+/// stays, charge and all.
 pub fn reap_dead(ctx: &Context, ledger: &mut Ledger) -> Vec<String> {
-    let dead: Vec<String> = ledger
-        .entries
-        .iter()
-        .filter(|e| !lease_is_held(ctx, &e.id))
-        .map(|e| e.id.clone())
-        .collect();
+    let mut dead: Vec<String> = Vec::new();
+    for e in &ledger.entries {
+        if lease_is_held(ctx, &e.id) {
+            continue;
+        }
+        let a = crate::managed::assess(ctx, &e.id);
+        if a.verdict.is_release() {
+            crate::managed::settle_released(ctx, &a);
+            dead.push(e.id.clone());
+        }
+    }
     for id in &dead {
         ledger.remove(id);
         let _ = std::fs::remove_file(ctx.paths.lease_file(id));

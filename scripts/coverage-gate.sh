@@ -5,11 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo llvm-cov --lib --json --output-path target/llvm-cov.json \
-  -- admit:: weight:: key:: eta:: forecast:: >/dev/null
+  -- admit:: weight:: key:: eta:: forecast:: reap:: receipt:: >/dev/null
 python3 - <<'PY'
 import json, sys
 data = json.load(open("target/llvm-cov.json"))
-want = {"src/admit.rs", "src/weight.rs", "src/key.rs", "src/eta.rs", "src/forecast.rs"}
+want = {"src/admit.rs", "src/weight.rs", "src/key.rs", "src/eta.rs", "src/forecast.rs", "src/reap.rs", "src/receipt.rs"}
 seen = set()
 bad = []
 for f in data["data"][0]["files"]:

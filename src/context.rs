@@ -108,6 +108,36 @@ impl LiveProvider for FixedLive {
     }
 }
 
+/// Where the machine's boot session id comes from. A managed command
+/// records it at registration; a different id later means the machine
+/// rebooted and every process of the old session is gone.
+pub trait BootIdProvider: Send + Sync {
+    /// `None` when the OS gives no id; the reaper then never releases on a
+    /// reboot and relies on its process checks alone.
+    fn boot_id(&self) -> Option<String>;
+}
+
+/// This machine's boot id (`kern.bootsessionuuid` on macOS,
+/// `/proc/sys/kernel/random/boot_id` on Linux).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemBoot;
+
+impl BootIdProvider for SystemBoot {
+    fn boot_id(&self) -> Option<String> {
+        crate::process::system_boot_id()
+    }
+}
+
+/// Always the same answer. For tests.
+#[derive(Debug, Clone)]
+pub struct FixedBoot(pub Option<String>);
+
+impl BootIdProvider for FixedBoot {
+    fn boot_id(&self) -> Option<String> {
+        self.0.clone()
+    }
+}
+
 /// Receives the stop signals meant for one gated run and decides how the
 /// process reacts to them. A run goes through three phases, and the
 /// supervisor can change its signal dispositions at each.
@@ -124,7 +154,10 @@ pub trait Supervisor: Send + Sync {
     fn waiting(&self) {}
     /// The command is about to start.
     fn running(&self) {}
-    /// The run is over (also called when spawning failed).
+    /// The caller is done with the run and has recorded how it ended; it
+    /// calls this just before it dies or re-raises a signal. The library
+    /// never calls it: restoring default dispositions earlier lets a second
+    /// stop signal kill the process before the outcome is written down.
     fn finished(&self) {}
     /// The last signal received since the previous call, or 0.
     fn take_pending(&self) -> i32 {
@@ -145,6 +178,7 @@ pub struct Context {
     pub clock: Arc<dyn Clock>,
     pub live: Arc<dyn LiveProvider>,
     pub supervisor: Arc<dyn Supervisor>,
+    pub boot: Arc<dyn BootIdProvider>,
     /// Temp-directory prefixes recognised when normalising a command into
     /// its history key (the CLI passes `$TMPDIR`).
     pub tmp_roots: Vec<String>,
@@ -160,6 +194,7 @@ impl Context {
             clock: Arc::new(SystemClock::new()),
             live: Arc::new(SystemLive),
             supervisor: Arc::new(NoSupervisor),
+            boot: Arc::new(SystemBoot),
             tmp_roots: Vec::new(),
             ledger_lock_timeout: crate::lock::LEDGER_LOCK_TIMEOUT,
         }
@@ -177,6 +212,11 @@ impl Context {
 
     pub fn with_supervisor(mut self, supervisor: Arc<dyn Supervisor>) -> Self {
         self.supervisor = supervisor;
+        self
+    }
+
+    pub fn with_boot(mut self, boot: Arc<dyn BootIdProvider>) -> Self {
+        self.boot = boot;
         self
     }
 

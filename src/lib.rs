@@ -44,13 +44,17 @@ pub mod key;
 pub mod ledger;
 pub mod live;
 pub mod lock;
+pub mod managed;
 pub mod paths;
+pub mod process;
+pub mod reap;
+pub mod receipt;
 pub mod runner;
 pub mod usage;
 pub mod weight;
 
 pub use context::{
-    Clock, Context, FakeClock, FixedLive, LiveProvider, NoSupervisor, Supervisor, SystemClock,
-    SystemLive,
+    BootIdProvider, Clock, Context, FakeClock, FixedBoot, FixedLive, LiveProvider, NoSupervisor,
+    Supervisor, SystemBoot, SystemClock, SystemLive,
 };
 pub use paths::Paths;

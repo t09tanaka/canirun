@@ -1,0 +1,592 @@
+//! Managed commands: registration, receipts, the reaper's rules and the
+//! measurement idempotence. Every test runs in its own temp state dir with
+//! an explicit `Context`; nothing touches the real user state.
+
+use canirun::admit::State;
+use canirun::config::Config;
+use canirun::exec::{self, Gated, Hooks, Opts};
+use canirun::history::{self, Record};
+use canirun::ledger::Ledger;
+use canirun::managed::{self, CommandSpec, Loaded, Measured, Registration, TerminalKind, TryAdmit};
+use canirun::receipt::Phase;
+use canirun::{lock, Context, FixedBoot, FixedLive, Paths, Supervisor};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+fn ctx_with_boot(dir: &Path, boot: Option<&str>) -> Context {
+    Context::new(Paths::new(dir.join("state"), dir.join("config.toml")))
+        .with_live(Arc::new(FixedLive(None)))
+        .with_boot(Arc::new(FixedBoot(boot.map(String::from))))
+}
+
+fn ctx(dir: &Path) -> Context {
+    ctx_with_boot(dir, Some("boot-1"))
+}
+
+fn opts(dir: &Path, argv: &[&str]) -> Opts {
+    Opts {
+        weight: Some(1),
+        front: false,
+        key: Some("managed-test".into()),
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+        cwd: dir.to_path_buf(),
+    }
+}
+
+fn spec(dir: &Path, id: &str, digest: &str, argv: &[&str]) -> CommandSpec {
+    CommandSpec {
+        command_id: id.into(),
+        spec_digest: digest.into(),
+        opts: opts(dir, argv),
+        attempt: Some(serde_json::json!({"attempt_id": "a-1", "node_id": "test"})),
+        services: vec![],
+    }
+}
+
+fn registered(r: Registration) -> (managed::RegisteredReceipt, managed::OwnerGuard) {
+    match r {
+        Registration::Registered(rc, g) => (rc, g),
+        Registration::AlreadyTerminal(_) => panic!("unexpected AlreadyTerminal"),
+    }
+}
+
+fn ledger(ctx: &Context) -> Ledger {
+    Ledger::load(&ctx.paths.ledger_file()).unwrap()
+}
+
+fn sidecar(ctx: &Context, id: &str) -> managed::Sidecar {
+    match managed::load_sidecar(ctx, id) {
+        Loaded::Ok(s) => *s,
+        other => panic!("sidecar {id}: {other:?}"),
+    }
+}
+
+/// Poll `f` until true, at most `secs`.
+fn until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    false
+}
+
+fn admit_now(ctx: &Context, cfg: &Config, id: &str) {
+    for _ in 0..200 {
+        match managed::try_admit(ctx, cfg.limits(), id, 0.0).unwrap() {
+            TryAdmit::Admitted => return,
+            TryAdmit::LockBusy | TryAdmit::Wait(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    panic!("never admitted");
+}
+
+#[test]
+fn register_is_idempotent_and_the_entry_exists_before_the_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "cmd-a", "digest-1", &["true"]);
+    let (r1, g1) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    assert!(r1.newly_registered);
+    assert_eq!(r1.phase, Phase::Registered);
+    assert_eq!(r1.boot_id.as_deref(), Some("boot-1"));
+    // The receipt is back: the entry and the sidecar are already there.
+    let l = ledger(&ctx);
+    let e = l.find("cmd-a").expect("entry before the receipt");
+    assert_eq!((e.seq, e.state), (r1.seq, State::Waiting));
+    let sc = sidecar(&ctx, "cmd-a");
+    assert_eq!(sc.spec_digest, "digest-1");
+    assert_eq!(sc.attempt.as_ref().unwrap()["node_id"], "test");
+
+    // The owner is alive: a second registration cannot take the lease.
+    assert!(matches!(
+        managed::register(&ctx, &cfg, &s),
+        Err(canirun::error::Error::AlreadyOwned(_))
+    ));
+    drop(g1);
+    // A new supervisor re-registers the same id and digest: same entry.
+    let (r2, g2) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    assert!(!r2.newly_registered);
+    assert_eq!(r2.seq, r1.seq);
+    assert_eq!(ledger(&ctx).entries.len(), 1);
+
+    drop(g2);
+    // A different digest for the same id is a conflict, and changes nothing.
+    let other = spec(dir.path(), "cmd-a", "digest-2", &["true"]);
+    assert!(matches!(
+        managed::register(&ctx, &cfg, &other),
+        Err(canirun::error::Error::Conflict(_))
+    ));
+    assert_eq!(sidecar(&ctx, "cmd-a").spec_digest, "digest-1");
+}
+
+#[test]
+fn ids_that_are_not_file_names_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    for bad in ["", "../x", "a/b", ".hidden", "sp ace"] {
+        let s = spec(dir.path(), bad, "d", &["true"]);
+        assert!(managed::register(&ctx, &cfg, &s).is_err(), "{bad:?}");
+    }
+    let empty_digest = spec(dir.path(), "ok", "", &["true"]);
+    assert!(managed::register(&ctx, &cfg, &empty_digest).is_err());
+    assert!(!ctx.paths.managed_dir().exists());
+}
+
+#[test]
+fn two_commands_from_one_process_do_not_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (_, ga) = registered(
+        managed::register(&ctx, &cfg, &spec(dir.path(), "one", "d1", &["true"])).unwrap(),
+    );
+    let (_, gb) = registered(
+        managed::register(&ctx, &cfg, &spec(dir.path(), "two", "d2", &["true"])).unwrap(),
+    );
+    let l = ledger(&ctx);
+    assert_eq!(l.entries.len(), 2);
+    // Same pid (ours), told apart by command id.
+    assert_eq!(l.find("one").unwrap().pid, l.find("two").unwrap().pid);
+    managed::finish(&ctx, ga, TerminalKind::Cancelled).unwrap();
+    let l = ledger(&ctx);
+    assert!(l.find("one").is_none());
+    assert!(l.find("two").is_some());
+    assert!(lock::lease_is_held(&ctx, "two"));
+    drop(gb);
+}
+
+#[test]
+fn a_full_run_records_terminal_before_releasing_and_measures_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "run-1", "d", &["sh", "-c", "exit 3"]);
+    let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    admit_now(&ctx, &cfg, "run-1");
+    assert_eq!(ledger(&ctx).find("run-1").unwrap().state, State::Running);
+    let ran = managed::run_command(&ctx, &guard, &s.opts, cfg.limits()).unwrap();
+    assert_eq!(ran.outcome.exit.code(), 3);
+    // Ran, but not yet released: the child's identity is recorded and the
+    // entry still holds its charge.
+    let sc = sidecar(&ctx, "run-1");
+    assert_eq!(sc.phase, Phase::ChildStarted);
+    let child = sc.child.unwrap();
+    assert_eq!(child.pgid, Some(child.pid as i32), "own process group");
+    assert!(sc.launch_intent_at.is_some());
+    assert!(ledger(&ctx).find("run-1").is_some());
+
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    let sc = sidecar(&ctx, "run-1");
+    assert_eq!(sc.phase, Phase::Terminal);
+    assert_eq!(sc.terminal.unwrap().kind, TerminalKind::Exited { code: 3 });
+    assert!(ledger(&ctx).find("run-1").is_none());
+    assert!(!ctx.paths.lease_file("run-1").exists());
+
+    // The id is single use: registering it again creates nothing.
+    match managed::register(&ctx, &cfg, &s).unwrap() {
+        Registration::AlreadyTerminal(sc) => assert_eq!(sc.phase, Phase::Terminal),
+        _ => panic!("expected AlreadyTerminal"),
+    }
+    assert!(ledger(&ctx).entries.is_empty());
+    assert!(!ctx.paths.lease_file("run-1").exists());
+
+    // Measurement: applied once per measurement id.
+    let rec = Record {
+        key: "k".into(),
+        repo: String::new(),
+        subdir: String::new(),
+        argv: "sh -c exit 3".into(),
+        key_argv: String::new(),
+        started_at: ran.started_at,
+        wall_secs: ran.outcome.wall_secs,
+        cpu_secs: ran.outcome.cpu_secs,
+        max_rss_bytes: ran.outcome.max_rss_bytes,
+        exit_code: 3,
+        weight_used: 1,
+        contended: ran.contended,
+    };
+    assert_eq!(
+        managed::record_measurement(&ctx, "m-1", &rec).unwrap(),
+        Measured::Applied
+    );
+    assert_eq!(
+        managed::record_measurement(&ctx, "m-1", &rec).unwrap(),
+        Measured::Duplicate
+    );
+    assert_eq!(
+        history::read_all(ctx.paths.history_file()).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        managed::record_measurement(&ctx, "m-2", &rec).unwrap(),
+        Measured::Applied
+    );
+    assert_eq!(
+        history::read_all(ctx.paths.history_file()).unwrap().len(),
+        2
+    );
+    assert!(managed::record_measurement(&ctx, "../m", &rec).is_err());
+}
+
+#[test]
+fn a_measurement_interrupted_after_the_append_is_not_applied_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let rec = Record {
+        key: "k".into(),
+        repo: String::new(),
+        subdir: String::new(),
+        argv: "x".into(),
+        key_argv: String::new(),
+        started_at: chrono::Utc::now(),
+        wall_secs: 1.5,
+        cpu_secs: 1.0,
+        max_rss_bytes: 10,
+        exit_code: 0,
+        weight_used: 1,
+        contended: false,
+    };
+    // A crash after the append, before the "applied" marker.
+    std::fs::create_dir_all(ctx.paths.measurements_dir()).unwrap();
+    std::fs::write(ctx.paths.measurements_dir().join("m.pending"), b"").unwrap();
+    history::append(ctx.paths.history_file(), &rec).unwrap();
+    assert_eq!(
+        managed::record_measurement(&ctx, "m", &rec).unwrap(),
+        Measured::Duplicate
+    );
+    assert_eq!(
+        history::read_all(ctx.paths.history_file()).unwrap().len(),
+        1
+    );
+    // A crash before the append: the retry appends.
+    std::fs::write(ctx.paths.measurements_dir().join("n.pending"), b"").unwrap();
+    assert_eq!(
+        managed::record_measurement(&ctx, "n", &rec).unwrap(),
+        Measured::Applied
+    );
+    assert_eq!(
+        history::read_all(ctx.paths.history_file()).unwrap().len(),
+        2
+    );
+}
+
+/// Pretend the supervisor died: drop its lease, keep everything else.
+fn orphan(ctx: &Context, id: &str, phase: Phase, child: Option<canirun::process::ChildIdentity>) {
+    let mut sc = sidecar(ctx, id);
+    sc.phase = phase;
+    sc.child = child;
+    managed::write_sidecar(ctx, &sc).unwrap();
+}
+
+fn reaped(ctx: &Context) -> Ledger {
+    lock::snapshot(ctx).unwrap().ledger
+}
+
+#[test]
+fn a_dead_owner_with_no_launch_is_released_and_marked_abandoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (_, g) =
+        registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    assert!(reaped(&ctx).find("c").is_some(), "owner alive");
+    drop(g);
+    assert!(reaped(&ctx).find("c").is_none());
+    let sc = sidecar(&ctx, "c");
+    assert_eq!(sc.terminal.unwrap().kind, TerminalKind::Abandoned);
+}
+
+#[test]
+fn a_launch_intent_without_a_child_identity_is_never_freed_until_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (_, g) =
+        registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    orphan(&ctx, "c", Phase::LaunchIntent, None);
+    drop(g);
+    assert!(reaped(&ctx).find("c").is_some());
+    let views = managed::views(&ctx, &ledger(&ctx).entries);
+    assert_eq!(views.len(), 1);
+    assert!(views[0].quarantined);
+    assert!(views[0].reason.contains("LaunchUnknown"), "{:?}", views[0]);
+    // An investigator settles it by hand.
+    managed::resolve(
+        &ctx,
+        "c",
+        TerminalKind::Interrupted,
+        "checked: nothing running",
+    )
+    .unwrap();
+    assert!(reaped(&ctx).find("c").is_none());
+    assert_eq!(sidecar(&ctx, "c").phase, Phase::Terminal);
+}
+
+#[test]
+fn an_unreadable_sidecar_is_not_free_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (_, g) =
+        registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    std::fs::write(ctx.paths.managed_file("c"), b"{ not json").unwrap();
+    drop(g);
+    assert!(reaped(&ctx).find("c").is_some());
+    // Even with the lock busy (the fallback read), and even after a reboot.
+    let rebooted = ctx_with_boot(dir.path(), Some("boot-2"));
+    assert!(reaped(&rebooted).find("c").is_some());
+    let v = managed::views(&ctx, &ledger(&ctx).entries);
+    assert!(v[0].quarantined && v[0].phase.is_none());
+    // Re-registering over a broken sidecar is refused, not papered over.
+    assert!(matches!(
+        managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])),
+        Err(canirun::error::Error::Conflict(_))
+    ));
+    managed::resolve(&ctx, "c", TerminalKind::Interrupted, "unreadable").unwrap();
+    assert!(reaped(&ctx).find("c").is_none());
+}
+
+#[test]
+fn a_changed_boot_id_releases_what_the_old_boot_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx1, cfg) = (ctx(dir.path()), Config::default());
+    let (_, g) =
+        registered(managed::register(&ctx1, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    let ghost = canirun::process::ChildIdentity {
+        pid: std::process::id(), // alive, would be "kept" on the same boot
+        start_time: canirun::process::start_time(std::process::id()),
+        pgid: Some(unsafe { libc::getpgid(0) }),
+    };
+    orphan(&ctx1, "c", Phase::ChildStarted, Some(ghost));
+    drop(g);
+    assert!(
+        reaped(&ctx1).find("c").is_some(),
+        "same boot: the tree looks alive"
+    );
+    // No boot id available: the shortcut is off, still kept.
+    assert!(reaped(&ctx_with_boot(dir.path(), None)).find("c").is_some());
+    // Rebooted: nothing of the old session exists.
+    let ctx2 = ctx_with_boot(dir.path(), Some("boot-2"));
+    assert!(reaped(&ctx2).find("c").is_none());
+    assert_eq!(
+        sidecar(&ctx2, "c").terminal.unwrap().kind,
+        TerminalKind::Interrupted
+    );
+}
+
+#[test]
+fn an_older_binary_rewriting_the_ledger_leaves_the_sidecar_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (_, _g) =
+        registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    // The ledger is plain v1: no key an older binary would not know.
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ctx.paths.ledger_file()).unwrap()).unwrap();
+    assert_eq!(raw["version"], 1);
+    let known = [
+        "id",
+        "pid",
+        "state",
+        "front",
+        "weight",
+        "predicted_rss",
+        "expected_secs",
+        "repo",
+        "subdir",
+        "argv",
+        "key",
+        "seq",
+        "enqueued_at",
+        "started_at",
+        "using",
+        "backfilled",
+    ];
+    for k in raw["entries"][0].as_object().unwrap().keys() {
+        assert!(known.contains(&k.as_str()), "new ledger key {k}");
+    }
+    // v0.4.2 saving: parse, add an entry it wrote itself, serialise.
+    let mut l = ledger(&ctx);
+    let mut old = l.entries[0].clone();
+    old.id = "plain".into();
+    old.seq = l.take_seq();
+    l.entries.push(old);
+    l.save(&ctx.paths.ledger_file()).unwrap();
+    assert_eq!(sidecar(&ctx, "c").spec_digest, "d");
+    assert!(ledger(&ctx).find("c").is_some());
+    // The plain entry (no sidecar, no lease) is reaped as ever.
+    assert!(reaped(&ctx).find("plain").is_none());
+    assert!(reaped(&ctx).find("c").is_some());
+}
+
+#[test]
+fn inspect_reports_a_quarantined_entry_and_still_counts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (_, g) =
+        registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    orphan(&ctx, "c", Phase::LaunchIntent, None);
+    drop(g);
+    let insp = canirun::inspect::inspect_with(&ctx, &cfg).unwrap();
+    assert_eq!(insp.entries.len(), 1);
+    assert!(insp.entries[0].suspect_dead);
+    // Reading changed nothing.
+    assert!(ledger(&ctx).find("c").is_some());
+}
+
+/// Runs only when re-executed by the SIGKILL test below, as the supervisor.
+#[test]
+fn supervisor_entry() {
+    let Some(dir) = std::env::var_os("CANIRUN_TEST_SUPERVISOR_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let (ctx, cfg) = (ctx(&dir), Config::default());
+    let s = spec(&dir, "sup-1", "d", &["sh", "-c", "sleep 60 & wait"]);
+    let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    admit_now(&ctx, &cfg, "sup-1");
+    let _ = managed::run_command(&ctx, &guard, &s.opts, cfg.limits());
+}
+
+#[test]
+fn a_sigkilled_supervisor_keeps_its_budget_until_its_tree_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _cfg) = (ctx(dir.path()), Config::default());
+    let mut sup = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "supervisor_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("CANIRUN_TEST_SUPERVISOR_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = until(
+        20,
+        || matches!(managed::load_sidecar(&ctx, "sup-1"), Loaded::Ok(sc) if sc.phase == Phase::ChildStarted),
+    );
+    assert!(started, "the supervisor never started its child");
+    let pgid = sidecar(&ctx, "sup-1").child.unwrap().pgid.unwrap();
+
+    unsafe { libc::kill(sup.id() as libc::pid_t, libc::SIGKILL) };
+    sup.wait().unwrap();
+    assert!(
+        !lock::lease_is_held(&ctx, "sup-1"),
+        "the lease died with the supervisor"
+    );
+
+    // The tree lives on: the budget stays charged, over and over.
+    for _ in 0..3 {
+        let l = reaped(&ctx);
+        let e = l.find("sup-1").expect("released while descendants run");
+        assert_eq!(e.state, State::Running);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let v = managed::views(&ctx, &ledger(&ctx).entries);
+    assert!(v[0].quarantined, "{:?}", v[0]);
+    assert!(v[0].reason.contains("DescendantsAlive"), "{:?}", v[0]);
+
+    // Stop the tree: now it is released and recorded as interrupted.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    assert!(
+        until(20, || reaped(&ctx).find("sup-1").is_none()),
+        "not released after the tree stopped"
+    );
+    assert_eq!(
+        sidecar(&ctx, "sup-1").terminal.unwrap().kind,
+        TerminalKind::Interrupted
+    );
+}
+
+/// Counts what the library tells its supervisor.
+#[derive(Default)]
+struct Recording {
+    waiting: AtomicU32,
+    finished: AtomicU32,
+    pending: AtomicU32,
+}
+
+impl Supervisor for Recording {
+    fn waiting(&self) {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+    }
+    fn finished(&self) {
+        self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+    fn take_pending(&self) -> i32 {
+        if self.pending.swap(0, Ordering::SeqCst) == 1 {
+            libc::SIGTERM
+        } else {
+            0
+        }
+    }
+}
+
+#[test]
+fn an_interrupted_wait_leaves_the_signal_handlers_to_the_caller() {
+    for via_signal in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Arc::new(Recording::default());
+        rec.pending.store(u32::from(via_signal), Ordering::SeqCst);
+        let ctx = ctx(dir.path()).with_supervisor(rec.clone());
+        let o = opts(dir.path(), &["true"]);
+        let cancelled = || !via_signal;
+        let got = exec::run_gated(
+            &ctx,
+            &Config::default(),
+            &o,
+            "w",
+            &Hooks {
+                cancelled: &cancelled,
+                progress: &|_| {},
+                progress_tty: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(got, Gated::Interrupted(libc::SIGTERM));
+        assert_eq!(rec.waiting.load(Ordering::SeqCst), 1);
+        // Restoring the defaults here would let a second SIGTERM kill the
+        // process before the caller wrote the outcome down.
+        assert_eq!(rec.finished.load(Ordering::SeqCst), 0);
+        assert!(ledger(&ctx).entries.is_empty());
+    }
+}
+
+#[test]
+fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state/canirun");
+    let cfg = Config::default();
+    // The library and the CLI share one state dir; real boot id on both.
+    let lib = Context::new(Paths::new(&state, dir.path().join("none.toml")))
+        .with_live(Arc::new(FixedLive(None)));
+    let (_, g) =
+        registered(managed::register(&lib, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    orphan(&lib, "c", Phase::LaunchIntent, None);
+    drop(g);
+    let run = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_canirun"))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()
+    };
+    let insp = run(&["inspect", "--json"]);
+    assert_eq!(insp["managed"][0]["command_id"], "c");
+    assert_eq!(insp["managed"][0]["quarantined"], true);
+    assert_eq!(insp["entries"][0]["suspect_dead"], true);
+    let status = run(&["status", "--json"]);
+    assert_eq!(status["entries"][0]["id"], "c", "still charged");
+    assert!(status.get("managed").is_none());
+    assert!(status["entries"][0].get("managed").is_none());
+}

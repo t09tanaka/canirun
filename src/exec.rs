@@ -6,7 +6,7 @@
 //! [`Hooks`], and how a run ended comes back as a [`Gated`] for the caller
 //! (the CLI) to turn into an exit code or a re-raised signal.
 
-use crate::admit::{self, Decision, Reason, State};
+use crate::admit::{self, Reason, State};
 use crate::config::Config;
 use crate::display::{fmt_bytes, fmt_duration};
 use crate::error::Result;
@@ -14,8 +14,12 @@ use crate::eta;
 use crate::gitctx;
 use crate::history::{self, Record};
 use crate::key::{self, CommandKey};
-use crate::ledger::{Entry, Ledger};
-use crate::runner::{self, Exit};
+use crate::ledger::Ledger;
+// The unit tests below build entries through `use super::*`.
+#[cfg(test)]
+use crate::ledger::Entry;
+use crate::managed::{self, OwnerGuard, Ran, TryAdmit, Waiting};
+use crate::runner::Exit;
 use crate::weight::{self, Measurement};
 use crate::{lock, Context};
 use std::io::Read;
@@ -25,6 +29,7 @@ use std::time::Duration;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// What to run and how it should be queued.
+#[derive(Debug, Clone)]
 pub struct Opts {
     pub weight: Option<u32>,
     pub front: bool,
@@ -196,51 +201,20 @@ pub fn run_gated(
     id: &str,
     hooks: &Hooks,
 ) -> Result<Gated> {
-    let Plan {
-        key,
-        weight: w,
-        predicted_rss,
-        expected_secs,
-    } = plan(ctx, cfg, opts)?;
+    let plan = plan(ctx, cfg, opts)?;
     let limits = cfg.limits();
 
     // Register as waiting. The lease is taken before the ledger entry so
-    // the entry is never observed without a held lease.
-    let _lease = lock::take_lease(ctx, id)?;
+    // the entry is never observed without a held lease. A busy ledger lock
+    // (a saturated machine can stall its holder for seconds) is retried
+    // rather than failing a command that may have queued for minutes.
+    let guard = OwnerGuard::new(lock::take_lease(ctx, id)?, id, false);
     ctx.supervisor.waiting();
-    // A busy ledger lock (a saturated machine can stall its holder for
-    // seconds) is retried, here and while waiting, rather than failing a
-    // command that may have queued for minutes.
-    loop {
-        if let Some(sig) = stop_requested(ctx, id, hooks) {
-            return Ok(Gated::Interrupted(sig));
-        }
-        let Some(_guard) = lock::try_ledger(ctx)? else {
-            continue;
-        };
-        let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
-        lock::reap_dead(ctx, &mut ledger);
-        let seq = ledger.take_seq();
-        ledger.entries.push(Entry {
-            id: id.to_string(),
-            pid: std::process::id(),
-            state: State::Waiting,
-            front: opts.front,
-            weight: w,
-            predicted_rss,
-            expected_secs,
-            repo: key.repo.clone(),
-            subdir: key.subdir.clone(),
-            argv: key.argv.clone(),
-            key: key.hash.clone(),
-            seq,
-            enqueued_at: ctx.clock.now(),
-            started_at: None,
-            using: None,
-            backfilled: false,
-        });
-        ledger.save(&ctx.paths.ledger_file())?;
-        break;
+    let mut stop = || stop_requested(ctx, id, hooks);
+    if let managed::Pushed::Interrupted(sig) =
+        managed::push_entry(ctx, id, opts, &plan, None, Some(&mut stop))?
+    {
+        return Ok(Gated::Interrupted(sig));
     }
 
     let enqueued = ctx.clock.monotonic();
@@ -255,110 +229,44 @@ pub fn run_gated(
         if let Some(sig) = stop_requested(ctx, id, hooks) {
             return Ok(Gated::Interrupted(sig));
         }
-        // Phase 1 (under the lock, no OS sampling): queue position and
-        // budget. Only a budget-admissible head pays for a live snapshot.
-        let (first, queue, est, holders) = {
-            let Some(_guard) = lock::try_ledger(ctx)? else {
-                continue;
+        let Waiting {
+            reason,
+            queue,
+            estimate: est,
+            holders,
+        } = match managed::try_admit(ctx, limits, id, waited().as_secs_f64())? {
+            TryAdmit::Admitted => break,
+            TryAdmit::LockBusy => continue,
+            TryAdmit::Wait(w) => *w,
+        };
+        let topic = topic_of(&reason);
+        let last = last_progress.map(|(t, last)| (ctx.clock.monotonic().saturating_sub(t), last));
+        if cadence.due(last, topic) {
+            let running = queue.iter().filter(|e| e.state == State::Running).count();
+            let used = match &reason {
+                Reason::Budget { used, .. } => *used,
+                _ => admit::used_budget(&queue),
             };
-            let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
-            if !lock::reap_dead(ctx, &mut ledger).is_empty() {
-                ledger.save(&ctx.paths.ledger_file())?;
-            }
-            let queue = ledger.queue_at(ctx.clock.now());
-            let est = eta::estimate(&timed_queue(ctx, &ledger), limits, id);
-            let holders = holders(ctx, &ledger);
-            (
-                admit::admit(
-                    &queue,
-                    id,
-                    predicted_rss,
-                    waited().as_secs_f64(),
-                    limits,
-                    None,
-                ),
-                queue,
-                est,
-                holders,
-            )
-        };
-        let decision = match first {
-            Decision::Wait(_) => first,
-            Decision::Admitted => {
-                // Phase 2: sample outside the lock, then re-check and
-                // flip to running atomically.
-                let snapshot = if queue.iter().any(|e| e.state == State::Running) {
-                    ctx.live.snapshot()
-                } else {
-                    None
-                };
-                let Some(_guard) = lock::try_ledger(ctx)? else {
-                    continue;
-                };
-                let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
-                let reaped = !lock::reap_dead(ctx, &mut ledger).is_empty();
-                let queue = ledger.queue_at(ctx.clock.now());
-                let decision = admit::admit(
-                    &queue,
-                    id,
-                    predicted_rss,
-                    waited().as_secs_f64(),
-                    limits,
-                    snapshot,
-                );
-                if decision == Decision::Admitted {
-                    // Started ahead of someone: the starvation cap in
-                    // `admit` must be able to tell it from the rest.
-                    let backfilled = admit::queue_order(&queue)
-                        .first()
-                        .is_some_and(|head| head.id != id);
-                    if let Some(e) = ledger.find_mut(id) {
-                        e.state = State::Running;
-                        e.started_at = Some(ctx.clock.now());
-                        e.backfilled = backfilled;
-                    }
+            (hooks.progress)(&format!(
+                "canirun: waiting {} ({}) — running {running} ({used}/{} used){}{}{}",
+                fmt_duration(waited()),
+                describe(&reason),
+                limits.budget,
+                match &reason {
+                    Reason::NotHead { ahead } | Reason::Reserved { ahead }
+                        if *ahead != usize::MAX =>
+                        format!(", ahead of you {ahead}"),
+                    _ => String::new(),
+                },
+                est.map(|e| format!(", {}", fmt_estimate(&e)))
+                    .unwrap_or_default(),
+                match &reason {
+                    Reason::Budget { .. } | Reason::Reserved { .. } if !holders.is_empty() =>
+                        format!("; held by {holders}"),
+                    _ => String::new(),
                 }
-                if reaped || decision == Decision::Admitted {
-                    ledger.save(&ctx.paths.ledger_file())?;
-                }
-                decision
-            }
-        };
-        if let Decision::Wait(reason) = &decision {
-            let topic = topic_of(reason);
-            let last =
-                last_progress.map(|(t, last)| (ctx.clock.monotonic().saturating_sub(t), last));
-            if cadence.due(last, topic) {
-                let running = queue.iter().filter(|e| e.state == State::Running).count();
-                // Phase 2 may have decided on a fresher ledger.
-                let used = match reason {
-                    Reason::Budget { used, .. } => *used,
-                    _ => admit::used_budget(&queue),
-                };
-                (hooks.progress)(&format!(
-                    "canirun: waiting {} ({}) — running {running} ({used}/{} used){}{}{}",
-                    fmt_duration(waited()),
-                    describe(reason),
-                    limits.budget,
-                    match reason {
-                        Reason::NotHead { ahead } | Reason::Reserved { ahead }
-                            if *ahead != usize::MAX =>
-                            format!(", ahead of you {ahead}"),
-                        _ => String::new(),
-                    },
-                    est.map(|e| format!(", {}", fmt_estimate(&e)))
-                        .unwrap_or_default(),
-                    match reason {
-                        Reason::Budget { .. } | Reason::Reserved { .. } if !holders.is_empty() =>
-                            format!("; held by {holders}"),
-                        _ => String::new(),
-                    }
-                ));
-                last_progress = Some((ctx.clock.monotonic(), topic));
-            }
-        }
-        if decision == Decision::Admitted {
-            break;
+            ));
+            last_progress = Some((ctx.clock.monotonic(), topic));
         }
         ctx.clock.sleep(POLL_INTERVAL);
     }
@@ -369,20 +277,17 @@ pub fn run_gated(
     if sig != 0 || (hooks.cancelled)() {
         let sig = if sig != 0 { sig } else { libc::SIGTERM };
         remove_entry(ctx, id);
-        ctx.supervisor.finished();
         return Ok(Gated::Interrupted(sig));
     }
-    // One sample right before the start: a run that begins on a saturated
-    // machine is recorded as contended so its parallelism is not learned.
-    let contended = ctx
-        .live
-        .snapshot()
-        .map(|l| l.cpu_busy > limits.cpu_threshold)
-        .unwrap_or(false);
-    let started_at = ctx.clock.now();
-    let out = runner::run(ctx, &opts.argv, &opts.cwd, id, true);
+    let ran = managed::run_command(ctx, &guard, opts, limits);
     remove_entry(ctx, id);
-    let out = out?;
+    drop(guard);
+    let Ran {
+        outcome: out,
+        started_at,
+        contended,
+    } = ran?;
+    let key = plan.key;
     let _ = history::append(
         ctx.paths.history_file(),
         &Record {
@@ -400,7 +305,7 @@ pub fn run_gated(
             cpu_secs: out.cpu_secs,
             max_rss_bytes: out.max_rss_bytes,
             exit_code: out.exit.code(),
-            weight_used: w,
+            weight_used: plan.weight,
             contended,
         },
     );
@@ -419,11 +324,10 @@ fn stop_requested(ctx: &Context, id: &str, hooks: &Hooks) -> Option<i32> {
         return None;
     };
     remove_entry(ctx, id);
-    ctx.supervisor.finished();
     Some(sig)
 }
 
-fn remove_entry(ctx: &Context, id: &str) {
+pub(crate) fn remove_entry(ctx: &Context, id: &str) {
     if let Ok(_guard) = lock::ledger(ctx) {
         if let Ok(mut ledger) = Ledger::load(&ctx.paths.ledger_file()) {
             ledger.remove(id);
@@ -438,7 +342,7 @@ const HOLDERS_SHOWN: usize = 3;
 
 /// The running entries that hold the budget, biggest first, as
 /// `48211 w2 idle 52:10 api: make api, ...` (empty when nothing runs).
-fn holders(ctx: &Context, ledger: &Ledger) -> String {
+pub(crate) fn holders(ctx: &Context, ledger: &Ledger) -> String {
     let now = ctx.clock.now();
     let mut running: Vec<_> = ledger
         .queue_at(now)

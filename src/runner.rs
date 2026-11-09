@@ -49,21 +49,46 @@ pub fn run(
     lease: &str,
     measure: bool,
 ) -> Result<Outcome> {
+    run_with(ctx, argv, cwd, lease, measure, Spawn::default())
+}
+
+/// How [`run_with`] spawns.
+#[derive(Default)]
+pub struct Spawn<'a> {
+    /// Put the child in a process group of its own (a managed command, so
+    /// the whole tree can be probed and stopped by group). Off for a plain
+    /// `exec`, where terminal signals must keep reaching the child.
+    pub own_process_group: bool,
+    /// Called with the child's pid right after the spawn.
+    pub on_spawn: Option<&'a dyn Fn(u32)>,
+}
+
+/// [`run`] with spawn options.
+pub fn run_with(
+    ctx: &Context,
+    argv: &[String],
+    cwd: &Path,
+    lease: &str,
+    measure: bool,
+    spawn: Spawn<'_>,
+) -> Result<Outcome> {
     let (prog, args) = argv
         .split_first()
         .ok_or_else(|| Error::Spawn("no command given".into()))?;
     ctx.supervisor.running();
     let start = ctx.clock.monotonic();
-    let child = Command::new(prog)
-        .args(args)
-        .current_dir(cwd)
-        .env("CANIRUN_LEASE", lease)
+    let mut cmd = Command::new(prog);
+    cmd.args(args).current_dir(cwd).env("CANIRUN_LEASE", lease);
+    if spawn.own_process_group {
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    }
+    let child = cmd
         .spawn()
-        .map_err(|e| {
-            ctx.supervisor.finished();
-            Error::Spawn(format!("cannot run {prog:?}: {e}{}", spawn_hint(argv, &e)))
-        })?;
+        .map_err(|e| Error::Spawn(format!("cannot run {prog:?}: {e}{}", spawn_hint(argv, &e))))?;
     let pid = child.id() as libc::pid_t;
+    if let Some(f) = spawn.on_spawn {
+        f(child.id());
+    }
     // Dropped (stopped and joined) once the child has been reaped.
     let _monitor =
         measure.then(|| crate::usage::Monitor::start(ctx.clone(), lease.to_string(), child.id()));
@@ -93,10 +118,8 @@ pub fn run(
             }
             continue;
         }
-        ctx.supervisor.finished();
         return Err(Error::Spawn(format!("wait4 failed: {err}")));
     }
-    ctx.supervisor.finished();
     let wall_secs = (ctx.clock.monotonic().saturating_sub(start)).as_secs_f64();
 
     let exit = if libc::WIFEXITED(status) {

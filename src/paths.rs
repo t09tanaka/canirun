@@ -59,6 +59,26 @@ impl Paths {
         self.leases_dir().join(format!("{id}.lock"))
     }
 
+    /// Sidecars of managed commands: `managed/<command_id>.json`. Not part
+    /// of the ledger, so an older binary rewriting `ledger.json` leaves
+    /// them alone.
+    pub fn managed_dir(&self) -> PathBuf {
+        self.state_dir.join("managed")
+    }
+
+    pub fn managed_file(&self, id: &str) -> PathBuf {
+        self.managed_dir().join(format!("{id}.json"))
+    }
+
+    /// Markers for measurements already applied to the history.
+    pub fn measurements_dir(&self) -> PathBuf {
+        self.state_dir.join("measurements")
+    }
+
+    pub fn history_lock(&self) -> PathBuf {
+        self.state_dir.join("history.lock")
+    }
+
     pub fn jobs_dir(&self) -> PathBuf {
         self.state_dir.join("jobs")
     }
@@ -91,6 +111,9 @@ mod tests {
         assert_eq!(p.lease_file("a"), Path::new("/s/leases/a.lock"));
         assert_eq!(p.job_exit("j"), Path::new("/s/jobs/j.exit"));
         assert_eq!(p.history_file(), Path::new("/s/history.jsonl"));
+        assert_eq!(p.managed_file("c"), Path::new("/s/managed/c.json"));
+        assert_eq!(p.measurements_dir(), Path::new("/s/measurements"));
+        assert_eq!(p.history_lock(), Path::new("/s/history.lock"));
         assert_eq!(p.config_file(), Path::new("/c/config.toml"));
     }
 
