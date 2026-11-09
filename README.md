@@ -572,7 +572,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ./scripts/coverage-gate.sh      # 100% lines on admit / weight / key / eta
 cargo install cargo-schemata --locked --version 0.1.0   # once
-cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs --file src/forecast.rs -- --lib
+cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs --file src/forecast.rs --file src/reap.rs --file src/receipt.rs --file src/marker.rs --file src/lineage.rs -- --lib
 ```
 
 On a Homebrew Rust toolchain (no `llvm-tools-preview`), point `cargo llvm-cov`
