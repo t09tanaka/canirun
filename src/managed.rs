@@ -260,7 +260,7 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 }
                 // A live child or group already keeps the entry.
                 if child_probe != Probe::Alive && group_probe != Probe::Alive {
-                    marker = ctx.scan.scan(id).probe;
+                    marker = runner::settled_scan(ctx, id).probe;
                 }
             }
             SidecarFacts::Managed {
@@ -268,9 +268,9 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 launch_age_secs,
                 ..
             } if manual || reap::grace_passed(*launch_age_secs) => {
-                marker = ctx.scan.scan(id).probe;
+                marker = runner::settled_scan(ctx, id).probe;
             }
-            SidecarFacts::Corrupt if manual => marker = ctx.scan.scan(id).probe,
+            SidecarFacts::Corrupt if manual => marker = runner::settled_scan(ctx, id).probe,
             _ => {}
         }
     }
@@ -881,6 +881,9 @@ pub struct Resolution {
     /// The sidecar's stage; `None` when there is no readable sidecar.
     pub phase: Option<Phase>,
     pub lease_held: bool,
+    /// False when the ledger has no entry with this id (nothing was
+    /// checked or changed).
+    pub found: bool,
     pub released: bool,
     /// The decision, as the reaper names it.
     pub verdict: String,
@@ -926,6 +929,17 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
     check_id("command_id", id)?;
     let _guard = lock::ledger(ctx)?;
     let ledger = Ledger::load(&ctx.paths.ledger_file())?;
+    if ledger.find(id).is_none() {
+        return Ok(Resolution {
+            command_id: id.to_string(),
+            phase: None,
+            lease_held: false,
+            found: false,
+            released: false,
+            verdict: "NoEntry".into(),
+            checked: "there is no ledger entry with this id".into(),
+        });
+    }
     let a = assess_with(ctx, id, true);
     let phase = match &a.sidecar {
         Loaded::Ok(sc) => Some(sc.phase),
@@ -935,15 +949,11 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
         command_id: id.to_string(),
         phase,
         lease_held: a.verdict == Verdict::Keep(reap::Keep::LeaseHeld),
+        found: true,
         released: false,
         verdict: format!("{:?}", a.verdict),
         checked: describe(a.verdict).to_string(),
     };
-    if ledger.find(id).is_none() {
-        r.verdict = "NoEntry".into();
-        r.checked = "there is no ledger entry with this id".into();
-        return Ok(r);
-    }
     let Verdict::Release(why) = a.verdict else {
         return Ok(r);
     };
@@ -965,6 +975,30 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
     }
     r.released = true;
     Ok(r)
+}
+
+/// Remove the oldest `.applied` markers, keeping the newest `keep` (the
+/// history keeps as many records, so a marker older than that guards a
+/// measurement whose record is gone anyway). Returns how many were removed.
+pub fn gc_measurements(ctx: &Context, keep: usize) -> Result<usize> {
+    let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
+    let Ok(rd) = std::fs::read_dir(ctx.paths.measurements_dir()) else {
+        return Ok(0);
+    };
+    let mut applied: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "applied"))
+        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+        .collect();
+    applied.sort_by(|a, b| b.cmp(a));
+    let mut removed = 0;
+    for (_, p) in applied.into_iter().skip(keep) {
+        if std::fs::remove_file(&p).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

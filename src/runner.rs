@@ -88,7 +88,7 @@ const MARKER_POLL: Duration = Duration::from_millis(100);
 /// How long to wait for marked processes to be gone after SIGKILL; a scan
 /// reads every process of the user, so it is slower than a group probe.
 const MARKER_KILL_WAIT: Duration = Duration::from_secs(8);
-/// Rescans before an unknown answer is believed.
+/// Rescans before an unknown answer is believed (see [`settled_scan`]).
 const UNKNOWN_RETRIES: usize = 3;
 
 fn group_empty(pgid: libc::pid_t) -> bool {
@@ -122,21 +122,41 @@ fn clear_group(ctx: &Context, pgid: libc::pid_t) -> bool {
     false
 }
 
-/// Stop every process still carrying `CANIRUN_MANAGED_ID=<id>`: SIGTERM,
-/// a grace, then SIGKILL, signalling only a pid that is still the process
-/// that was seen. True only when a scan then finds none and every process
-/// could be read.
-pub(crate) fn stop_marked(ctx: &Context, id: &str) -> bool {
-    // A process that exits while the scan reads it can make one scan
-    // "unknown"; only an answer that stays unknown counts.
-    let mut scan = ctx.scan.scan(id);
-    for _ in 0..UNKNOWN_RETRIES {
-        if scan.probe != Probe::Unknown {
-            break;
+/// Scan for the processes of managed command `id` until the answer can be
+/// believed. A process that exits while the scan reads it can make one scan
+/// `Unknown` (only an answer that stays unknown through
+/// [`UNKNOWN_RETRIES`] rescans counts) or miss a process that was just
+/// forked (so `Gone` must come twice in a row). `Alive` is believed at once.
+pub(crate) fn settled_scan(ctx: &Context, id: &str) -> crate::marker::Scan {
+    let (mut gone, mut unknown) = (0, 0);
+    loop {
+        let scan = ctx.scan_marked(id);
+        match scan.probe {
+            Probe::Alive => return scan,
+            Probe::Gone => {
+                gone += 1;
+                if gone >= 2 {
+                    return scan;
+                }
+            }
+            Probe::Unknown => {
+                gone = 0;
+                unknown += 1;
+                if unknown > UNKNOWN_RETRIES {
+                    return scan;
+                }
+            }
         }
         ctx.clock.sleep(MARKER_POLL);
-        scan = ctx.scan.scan(id);
     }
+}
+
+/// Stop every process still carrying `CANIRUN_MANAGED_ID=<id>` (and this
+/// state directory's scope): SIGTERM, a grace, then SIGKILL, signalling
+/// only a pid that is still the process that was seen. True only when
+/// scans then find none, twice in a row, and every process could be read.
+pub(crate) fn stop_marked(ctx: &Context, id: &str) -> bool {
+    let mut scan = settled_scan(ctx, id);
     if scan.probe != Probe::Alive {
         return scan.probe == Probe::Gone;
     }
@@ -150,7 +170,7 @@ pub(crate) fn stop_marked(ctx: &Context, id: &str) -> bool {
         let until = ctx.clock.monotonic() + wait;
         loop {
             ctx.clock.sleep(MARKER_POLL);
-            scan = ctx.scan.scan(id);
+            scan = settled_scan(ctx, id);
             if scan.probe != Probe::Alive {
                 return scan.probe == Probe::Gone;
             }
@@ -182,7 +202,8 @@ pub fn run_with(
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     }
     if let Some(id) = spawn.marker_id {
-        cmd.env(marker::ENV_VAR, id);
+        cmd.env(marker::ENV_VAR, id)
+            .env(marker::SCOPE_VAR, marker::scope(ctx.paths.state_dir()));
     }
     let child = cmd
         .spawn()
@@ -289,6 +310,95 @@ fn normalise_maxrss(raw: u64) -> u64 {
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    use crate::marker::{ProcRef, Scan};
+    use crate::{FakeClock, NoSupervisor, Paths, ProcessScan};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// Answers the scripted probes in order, then the last one forever, and
+    /// counts the scans.
+    struct Scripted {
+        left: Mutex<VecDeque<Probe>>,
+        last: Mutex<Probe>,
+        calls: Mutex<usize>,
+    }
+
+    impl ProcessScan for Scripted {
+        fn scan(&self, _id: &str, _scope: &str) -> Scan {
+            *self.calls.lock().unwrap() += 1;
+            let mut left = self.left.lock().unwrap();
+            let probe = left.pop_front().unwrap_or(*self.last.lock().unwrap());
+            *self.last.lock().unwrap() = probe;
+            // A marked process whose start time is unknown is never signalled.
+            let alive = if probe == Probe::Alive {
+                vec![ProcRef {
+                    pid: u32::MAX,
+                    start_time: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            Scan { probe, alive }
+        }
+    }
+
+    /// The probes the scan answers (then the last repeats) and how many
+    /// scans one call to `f` made.
+    fn scripted<T>(probes: &[Probe], f: impl FnOnce(&Context) -> T) -> (T, usize) {
+        let scan = Arc::new(Scripted {
+            left: Mutex::new(probes.iter().copied().collect()),
+            last: Mutex::new(*probes.last().unwrap()),
+            calls: Mutex::new(0),
+        });
+        let ctx = Context::new(Paths::new("/nonexistent-state", "/nonexistent-config"))
+            .with_clock(Arc::new(FakeClock::new(chrono::Utc::now())))
+            .with_supervisor(Arc::new(NoSupervisor))
+            .with_scan(scan.clone());
+        let out = f(&ctx);
+        let n = *scan.calls.lock().unwrap();
+        (out, n)
+    }
+
+    use Probe::{Alive, Gone, Unknown};
+
+    #[test]
+    fn gone_is_believed_only_when_it_comes_twice_in_a_row() {
+        let (s, n) = scripted(&[Gone, Gone], |c| settled_scan(c, "i"));
+        assert_eq!((s.probe, n), (Gone, 2));
+        let (s, n) = scripted(&[Gone, Alive], |c| settled_scan(c, "i"));
+        assert_eq!((s.probe, n), (Alive, 2));
+        // An unknown between two clear scans starts the count again.
+        let (s, n) = scripted(&[Gone, Unknown, Gone, Gone], |c| settled_scan(c, "i"));
+        assert_eq!((s.probe, n), (Gone, 4));
+        let (s, n) = scripted(&[Alive], |c| settled_scan(c, "i"));
+        assert_eq!((s.probe, n), (Alive, 1));
+    }
+
+    #[test]
+    fn unknown_is_rescanned_a_few_times_before_it_is_believed() {
+        let (s, n) = scripted(&[Unknown], |c| settled_scan(c, "i"));
+        assert_eq!((s.probe, n), (Unknown, UNKNOWN_RETRIES + 1));
+        let (s, n) = scripted(&[Unknown, Unknown, Unknown, Gone, Gone], |c| {
+            settled_scan(c, "i")
+        });
+        assert_eq!((s.probe, n), (Gone, 5));
+    }
+
+    #[test]
+    fn stop_marked_confirms_gone_twice_and_retries_unknown_after_signalling() {
+        assert!(!scripted(&[Unknown], |c| stop_marked(c, "i")).0);
+        assert!(scripted(&[Gone, Gone], |c| stop_marked(c, "i")).0);
+        assert!(!scripted(&[Gone, Alive, Alive], |c| stop_marked(c, "i")).0);
+        // After the signals an unknown is rescanned like the first one, and
+        // a single clear scan is not enough.
+        let after = [Alive, Unknown, Unknown, Unknown, Gone, Gone];
+        assert!(scripted(&after, |c| stop_marked(c, "i")).0);
+        let one_clear = [Alive, Gone, Alive];
+        assert!(!scripted(&one_clear, |c| stop_marked(c, "i")).0);
+        let stays_unknown = [Alive, Unknown];
+        assert!(!scripted(&stays_unknown, |c| stop_marked(c, "i")).0);
+    }
 
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()

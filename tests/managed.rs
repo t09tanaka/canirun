@@ -700,8 +700,15 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
         "{said}"
     );
     let (code, said) = text(&["resolve", "c"]);
-    assert_eq!(code, 1, "{said}");
-    assert!(said.contains("no ledger entry"), "{said}");
+    // No such entry is neither "released" (0) nor "kept" (1) nor an error (2).
+    assert_eq!(code, 3, "{said}");
+    assert!(said.contains("no such entry"), "{said}");
+    assert!(!said.contains("still charged"), "{said}");
+    let (code, said) = text(&["resolve", "c", "--json"]);
+    assert_eq!(code, 3, "{said}");
+    let v: serde_json::Value = serde_json::from_str(&said).unwrap();
+    assert_eq!(v["found"], false);
+    assert_eq!(v["verdict"], "NoEntry");
     assert!(ledger(&lib).find("c").is_none());
     assert_eq!(
         sidecar(&lib, "c").terminal.unwrap().kind,
@@ -902,7 +909,7 @@ fn resolve_checked_releases_only_what_the_checks_allow() {
         .unwrap()
         .contains("canirun resolve"));
     let again = managed::resolve_checked(&with(Probe::Gone), "r").unwrap();
-    assert!(!again.released && again.verdict == "NoEntry");
+    assert!(!again.released && !again.found && again.verdict == "NoEntry");
 }
 
 #[test]
@@ -995,6 +1002,15 @@ fn helper_entry() {
             });
         }
         c.spawn().unwrap();
+        // Leave only once the sleeper has ignored SIGTERM and written its
+        // pid, so the leader's exit is what starts the stop and the SIGKILL
+        // path is certain to be needed.
+        if let Some(f) = pidfile {
+            let end = Instant::now() + Duration::from_secs(10);
+            while !Path::new(&f).exists() && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     } else {
         if std::env::var_os("CANIRUN_TEST_IGNORE_TERM").is_some() {
             unsafe {
@@ -1019,8 +1035,43 @@ fn helper_command(role: &str, pidfile: &Path, ignore_term: bool) -> Vec<String> 
     v
 }
 
+/// Is `pid` a process that still runs? `kill(pid, 0)` succeeds for a zombie
+/// too, and in a container without an init nobody reaps an orphan, so a
+/// zombie counts as dead.
 fn pid_alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    !is_zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: i32) -> bool {
+    // "<pid> (<comm>) <state> ...": the comm may contain anything, so the
+    // state is what follows the last ')'.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            let rest = s.get(s.rfind(')')? + 1..)?;
+            rest.trim_start().chars().next()
+        })
+        .is_some_and(|c| c == 'Z' || c == 'X')
+}
+
+#[cfg(target_os = "macos")]
+fn is_zombie(pid: i32) -> bool {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    n == size && info.pbi_status == libc::SZOMB
 }
 
 fn escaped_case(id: &str, ignore_term: bool) {
@@ -1061,6 +1112,34 @@ fn a_descendant_that_ignores_sigterm_is_killed() {
 }
 
 #[test]
+fn a_process_with_the_same_id_from_another_state_dir_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    // Same id, but admitted by another state directory: not ours to stop
+    // and not a reason to hold the budget.
+    let mut stranger = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "helper_entry", "--nocapture"])
+        .env("CANIRUN_TEST_ROLE", "sleep")
+        .env(canirun::marker::ENV_VAR, "shared-id")
+        .env(
+            canirun::marker::SCOPE_VAR,
+            canirun::marker::scope(other.path()),
+        )
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let s = spec(dir.path(), "shared-id", "d", &["true"]);
+    let (ran, guard) = run_to_end(&ctx, &cfg, &s);
+    assert!(!ran.outcome.descendants_left);
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    assert!(ledger(&ctx).find("shared-id").is_none());
+    assert!(stranger.try_wait().unwrap().is_none(), "it was signalled");
+    stranger.kill().unwrap();
+    stranger.wait().unwrap();
+}
+
+#[test]
 fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path());
@@ -1072,6 +1151,10 @@ fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
         .args(["--exact", "helper_entry", "--nocapture"])
         .env("CANIRUN_TEST_ROLE", "sleep")
         .env(canirun::marker::ENV_VAR, "esc-held")
+        .env(
+            canirun::marker::SCOPE_VAR,
+            canirun::marker::scope(ctx.paths.state_dir()),
+        )
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -1088,4 +1171,32 @@ fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
     survivor.kill().unwrap();
     survivor.wait().unwrap();
     assert!(until(20, || reaped(&ctx).find("esc-held").is_none()));
+}
+
+#[test]
+fn gc_keeps_only_the_newest_applied_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let m = ctx.paths.measurements_dir();
+    std::fs::create_dir_all(&m).unwrap();
+    let base = std::time::SystemTime::now() - Duration::from_secs(1000);
+    for i in 0..5u64 {
+        let f = std::fs::File::create(m.join(format!("m{i}.applied"))).unwrap();
+        f.set_modified(base + Duration::from_secs(i * 10)).unwrap();
+    }
+    std::fs::write(m.join("p.pending"), b"").unwrap();
+    assert_eq!(managed::gc_measurements(&ctx, 3).unwrap(), 2);
+    let mut left: Vec<String> = std::fs::read_dir(&m)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["m2.applied", "m3.applied", "m4.applied", "p.pending"]
+    );
+    assert_eq!(managed::gc_measurements(&ctx, 3).unwrap(), 0);
+    assert_eq!(managed::gc_measurements(&ctx, 0).unwrap(), 3);
+    let none = ctx_with_boot(tempfile::tempdir().unwrap().path(), None);
+    assert_eq!(managed::gc_measurements(&none, 3).unwrap(), 0);
 }

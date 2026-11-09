@@ -56,6 +56,19 @@ the minor version).
 
 ### Fixed
 
+- Managed commands, review fixes: on macOS the arguments of a process were
+  searched for the marker as well as its environment, so an argument could
+  hide or fake it; only the environment is read now. The marker also
+  carries `CANIRUN_MANAGED_SCOPE` (a hash of the state directory), and only
+  a process with the same id and scope is waited for or signalled, so the
+  same id in another state directory is left alone. A clear scan has to be
+  repeated before it is believed, and an unknown one is retried after the
+  signals too. A process whose owner cannot be read is read anyway
+  instead of being skipped. Nested managed commands track the innermost one.
+- `canirun resolve` on an id the ledger does not have says `no such entry`
+  (exit 3, `"found": false` in `--json`) instead of "kept, still charged".
+- `canirun gc` removes old `measurements/*.applied` markers (it keeps the
+  newest `history_keep`); they used to pile up.
 - A job that received SIGTERM twice in a row while queued could die before
   its exit file was written and show as lost. The library no longer restores
   default signal handling on its own; the CLI does it just before it

@@ -92,9 +92,10 @@ pub fn signal_if_same(p: &ProcRef, sig: libc::c_int) -> bool {
     unsafe { libc::kill(p.pid as libc::pid_t, sig) == 0 }
 }
 
-/// Look for processes of this user carrying `CANIRUN_MANAGED_ID=<id>`.
-pub fn scan_system(id: &str) -> Scan {
-    marker::classify(&observe_all(), id, std::process::id())
+/// Look for processes of this user carrying `CANIRUN_MANAGED_ID=<id>` and
+/// `CANIRUN_MANAGED_SCOPE=<scope>`.
+pub fn scan_system(id: &str, scope: &str) -> Scan {
+    marker::classify(&observe_all(), id, scope, std::process::id())
 }
 
 /// The environment marker of every live, non-zombie process of this user.
@@ -114,11 +115,22 @@ fn observe_all() -> Vec<Seen> {
         if p.thread_kind().is_some() {
             continue;
         }
-        if matches!(p.status(), ProcessStatus::Zombie) || p.user_id().is_none_or(|u| **u != me) {
+        if matches!(p.status(), ProcessStatus::Zombie) {
             continue;
         }
         let pid = pid.as_u32();
-        let Some(marker) = read_marker(pid) else {
+        // A process whose owner could not be read is not skipped: it is
+        // read, and what the kernel refuses of a process that is not
+        // certainly ours reads as unmarked (on macOS this is every process
+        // of another user, `launchd` included: sysinfo reports no owner for
+        // them and `KERN_PROCARGS2` fails with `EINVAL`). A process known to
+        // be ours that cannot be read is unreadable.
+        let ours = match p.user_id() {
+            Some(u) if **u != me => continue,
+            Some(_) => true,
+            None => false,
+        };
+        let Some(marker) = read_marker(pid, ours) else {
             continue;
         };
         out.push(Seen {
@@ -140,11 +152,12 @@ fn vanished(pid: u32) -> bool {
         || start_time(pid).is_none()
 }
 
-/// `None` when the process is gone.
+/// `None` when the process is gone. `ours`: the process is known to belong
+/// to this user.
 #[cfg(target_os = "linux")]
-fn read_marker(pid: u32) -> Option<Marker> {
+fn read_marker(pid: u32, _ours: bool) -> Option<Marker> {
     match std::fs::read(format!("/proc/{pid}/environ")) {
-        Ok(bytes) => Some(marker::find_marker(&bytes, 0)),
+        Ok(bytes) => Some(marker::find_marker(&bytes)),
         Err(_) if vanished(pid) => None,
         // The kernel withholds the environment of a process that made itself
         // non-dumpable (an agent, a sandboxed helper). A descendant of a
@@ -155,9 +168,10 @@ fn read_marker(pid: u32) -> Option<Marker> {
     }
 }
 
-/// `None` when the process is gone.
+/// `None` when the process is gone. `ours`: the process is known to belong
+/// to this user.
 #[cfg(target_os = "macos")]
-fn read_marker(pid: u32) -> Option<Marker> {
+fn read_marker(pid: u32, ours: bool) -> Option<Marker> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut len: libc::size_t = 0;
     let sized = unsafe {
@@ -187,7 +201,9 @@ fn read_marker(pid: u32) -> Option<Marker> {
         -1
     };
     if rc != 0 {
-        let denied = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        // Another user's process is refused with `EINVAL`.
+        let denied = errno == Some(libc::EPERM) || (!ours && errno == Some(libc::EINVAL));
         return if vanished(pid) {
             None
         } else if denied {
@@ -197,15 +213,15 @@ fn read_marker(pid: u32) -> Option<Marker> {
         };
     }
     buf.truncate(len);
-    // The argument count (an i32) comes first. Apple's own binaries (`sh`,
-    // `sleep`, ...) hide their environment from other processes: their block
-    // ends after the arguments, which reads as no marker.
-    Some(marker::find_marker(&buf, 4))
+    // Apple's own binaries (`sh`, `sleep`, ...) hide their environment from
+    // other processes: their block ends after the arguments, which reads as
+    // no marker.
+    Some(marker::parse_procargs(&buf))
 }
 
 /// No reader for this OS: nothing can be ruled out.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_marker(pid: u32) -> Option<Marker> {
+fn read_marker(pid: u32, _ours: bool) -> Option<Marker> {
     (!vanished(pid)).then_some(Marker::Unreadable)
 }
 
@@ -302,9 +318,23 @@ mod tests {
         }
     }
 
+    /// Scan until `probe` is `Gone`, for a few seconds: a bystander that
+    /// exits while being read makes one scan `Unknown`.
+    fn gone_soon(id: &str, scope: &str) -> Probe {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let probe = scan_system(id, scope).probe;
+            if probe == Probe::Gone || std::time::Instant::now() >= end {
+                return probe;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn a_marked_process_is_found_until_it_dies() {
         let id = format!("scan-test-{}", std::process::id());
+        let scope = "0123456789abcdef";
         let mut c = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -313,15 +343,18 @@ mod tests {
             ])
             .env("CANIRUN_TEST_SLEEPER", "1")
             .env(marker::ENV_VAR, &id)
+            .env(marker::SCOPE_VAR, scope)
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let found = scan_system(&id);
+        let found = scan_system(&id, scope);
         assert_eq!(found.probe, Probe::Alive, "{found:?}");
         assert_eq!(found.alive.len(), 1);
         assert_eq!(found.alive[0].pid, c.id());
         assert!(found.alive[0].start_time.is_some());
-        assert_eq!(scan_system(&format!("{id}-other")).probe, Probe::Gone);
+        assert_eq!(gone_soon(&format!("{id}-other"), scope), Probe::Gone);
+        // The same id under another scope is not this command.
+        assert_eq!(gone_soon(&id, "fedcba9876543210"), Probe::Gone);
         // Only a pid that is still the same process is signalled.
         let mut stale = found.alive[0];
         stale.start_time = stale.start_time.map(|t| t + 1000);
@@ -331,7 +364,7 @@ mod tests {
         assert!(c.try_wait().unwrap().is_none());
         assert!(signal_if_same(&found.alive[0], libc::SIGKILL));
         c.wait().unwrap();
-        assert_eq!(scan_system(&id).probe, Probe::Gone);
+        assert_eq!(gone_soon(&id, scope), Probe::Gone);
     }
 
     #[test]

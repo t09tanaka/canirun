@@ -270,10 +270,12 @@ themselves once their processes stop. Two kinds are not: an entry whose
 sidecar cannot be read, and a launch intent whose timestamp is missing. For
 those, `canirun resolve <id>` runs the same checks on demand: the owner's
 lease must be gone, and the child, its process group and every process of
-yours carrying `CANIRUN_MANAGED_ID=<id>` must be gone, with every process
-readable. It prints the entry's state, what was checked and the result, and
+yours carrying `CANIRUN_MANAGED_ID=<id>` (and this state directory's
+`CANIRUN_MANAGED_SCOPE`) must be gone, with every process readable. It prints the entry's state, what was checked and the result, and
 records the outcome as `interrupted`. Exit 0 means released, 1 means kept
-(still charged), 2 an error. It never kills anything.
+(still charged), 2 an error, 3 that the ledger has no entry with that id
+(it prints `no such entry`, and `--json` has `"found": false` and
+`"verdict": "NoEntry"`). It never kills anything.
 
 A launch intent (the supervisor died around the spawn, so it is unknown
 whether a child exists) is released by the reaper itself once the lease is
@@ -294,8 +296,20 @@ What this cannot see, and the safe-side behaviour that results:
 - The process group check does not compare start times, so a pid that was
   reused by an unrelated process in the same group id can keep an entry held
   for a while. That errs on the side of keeping the budget.
-- The marker is the id alone. Two canirun state directories that use the
-  same command id can hold each other's entries; that is also the safe side.
+- The marker is the id plus a scope, `CANIRUN_MANAGED_SCOPE`: the first 16
+  hex digits of the SHA-256 of the state directory's canonical path. Two
+  state directories that use the same command id do not see, hold or stop
+  each other's processes.
+- Only the innermost managed command is tracked: one started inside another
+  managed command overwrites the outer id and scope in its environment.
+- On macOS the arguments of a process are read apart from its environment,
+  so an argument that looks like the marker is not mistaken for it.
+- A process whose owner the OS does not report is read anyway, not skipped.
+  If the kernel refuses its environment it is taken for another user's and
+  read as unmarked; one known to be yours that cannot be read makes the scan
+  "unknown".
+- A scan that finds nothing is repeated once and believed only if it finds
+  nothing again; an unknown one is repeated a few times first.
 - Only processes of the same user are scanned. If one of them fails to be
   read for a reason other than the OS withholding its environment, the scan
   is "unknown" and nothing is released on its account.
@@ -304,8 +318,10 @@ What this cannot see, and the safe-side behaviour that results:
 
 `config` prints the effective configuration (defaults merged with the
 file). `gc` reaps dead entries and trims history to `history_keep`
-records per key; both also happen on the fly, so `gc` is only for
-tidiness.
+records per key, and keeps the newest `history_keep` of the
+`measurements/*.applied` markers that `managed::record_measurement`
+leaves (one per measurement); both also happen on the fly, so `gc` is
+only for tidiness.
 
 ## Configuration
 

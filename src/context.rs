@@ -138,10 +138,10 @@ impl BootIdProvider for FixedBoot {
     }
 }
 
-/// Where the answer to "is anything still running with this managed id in
-/// its environment?" comes from (see [`crate::marker`]).
+/// Where the answer to "is anything still running with this managed id and
+/// scope in its environment?" comes from (see [`crate::marker`]).
 pub trait ProcessScan: Send + Sync {
-    fn scan(&self, id: &str) -> crate::marker::Scan;
+    fn scan(&self, id: &str, scope: &str) -> crate::marker::Scan;
 }
 
 /// This machine's processes of the current user.
@@ -149,8 +149,8 @@ pub trait ProcessScan: Send + Sync {
 pub struct SystemScan;
 
 impl ProcessScan for SystemScan {
-    fn scan(&self, id: &str) -> crate::marker::Scan {
-        crate::process::scan_system(id)
+    fn scan(&self, id: &str, scope: &str) -> crate::marker::Scan {
+        crate::process::scan_system(id, scope)
     }
 }
 
@@ -168,7 +168,7 @@ impl FixedScan {
 }
 
 impl ProcessScan for FixedScan {
-    fn scan(&self, _id: &str) -> crate::marker::Scan {
+    fn scan(&self, _id: &str, _scope: &str) -> crate::marker::Scan {
         self.0.clone()
     }
 }
@@ -223,6 +223,13 @@ pub struct Context {
 }
 
 impl Context {
+    /// One scan for the processes of managed command `id` admitted by this
+    /// context's state directory.
+    pub fn scan_marked(&self, id: &str) -> crate::marker::Scan {
+        self.scan
+            .scan(id, &crate::marker::scope(self.paths.state_dir()))
+    }
+
     /// Real clocks, real machine metrics, no signal handling.
     pub fn new(paths: Paths) -> Self {
         Context {
