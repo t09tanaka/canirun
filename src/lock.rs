@@ -151,17 +151,22 @@ pub fn snapshot_read_only(ctx: &Context) -> Result<ReadOnlySnapshot> {
         Err(e) => return Err(e.into()),
     };
     let locked = guard.is_some();
-    let ledger = Ledger::load(&ctx.paths.ledger_file());
+    // Probe the leases while the shared lock is still held: an owner
+    // removes its entry under the exclusive lock before dropping the
+    // lease, so every entry read here still has its lease held.
+    let read = Ledger::load(&ctx.paths.ledger_file()).map(|ledger| {
+        let suspect_dead: Vec<String> = ledger
+            .entries
+            .iter()
+            .filter(|e| !lease_is_held(ctx, &e.id))
+            .map(|e| e.id.clone())
+            .collect();
+        (ledger, suspect_dead)
+    });
     if let Some(f) = &guard {
         let _ = FileExt::unlock(f);
     }
-    let ledger = ledger?;
-    let suspect_dead = ledger
-        .entries
-        .iter()
-        .filter(|e| !lease_is_held(ctx, &e.id))
-        .map(|e| e.id.clone())
-        .collect();
+    let (ledger, suspect_dead) = read?;
     Ok(ReadOnlySnapshot {
         ledger,
         locked,
@@ -246,5 +251,82 @@ pub fn sweep_orphan_leases(ctx: &Context, ledger: &Ledger) {
         if ledger.find(id).is_none() && !lease_is_held(ctx, id) {
             let _ = std::fs::remove_file(ent.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admit::State;
+    use crate::ledger::Entry;
+    use crate::paths::Paths;
+    use chrono::Utc;
+
+    fn entry(id: &str, seq: u64) -> Entry {
+        Entry {
+            id: id.into(),
+            pid: 1,
+            state: State::Running,
+            front: false,
+            weight: 1,
+            predicted_rss: 0,
+            expected_secs: None,
+            repo: String::new(),
+            subdir: String::new(),
+            argv: "x".into(),
+            key: "k".into(),
+            seq,
+            enqueued_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            using: None,
+            backfilled: false,
+        }
+    }
+
+    fn state_with(ids: &[&str]) -> (tempfile::TempDir, Context) {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = Context::new(Paths::new(d.path().join("state"), d.path().join("c.toml")));
+        let mut l = Ledger::default();
+        for id in ids {
+            let s = l.take_seq();
+            l.entries.push(entry(id, s));
+        }
+        drop(ledger(&ctx).unwrap());
+        l.save(&ctx.paths.ledger_file()).unwrap();
+        (d, ctx)
+    }
+
+    #[test]
+    fn read_only_snapshot_judges_leases_under_the_shared_lock() {
+        let (_d, ctx) = state_with(&["a", "b"]);
+        let lease = take_lease(&ctx, "a").unwrap();
+        let snap = snapshot_read_only(&ctx).unwrap();
+        assert!(snap.locked);
+        assert_eq!(snap.ledger.entries.len(), 2);
+        // "a" has its owner, "b" has none; nothing is removed.
+        assert_eq!(snap.suspect_dead, vec!["b".to_string()]);
+        drop(lease);
+        let snap = snapshot_read_only(&ctx).unwrap();
+        assert_eq!(snap.suspect_dead.len(), 2);
+    }
+
+    #[test]
+    fn read_only_snapshot_releases_its_shared_lock() {
+        let (_d, ctx) = state_with(&["a"]);
+        let _lease = take_lease(&ctx, "a").unwrap();
+        snapshot_read_only(&ctx).unwrap();
+        // An exclusive lock is available right after.
+        let g = acquire(&ctx.paths.ledger_lock(), Duration::from_millis(100));
+        assert!(g.is_ok());
+    }
+
+    #[test]
+    fn read_only_snapshot_without_a_lock_file_creates_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = Context::new(Paths::new(d.path().join("state"), d.path().join("c.toml")));
+        let snap = snapshot_read_only(&ctx).unwrap();
+        assert!(!snap.locked);
+        assert!(snap.ledger.entries.is_empty());
+        assert!(!d.path().join("state").exists());
     }
 }

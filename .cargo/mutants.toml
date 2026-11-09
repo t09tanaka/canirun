@@ -2,6 +2,7 @@
 # the end-to-end tests in tests/cli.rs, where mutation runs would mostly
 # measure timing and process plumbing.
 examine_globs = ["src/admit.rs", "src/weight.rs", "src/key.rs", "src/eta.rs", "src/forecast.rs"]
-# Loop bounds that are never reached: a bigger or smaller bound gives the
-# same answers, and the loop cannot run away.
-exclude_re = ["iteration_cap"]
+# Only the arithmetic inside the loop bound is excluded: a bigger or smaller
+# bound gives the same answers, and the loop cannot run away. Replacing the
+# whole function (0 or 1 passes) changes the answers and stays in the gate.
+exclude_re = ["in iteration_cap$"]

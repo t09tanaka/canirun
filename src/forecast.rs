@@ -240,8 +240,27 @@ pub struct NodeForecast {
 }
 
 /// The plan as a whole: `ready_in_ms` and `start_in_ms` are the earliest
-/// over the nodes, `finish_in_ms` the latest, `queue_wait_after_ready_ms`
-/// and `execution_ms` the totals. A null node value makes the total null.
+/// over the nodes, `finish_in_ms` the latest. A null node value makes the
+/// aggregate null.
+///
+/// A sum of node times is not a time on the clock once nodes can run side
+/// by side (four 20 s nodes in parallel finish after 20 s, not 80 s), so
+/// for a plan of two or more nodes `queue_wait_after_ready_ms` and
+/// `execution_ms` are null, with the reason in `null_reasons`. What the
+/// plan reports instead is its critical path: starting from the node that
+/// finishes last, `critical_path` follows what decided each start back in
+/// time (the dependency that finished last, or for a node without
+/// dependencies the plan node whose finish freed the budget it started on;
+/// it stops where neither exists) and lists those nodes in running order.
+/// `critical_path_execution_ms` adds up their execution times and
+/// `critical_path_wait_ms` their queue waits after becoming ready, except
+/// that a wait spent behind the next path node is already part of that
+/// node's execution and is not counted twice. Together with any ready
+/// floor or external delay on the path they make up `finish_in_ms`. For a
+/// single node the two values equal that node's own. A null value on the
+/// path makes the matching total null (reason in `null_reasons`); a node
+/// that never finishes in the simulation leaves the path empty and both
+/// totals null.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanForecast {
     pub attempt_id: String,
@@ -249,6 +268,12 @@ pub struct PlanForecast {
     pub expansion_seq: u64,
     #[serde(flatten)]
     pub timing: Timing,
+    #[serde(default)]
+    pub critical_path: Vec<String>,
+    #[serde(default)]
+    pub critical_path_wait_ms: Option<u64>,
+    #[serde(default)]
+    pub critical_path_execution_ms: Option<u64>,
     pub nodes: Vec<NodeForecast>,
 }
 
@@ -365,6 +390,10 @@ struct Job {
     live_hold: bool,
     /// Why `dur_ms` is None.
     unknown_note: Option<String>,
+    /// Recorded runs behind the runtime.
+    history_count: usize,
+    /// Read from the ledger rather than created by the forecast.
+    from_ledger: bool,
 }
 
 impl Job {
@@ -398,6 +427,8 @@ impl Job {
             } else {
                 None
             },
+            history_count: runtime.history_count,
+            from_ledger: false,
         }
     }
 }
@@ -683,6 +714,23 @@ fn timing_of(
     }
 
     let start = j.start_ms;
+    // Ledger entries whose finish opened the budget this node started on:
+    // a start that rests on an entry with little history is as uncertain
+    // as the entry's runtime.
+    let mut history_floor = meta.runtime.history_count;
+    if let Some(s) = start.filter(|s| *s > 0) {
+        for (k, y) in jobs.iter().enumerate() {
+            if k != i && y.from_ledger && y.finish_ms == Some(s) {
+                history_floor = history_floor.min(y.history_count);
+                if y.history_count < 3 {
+                    assumptions.push(format!(
+                        "start follows ledger entry {} with only {} recorded runs",
+                        y.id, y.history_count
+                    ));
+                }
+            }
+        }
+    }
     let tainted_start = start.is_some_and(|s| {
         jobs.iter()
             .enumerate()
@@ -751,7 +799,7 @@ fn timing_of(
     };
 
     let mut confidence = if finish.is_some() {
-        match meta.runtime.history_count {
+        match history_floor {
             0..=2 => Confidence::Medium,
             _ => Confidence::High,
         }
@@ -796,6 +844,124 @@ fn sum_all(it: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     Some(total)
 }
 
+/// What the simulation says about one plan node, for the critical path.
+struct PathInfo {
+    /// Indices (into the plan's nodes) of the dependencies.
+    deps: Vec<usize>,
+    ready: Option<u64>,
+    start: Option<u64>,
+    finish: Option<u64>,
+}
+
+struct CriticalPath {
+    nodes: Vec<String>,
+    wait_ms: Option<u64>,
+    execution_ms: Option<u64>,
+    null_reasons: BTreeMap<String, String>,
+}
+
+/// Walk back from the node that finishes last (see [`PlanForecast`]).
+fn critical_path(nodes: &[NodeForecast], info: &[PathInfo]) -> CriticalPath {
+    let mut out = CriticalPath {
+        nodes: Vec::new(),
+        wait_ms: Some(0),
+        execution_ms: Some(0),
+        null_reasons: BTreeMap::new(),
+    };
+    if nodes.is_empty() {
+        return out;
+    }
+    let finishes: Option<Vec<u64>> = info.iter().map(|n| n.finish).collect();
+    let Some(finishes) = finishes else {
+        let why = "a node does not finish in the simulation";
+        out.wait_ms = None;
+        out.execution_ms = None;
+        out.null_reasons
+            .insert("critical_path_wait_ms".into(), why.into());
+        out.null_reasons
+            .insert("critical_path_execution_ms".into(), why.into());
+        return out;
+    };
+    let mut cur = 0;
+    for (k, f) in finishes.iter().enumerate() {
+        if *f > finishes[cur] {
+            cur = k;
+        }
+    }
+    // (node, its wait is covered by the next node on the path)
+    let mut path: Vec<(usize, bool)> = Vec::new();
+    let mut visited = vec![false; nodes.len()];
+    loop {
+        visited[cur] = true;
+        let n = &info[cur];
+        let mut pred = None;
+        for &d in &n.deps {
+            if pred.is_none_or(|p: usize| finishes[d] > finishes[p]) {
+                pred = Some(d);
+            }
+        }
+        let mut covered = false;
+        // Every node on a finished path has started, so `start` is known.
+        if pred.is_none() && n.start > n.ready {
+            let s = n.start.unwrap_or(0);
+            pred = (0..nodes.len()).find(|&k| !visited[k] && finishes[k] == s);
+            covered = pred.is_some();
+        }
+        path.push((cur, covered));
+        match pred {
+            Some(p) if !visited[p] => cur = p,
+            _ => break,
+        }
+    }
+    path.reverse();
+    let mut wait = Some(0u64);
+    let mut exec = Some(0u64);
+    let mut why_wait = Vec::new();
+    let mut why_exec = Vec::new();
+    for &(k, covered) in &path {
+        let t = &nodes[k].timing;
+        out.nodes.push(nodes[k].node_id.clone());
+        if !covered {
+            match t.queue_wait_after_ready_ms {
+                Some(w) => wait = wait.and_then(|a| a.checked_add(w)),
+                None => {
+                    wait = None;
+                    why_wait.push(null_reason(&nodes[k], "queue_wait_after_ready_ms"));
+                }
+            }
+        }
+        match t.execution_ms {
+            Some(x) => exec = exec.and_then(|a| a.checked_add(x)),
+            None => {
+                exec = None;
+                why_exec.push(null_reason(&nodes[k], "execution_ms"));
+            }
+        }
+    }
+    out.wait_ms = wait;
+    out.execution_ms = exec;
+    if wait.is_none() {
+        out.null_reasons
+            .insert("critical_path_wait_ms".into(), why_wait.join("; "));
+    }
+    if exec.is_none() {
+        out.null_reasons
+            .insert("critical_path_execution_ms".into(), why_exec.join("; "));
+    }
+    out
+}
+
+fn null_reason(n: &NodeForecast, key: &str) -> String {
+    format!(
+        "{}: {}",
+        n.node_id,
+        n.timing
+            .null_reasons
+            .get(key)
+            .map_or("unknown", String::as_str)
+    )
+}
+
 fn summarize(nodes: &[NodeForecast]) -> Timing {
     let t = |f: fn(&Timing) -> Option<u64>| nodes.iter().map(move |n| f(&n.timing));
     let mut nulls = BTreeMap::new();
@@ -826,12 +992,30 @@ fn summarize(nodes: &[NodeForecast]) -> Timing {
     };
     let ready = agg("ready_in_ms", min_of(t(|x| x.ready_in_ms).collect()));
     let start = agg("start_in_ms", min_of(t(|x| x.start_in_ms).collect()));
-    let wait = agg(
-        "queue_wait_after_ready_ms",
-        sum_all(t(|x| x.queue_wait_after_ready_ms)),
-    );
-    let exec = agg("execution_ms", sum_all(t(|x| x.execution_ms)));
+    // Several nodes may run side by side: their sum is not a clock value.
+    let parallel = nodes.len() >= 2;
+    let wait = if parallel {
+        None
+    } else {
+        agg(
+            "queue_wait_after_ready_ms",
+            sum_all(t(|x| x.queue_wait_after_ready_ms)),
+        )
+    };
+    let exec = if parallel {
+        None
+    } else {
+        agg("execution_ms", sum_all(t(|x| x.execution_ms)))
+    };
     let finish = agg("finish_in_ms", max_of(t(|x| x.finish_in_ms).collect()));
+    if parallel {
+        for name in ["queue_wait_after_ready_ms", "execution_ms"] {
+            nulls.insert(
+                name.to_string(),
+                "a plan with several nodes may run them in parallel, so a sum is not a time on the clock; see critical_path_*".to_string(),
+            );
+        }
+    }
     let ranking = if nodes.iter().any(|n| n.timing.ranking.is_some()) {
         let all = |f: fn(&Ranking) -> Option<u64>| {
             nodes
@@ -894,7 +1078,11 @@ fn summarize(nodes: &[NodeForecast]) -> Timing {
     }
 }
 
-fn ledger_job(e: &crate::inspect::InspectedEntry, taken_at: DateTime<Utc>) -> Job {
+fn ledger_job(
+    e: &crate::inspect::InspectedEntry,
+    taken_at: DateTime<Utc>,
+    history_count: usize,
+) -> Job {
     let entry = &e.entry;
     let running = entry.state == State::Running;
     let rt = Runtime {
@@ -916,23 +1104,26 @@ fn ledger_job(e: &crate::inspect::InspectedEntry, taken_at: DateTime<Utc>) -> Jo
     );
     j.seq = entry.seq;
     j.in_plan = false;
+    j.history_count = history_count;
+    j.from_ledger = true;
     if running {
         let elapsed_ms = entry
             .started_at
-            .map(|s| (taken_at - s).num_milliseconds().max(0) as u64)
-            .unwrap_or(0);
+            .map(|s| (taken_at - s).num_milliseconds().max(0) as u64);
         j.st = St::Running;
         j.start_ms = Some(0);
         j.ready_ms = Some(0);
         j.using = entry.using;
         j.backfilled = entry.backfilled;
-        match j.dur_ms {
-            Some(d) if d > elapsed_ms && !e.suspect_dead => j.dur_ms = Some(d - elapsed_ms),
+        match (j.dur_ms, elapsed_ms) {
+            (Some(d), Some(el)) if d > el && !e.suspect_dead => j.dur_ms = Some(d - el),
             _ => {
                 j.dur_ms = None;
                 j.measured = false;
                 j.unknown_note = Some(if e.suspect_dead {
                     "owner lease not held; entry still counted, remaining time unknown".into()
+                } else if elapsed_ms.is_none() {
+                    "start time not recorded; remaining time unknown".into()
                 } else {
                     "running longer than its history; remaining time unknown (overrun)".into()
                 });
@@ -957,6 +1148,27 @@ pub fn forecast(
     plan: &WorkloadPlan,
     overlay: &[FutureDemand],
 ) -> Result<Forecast> {
+    // Nodes sharing a shared_id are one piece of work: a dependency between
+    // two of them cannot be honoured once they are one.
+    let shared_of: HashMap<&str, &str> = plan
+        .nodes
+        .iter()
+        .filter_map(|n| Some((n.node_id.as_str(), n.shared_id.as_deref()?)))
+        .collect();
+    for n in &plan.nodes {
+        for d in &n.depends_on {
+            if let (Some(a), Some(b)) =
+                (shared_of.get(n.node_id.as_str()), shared_of.get(d.as_str()))
+            {
+                if a == b && d != &n.node_id {
+                    return Err(Error::Plan(format!(
+                        "shared_id {a}: nodes {} and {d} are merged but {} depends on {d}",
+                        n.node_id, n.node_id
+                    )));
+                }
+            }
+        }
+    }
     // Nodes sharing a shared_id are one piece of work: keep the first.
     let mut remap: HashMap<&str, &str> = HashMap::new();
     let mut first_shared: HashMap<&str, &str> = HashMap::new();
@@ -996,7 +1208,14 @@ pub fn forecast(
     let mut jobs: Vec<Job> = insp
         .entries
         .iter()
-        .map(|e| ledger_job(e, insp.taken_at))
+        .map(|e| {
+            let records = insp
+                .history
+                .iter()
+                .find(|h| h.key == e.entry.key)
+                .map_or(0, |h| h.records);
+            ledger_job(e, insp.taken_at, records)
+        })
         .collect();
     let by_ledger_id: HashMap<String, usize> = jobs
         .iter()
@@ -1019,6 +1238,14 @@ pub fn forecast(
             )
         })
         .collect();
+    for gone in remap.keys() {
+        seen.insert((
+            plan.attempt_id.clone(),
+            plan.plan_digest.clone(),
+            plan.expansion_seq,
+            gone.to_string(),
+        ));
+    }
     let mut shared_seen: HashSet<String> = plan
         .nodes
         .iter()
@@ -1055,6 +1282,10 @@ pub fn forecast(
             .as_ref()
             .is_some_and(|id| by_ledger_id.contains_key(id))
         {
+            // Later demands of the same shared work are that entry too.
+            if let Some(s) = &d.shared_id {
+                shared_seen.insert(s.clone());
+            }
             cover(&mut coverage);
             report.replaced_by_ledger.push(label);
             continue;
@@ -1162,18 +1393,39 @@ pub fn forecast(
             ),
         })
         .collect();
-    let timing = summarize(&node_forecasts);
+    let mut timing = summarize(&node_forecasts);
+    let job_node: HashMap<usize, usize> =
+        node_job.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+    let info: Vec<PathInfo> = node_job
+        .iter()
+        .map(|&i| PathInfo {
+            deps: jobs[i]
+                .deps
+                .iter()
+                .filter_map(|d| job_node.get(d).copied())
+                .collect(),
+            ready: jobs[i].ready_ms,
+            start: jobs[i].start_ms,
+            finish: jobs[i].finish_ms,
+        })
+        .collect();
+    let path = critical_path(&node_forecasts, &info);
+    timing.null_reasons.extend(path.null_reasons);
     // A merged node reports what the node it was merged into reports.
     let mut node_forecasts = node_forecasts;
     let mut merged: Vec<(&str, &str)> = remap.iter().map(|(a, b)| (*a, *b)).collect();
     merged.sort();
     for (gone, kept) in merged {
-        if let Some(k) = node_forecasts.iter().find(|n| n.node_id == kept).cloned() {
-            node_forecasts.push(NodeForecast {
-                node_id: gone.to_string(),
-                timing: k.timing,
-            });
-        }
+        // The kept node is always in the plan, so the lookup finds it.
+        let kept_timing = node_forecasts
+            .iter()
+            .filter(|n| n.node_id == kept)
+            .map(|n| n.timing.clone())
+            .next();
+        node_forecasts.extend(kept_timing.map(|timing| NodeForecast {
+            node_id: gone.to_string(),
+            timing,
+        }));
         coverage
             .entry((
                 plan.attempt_id.clone(),
@@ -1207,6 +1459,9 @@ pub fn forecast(
             plan_digest: plan.plan_digest.clone(),
             expansion_seq: plan.expansion_seq,
             timing,
+            critical_path: path.nodes,
+            critical_path_wait_ms: path.wait_ms,
+            critical_path_execution_ms: path.execution_ms,
             nodes: node_forecasts,
         },
     })
@@ -1358,7 +1613,11 @@ mod tests {
     // not 10 + 30 + 20.
     #[test]
     fn transfer_overlaps_the_queue() {
-        let i = insp(1, calm(), vec![running("r", 1, Some(30.0), 0)]);
+        let i = with_history(
+            insp(1, calm(), vec![running("r", 1, Some(30.0), 0)]),
+            "r",
+            5,
+        );
         let mut n = node("n", 1, Runtime::measured(20.0, 5));
         n.external_delay_ms = 10_000;
         let t = single(&i, n);
@@ -1505,9 +1764,15 @@ mod tests {
         assert_eq!(t.ready_in_ms, Some(0));
         assert_eq!(t.start_in_ms, Some(0));
         assert_eq!(t.finish_in_ms, Some(35_000));
-        assert_eq!(t.execution_ms, Some(33_000));
-        assert_eq!(t.queue_wait_after_ready_ms, Some(0));
-        assert!(t.null_reasons.is_empty());
+        // Two or more nodes: no sums, the critical path instead.
+        assert_eq!(t.execution_ms, None);
+        assert_eq!(t.queue_wait_after_ready_ms, None);
+        assert!(t.null_reasons["execution_ms"].contains("parallel"));
+        assert!(t.null_reasons["queue_wait_after_ready_ms"].contains("parallel"));
+        assert_eq!(f.target.critical_path, ["a", "b"]);
+        // 10 s + 20 s of execution; the 5 s transfer is neither.
+        assert_eq!(f.target.critical_path_execution_ms, Some(30_000));
+        assert_eq!(f.target.critical_path_wait_ms, Some(0));
     }
 
     #[test]
@@ -1711,7 +1976,8 @@ mod tests {
         let s1 = f.target.nodes.iter().find(|n| n.node_id == "s1").unwrap();
         assert_eq!(s1.timing, s2.timing);
         assert_eq!(f.coverage[0].node_ids, ["s1", "s2", "t"]);
-        assert_eq!(f.target.timing.execution_ms, Some(15_000));
+        assert_eq!(f.target.critical_path, ["s1", "t"]);
+        assert_eq!(f.target.critical_path_execution_ms, Some(15_000));
     }
 
     #[test]
@@ -1776,7 +2042,7 @@ mod tests {
             cpu_busy: 0.1,
             load_avg: 0.0,
         });
-        let i = insp(2, live, vec![running("r", 1, Some(30.0), 0)]);
+        let i = with_history(insp(2, live, vec![running("r", 1, Some(30.0), 0)]), "r", 5);
         let mut n = node("n", 1, Runtime::measured(5.0, 3));
         n.predicted_rss = 1 << 30;
         let t = single(&i, n);
@@ -2037,5 +2303,275 @@ mod tests {
             node("n", 1, Runtime::measured(1.0, 3)),
         );
         assert_eq!(t.start_in_ms, Some(30_000));
+    }
+
+    fn nodes_of(f: &Forecast) -> Vec<&str> {
+        f.target.critical_path.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn four_parallel_nodes_are_not_summed() {
+        let ns: Vec<_> = (1..=4)
+            .map(|k| node(&format!("n{k}"), 1, Runtime::measured(20.0, 3)))
+            .collect();
+        let f = run(&insp(4, calm(), vec![]), &plan(ns), &[]);
+        let t = &f.target.timing;
+        assert_eq!(t.finish_in_ms, Some(20_000));
+        assert_eq!((t.execution_ms, t.queue_wait_after_ready_ms), (None, None));
+        assert!(t.null_reasons["execution_ms"].contains("parallel"));
+        assert_eq!(nodes_of(&f), ["n1"]);
+        assert_eq!(f.target.critical_path_execution_ms, Some(20_000));
+        assert_eq!(f.target.critical_path_wait_ms, Some(0));
+    }
+
+    #[test]
+    fn serial_nodes_behind_the_budget_form_the_path() {
+        // Budget 1: b waits for a; the wait is a's execution, not extra.
+        let a = node("a", 1, Runtime::measured(10.0, 3));
+        let b = node("b", 1, Runtime::measured(20.0, 3));
+        let f = run(&insp(1, calm(), vec![]), &plan(vec![a, b]), &[]);
+        assert_eq!(f.target.timing.finish_in_ms, Some(30_000));
+        assert_eq!(nodes_of(&f), ["a", "b"]);
+        assert_eq!(f.target.critical_path_execution_ms, Some(30_000));
+        assert_eq!(f.target.critical_path_wait_ms, Some(0));
+    }
+
+    #[test]
+    fn a_dependency_wins_over_the_budget_and_its_wait_counts() {
+        // Budget 1. p runs 0-10, q 10-15, r (after p) is ready at 10 but
+        // waits for q until 15 and ends at 18.
+        let p = node("p", 1, Runtime::measured(10.0, 3));
+        let q = node("q", 1, Runtime::measured(5.0, 3));
+        let mut r = node("r", 1, Runtime::measured(3.0, 3));
+        r.depends_on = vec!["p".into()];
+        let f = run(&insp(1, calm(), vec![]), &plan(vec![p, q, r]), &[]);
+        assert_eq!(f.target.timing.finish_in_ms, Some(18_000));
+        assert_eq!(nodes_of(&f), ["p", "r"]);
+        assert_eq!(f.target.critical_path_execution_ms, Some(13_000));
+        assert_eq!(f.target.critical_path_wait_ms, Some(5_000));
+    }
+
+    #[test]
+    fn the_diamond_follows_its_slower_side() {
+        let a = node("a", 1, Runtime::measured(10.0, 3));
+        let mut b = node("b", 1, Runtime::measured(20.0, 3));
+        b.depends_on = vec!["a".into()];
+        let mut c = node("c", 1, Runtime::measured(5.0, 3));
+        c.depends_on = vec!["a".into()];
+        let mut d = node("d", 1, Runtime::measured(10.0, 3));
+        d.depends_on = vec!["c".into(), "b".into()];
+        let f = run(&insp(4, calm(), vec![]), &plan(vec![a, b, c, d]), &[]);
+        assert_eq!(f.target.timing.finish_in_ms, Some(40_000));
+        assert_eq!(nodes_of(&f), ["a", "b", "d"]);
+        assert_eq!(f.target.critical_path_execution_ms, Some(40_000));
+        assert_eq!(f.target.critical_path_wait_ms, Some(0));
+        // The first of equally late dependencies is taken.
+        let a = node("a", 1, Runtime::measured(10.0, 3));
+        let b = node("b", 1, Runtime::measured(10.0, 3));
+        let mut d = node("d", 1, Runtime::measured(1.0, 3));
+        d.depends_on = vec!["b".into(), "a".into()];
+        let f = run(&insp(4, calm(), vec![]), &plan(vec![a, b, d]), &[]);
+        assert_eq!(nodes_of(&f), ["b", "d"]);
+    }
+
+    #[test]
+    fn a_wait_on_the_ledger_stops_the_path_and_counts() {
+        let i = insp(1, calm(), vec![running("r", 1, Some(30.0), 0)]);
+        let f = run(
+            &i,
+            &plan(vec![
+                node("n", 1, Runtime::measured(10.0, 3)),
+                node("m", 1, Runtime::measured(1.0, 3)),
+            ]),
+            &[],
+        );
+        assert_eq!(nodes_of(&f), ["n", "m"]);
+        // n waited 30 s on the ledger entry; m followed n.
+        assert_eq!(f.target.critical_path_wait_ms, Some(30_000));
+        assert_eq!(f.target.critical_path_execution_ms, Some(11_000));
+        assert_eq!(f.target.timing.finish_in_ms, Some(41_000));
+    }
+
+    #[test]
+    fn a_single_node_path_equals_its_own_numbers() {
+        let i = insp(1, calm(), vec![running("r", 1, Some(30.0), 0)]);
+        let f = run(
+            &i,
+            &plan(vec![node("n", 1, Runtime::measured(10.0, 3))]),
+            &[],
+        );
+        assert_eq!(nodes_of(&f), ["n"]);
+        assert_eq!(f.target.critical_path_wait_ms, Some(30_000));
+        assert_eq!(f.target.critical_path_execution_ms, Some(10_000));
+        assert_eq!(f.target.timing.execution_ms, Some(10_000));
+        assert_eq!(f.target.timing.queue_wait_after_ready_ms, Some(30_000));
+    }
+
+    #[test]
+    fn an_empty_plan_has_an_empty_path() {
+        let f = run(&insp(1, calm(), vec![]), &plan(vec![]), &[]);
+        assert!(f.target.critical_path.is_empty());
+        assert_eq!(f.target.critical_path_wait_ms, Some(0));
+        assert_eq!(f.target.critical_path_execution_ms, Some(0));
+    }
+
+    #[test]
+    fn a_node_that_never_finishes_leaves_no_path() {
+        let a = node("a", 1, Runtime::unknown());
+        let b = node("b", 1, Runtime::measured(1.0, 3));
+        let f = run(&insp(2, calm(), vec![]), &plan(vec![a, b]), &[]);
+        assert!(f.target.critical_path.is_empty());
+        assert_eq!(f.target.critical_path_wait_ms, None);
+        assert_eq!(f.target.critical_path_execution_ms, None);
+        let r = &f.target.timing.null_reasons;
+        assert!(r["critical_path_wait_ms"].contains("does not finish"));
+        assert!(r["critical_path_execution_ms"].contains("does not finish"));
+    }
+
+    #[test]
+    fn a_fallback_node_on_the_path_makes_its_totals_null_with_a_reason() {
+        let a = node("a", 1, Runtime::fallback());
+        let mut b = node("b", 1, Runtime::measured(1.0, 3));
+        b.depends_on = vec!["a".into()];
+        let f = run(&insp(2, calm(), vec![]), &plan(vec![a, b]), &[]);
+        assert_eq!(nodes_of(&f), ["a", "b"]);
+        assert_eq!(f.target.critical_path_execution_ms, None);
+        assert!(f.target.timing.null_reasons["critical_path_execution_ms"].contains("a: "));
+        // b started after an unmeasured run: its start and wait are null too.
+        assert_eq!(f.target.critical_path_wait_ms, None);
+        assert!(f.target.timing.null_reasons["critical_path_wait_ms"].contains("b: "));
+    }
+
+    #[test]
+    fn zero_length_nodes_do_not_loop_the_path() {
+        // Budget 1, two instant nodes: each "freed" the other's start.
+        let a = node("a", 1, Runtime::measured(0.0, 3));
+        let b = node("b", 1, Runtime::measured(0.0, 3));
+        let f = run(&insp(1, calm(), vec![]), &plan(vec![a, b]), &[]);
+        assert!(!f.target.critical_path.is_empty());
+        assert!(f.target.critical_path.len() <= 2);
+    }
+
+    #[test]
+    fn a_second_overlay_of_shared_work_behind_a_ledger_entry_is_not_new() {
+        let mut first = demand("x", 1, 10.0);
+        first.shared_id = Some("setup".into());
+        first.ledger_entry = Some("w".into());
+        let mut second = demand("y", 1, 10.0);
+        second.shared_id = Some("setup".into());
+        let i = insp(1, calm(), vec![waiting("w", 1, Some(10.0), 2)]);
+        let f = run(
+            &i,
+            &plan(vec![node("n", 1, Runtime::measured(1.0, 3))]),
+            &[first, second],
+        );
+        assert_eq!(f.overlay.replaced_by_ledger, ["other/x"]);
+        assert_eq!(f.overlay.duplicates_dropped, ["other/y"]);
+        assert!(f.overlay.applied.is_empty());
+        // w (10 s) then n: nothing extra.
+        assert_eq!(f.target.timing.finish_in_ms, Some(11_000));
+    }
+
+    #[test]
+    fn an_overlay_with_the_key_of_a_merged_away_node_is_a_duplicate() {
+        let mut s1 = node("s1", 1, Runtime::measured(10.0, 3));
+        s1.shared_id = Some("setup".into());
+        let mut s2 = node("s2", 1, Runtime::measured(10.0, 3));
+        s2.shared_id = Some("setup".into());
+        let mut d = demand("s2", 1, 10.0);
+        d.attempt_id = "att".into();
+        d.plan_digest = "sha256:plan".into();
+        d.expansion_seq = 0;
+        let f = run(&insp(1, calm(), vec![]), &plan(vec![s1, s2]), &[d]);
+        assert_eq!(f.overlay.duplicates_dropped, ["att/s2"]);
+        assert!(f.overlay.applied.is_empty());
+        assert_eq!(f.target.timing.finish_in_ms, Some(10_000));
+    }
+
+    #[test]
+    fn a_dependency_between_merged_nodes_is_named() {
+        let mut s1 = node("s1", 1, Runtime::measured(1.0, 3));
+        s1.shared_id = Some("setup".into());
+        let mut s2 = node("s2", 1, Runtime::measured(1.0, 3));
+        s2.shared_id = Some("setup".into());
+        s2.depends_on = vec!["s1".into()];
+        let err = forecast(
+            &ctx().0,
+            &insp(1, calm(), vec![]),
+            &plan(vec![s1.clone(), s2]),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shared_id setup"), "{err}");
+        assert!(err.contains("s1") && err.contains("s2"), "{err}");
+        assert!(!err.contains("cycle"), "{err}");
+        // Different shared ids, or one without, are fine.
+        let mut other = node("o", 1, Runtime::measured(1.0, 3));
+        other.shared_id = Some("other".into());
+        other.depends_on = vec!["s1".into()];
+        let mut plain = node("p", 1, Runtime::measured(1.0, 3));
+        plain.depends_on = vec!["s1".into()];
+        assert!(forecast(
+            &ctx().0,
+            &insp(1, calm(), vec![]),
+            &plan(vec![s1, other, plain]),
+            &[]
+        )
+        .is_ok());
+    }
+
+    fn with_history(mut i: Inspection, key: &str, records: usize) -> Inspection {
+        i.history.push(crate::inspect::HistoryRef {
+            key: key.into(),
+            records,
+            latest: None,
+        });
+        i
+    }
+
+    #[test]
+    fn a_start_behind_a_thin_ledger_history_lowers_confidence() {
+        let n = node("n", 1, Runtime::measured(10.0, 5));
+        let thin = with_history(
+            insp(1, calm(), vec![running("r", 1, Some(30.0), 0)]),
+            "r",
+            1,
+        );
+        let t = single(&thin, n.clone());
+        assert_eq!(t.finish_in_ms, Some(40_000));
+        assert_eq!(t.confidence, Confidence::Medium);
+        assert!(t.assumptions.iter().any(|a| a.contains("entry r")));
+        let rich = with_history(
+            insp(1, calm(), vec![running("r", 1, Some(30.0), 0)]),
+            "r",
+            5,
+        );
+        let t = single(&rich, n.clone());
+        assert_eq!(t.confidence, Confidence::High);
+        assert!(!t.assumptions.iter().any(|a| a.contains("entry r")));
+        // Not behind the entry: its history does not matter.
+        let idle = with_history(
+            insp(2, calm(), vec![running("r", 1, Some(30.0), 0)]),
+            "r",
+            0,
+        );
+        assert_eq!(single(&idle, n).confidence, Confidence::High);
+    }
+
+    #[test]
+    fn a_running_entry_without_a_start_time_has_unknown_remaining_time() {
+        let mut r = running("r", 1, Some(30.0), 5);
+        r.entry.started_at = None;
+        let t = single(
+            &insp(1, calm(), vec![r]),
+            node("n", 1, Runtime::measured(1.0, 3)),
+        );
+        assert_eq!(t.start_in_ms, None);
+        assert!(t.null_reasons["start_in_ms"].contains("unknown"));
+        assert!(t
+            .assumptions
+            .iter()
+            .any(|a| a.contains("1 running entries have unknown remaining time")));
     }
 }
