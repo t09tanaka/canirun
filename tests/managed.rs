@@ -437,49 +437,103 @@ fn a_changed_boot_id_releases_what_the_old_boot_left() {
     );
 }
 
+/// The ledger types of the last release before managed entries existed,
+/// copied as they were: what an older binary parses the ledger with.
+mod old_ledger {
+    use canirun::admit::State;
+    use chrono::{DateTime, Utc};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub struct Entry {
+        pub id: String,
+        pub pid: u32,
+        pub state: State,
+        pub front: bool,
+        pub weight: u32,
+        pub predicted_rss: u64,
+        #[serde(default)]
+        pub expected_secs: Option<f64>,
+        pub repo: String,
+        #[serde(default)]
+        pub subdir: String,
+        pub argv: String,
+        pub key: String,
+        pub seq: u64,
+        pub enqueued_at: DateTime<Utc>,
+        #[serde(default)]
+        pub started_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        pub using: Option<f64>,
+        #[serde(default)]
+        pub backfilled: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub struct Ledger {
+        pub version: u32,
+        pub next_seq: u64,
+        pub entries: Vec<Entry>,
+    }
+}
+
 #[test]
-fn an_older_binary_rewriting_the_ledger_leaves_the_sidecar_alone() {
+fn an_older_binary_refuses_a_ledger_that_holds_a_managed_entry() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, cfg) = (ctx(dir.path()), Config::default());
-    let (_, _g) =
+    let old = |c: &Context| {
+        serde_json::from_slice::<old_ledger::Ledger>(&std::fs::read(c.paths.ledger_file()).unwrap())
+    };
+    let (_, g) =
         registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
-    // The ledger is plain v1: no key an older binary would not know.
+    // It cannot load it, so it neither reaps the entry nor rewrites the file.
+    assert!(old(&ctx).is_err());
     let raw: serde_json::Value =
         serde_json::from_slice(&std::fs::read(ctx.paths.ledger_file()).unwrap()).unwrap();
-    assert_eq!(raw["version"], 1);
-    let known = [
-        "id",
-        "pid",
-        "state",
-        "front",
-        "weight",
-        "predicted_rss",
-        "expected_secs",
-        "repo",
-        "subdir",
-        "argv",
-        "key",
-        "seq",
-        "enqueued_at",
-        "started_at",
-        "using",
-        "backfilled",
-    ];
-    for k in raw["entries"][0].as_object().unwrap().keys() {
-        assert!(known.contains(&k.as_str()), "new ledger key {k}");
-    }
-    // v0.4.2 saving: parse, add an entry it wrote itself, serialise.
-    let mut l = ledger(&ctx);
-    let mut old = l.entries[0].clone();
-    old.id = "plain".into();
-    old.seq = l.take_seq();
-    l.entries.push(old);
-    l.save(&ctx.paths.ledger_file()).unwrap();
-    assert_eq!(sidecar(&ctx, "c").spec_digest, "d");
-    assert!(ledger(&ctx).find("c").is_some());
-    // The plain entry (no sidecar, no lease) is reaped as ever.
-    assert!(reaped(&ctx).find("plain").is_none());
+    assert_eq!(raw["version"], 2);
+    assert!(raw.get("entries").is_none());
+    assert_eq!(raw["entries_v2"][0]["id"], "c");
+    // This binary reads it, the sidecar is untouched, and the entry is kept
+    // while its owner lives and released once it is gone.
     assert!(reaped(&ctx).find("c").is_some());
+    assert_eq!(sidecar(&ctx, "c").spec_digest, "d");
+    drop(g);
+    assert!(reaped(&ctx).find("c").is_none());
+    // Without managed entries the file is the old shape again.
+    assert!(old(&ctx).is_ok());
+}
+
+#[test]
+fn a_plain_entry_keeps_the_old_ledger_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let mut l = Ledger::default();
+    let s = l.take_seq();
+    l.entries.push(canirun::ledger::Entry {
+        id: "plain".into(),
+        pid: std::process::id(),
+        state: State::Waiting,
+        front: false,
+        weight: 1,
+        predicted_rss: 0,
+        expected_secs: None,
+        repo: String::new(),
+        subdir: String::new(),
+        argv: "x".into(),
+        key: "k".into(),
+        seq: s,
+        enqueued_at: chrono::Utc::now(),
+        started_at: None,
+        using: None,
+        backfilled: false,
+    });
+    l.save(&ctx.paths.ledger_file()).unwrap();
+    let old: old_ledger::Ledger =
+        serde_json::from_slice(&std::fs::read(ctx.paths.ledger_file()).unwrap()).unwrap();
+    assert_eq!(old.version, 1);
+    assert_eq!(old.entries.len(), 1);
 }
 
 #[test]
@@ -1856,4 +1910,175 @@ fn a_run_that_left_descendants_does_not_close_the_window() {
         !kept.released && kept.verdict.contains("ProbeUnknown"),
         "{kept:?}"
     );
+}
+
+/// A ChildStarted entry whose child (this test process) is alive and whose
+/// supervisor is gone, as of `ctx`'s boot.
+fn orphan_with_live_child(ctx: &Context, id: &str) {
+    let ghost = canirun::process::ChildIdentity {
+        pid: std::process::id(),
+        start_time: canirun::process::start_time(std::process::id()),
+        pgid: Some(unsafe { libc::getpgid(0) }),
+    };
+    orphan(ctx, id, Phase::ChildStarted, Some(ghost));
+}
+
+#[test]
+fn adopting_a_started_run_after_a_reboot_does_not_free_the_new_childs_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx1, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "c", "d", &["true"]);
+    let (_, g) = registered(managed::register(&ctx1, &cfg, &s).unwrap());
+    orphan_with_live_child(&ctx1, "c");
+    drop(g);
+    // The machine rebooted; the same id is registered again.
+    let ctx2 = ctx_with_boot(dir.path(), Some("boot-2"));
+    let (rc, g2) = registered(managed::register(&ctx2, &cfg, &s).unwrap());
+    assert_eq!(rc.phase, Phase::Registered);
+    assert!(rc.newly_registered);
+    assert_eq!(rc.boot_id.as_deref(), Some("boot-2"));
+    assert_eq!(sidecar(&ctx2, "c").boot_id.as_deref(), Some("boot-2"));
+    // The child of this boot lives on while its supervisor dies: kept.
+    orphan_with_live_child(&ctx2, "c");
+    drop(g2);
+    assert!(reaped(&ctx2).find("c").is_some());
+    assert_eq!(sidecar(&ctx2, "c").phase, Phase::ChildStarted);
+}
+
+#[test]
+fn adopting_an_unlaunched_registration_after_a_reboot_refreshes_its_boot_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx1, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "c", "d", &["true"]);
+    let (first, g) = registered(managed::register(&ctx1, &cfg, &s).unwrap());
+    drop(g);
+    let ctx2 = ctx_with_boot(dir.path(), Some("boot-2"));
+    let (rc, _g) = registered(managed::register(&ctx2, &cfg, &s).unwrap());
+    assert!(!rc.newly_registered);
+    assert_eq!(rc.seq, first.seq);
+    assert_eq!(rc.boot_id.as_deref(), Some("boot-2"));
+    assert_eq!(sidecar(&ctx2, "c").boot_id.as_deref(), Some("boot-2"));
+}
+
+#[test]
+fn the_current_boot_is_stamped_at_the_launch_and_at_the_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::default();
+    let s = spec(dir.path(), "c", "d", &["true"]);
+    let (_, guard) = registered(managed::register(&ctx(dir.path()), &cfg, &s).unwrap());
+    // Registered on boot-1, launched on boot-2 (no re-registration).
+    let ctx2 = ctx_with_boot(dir.path(), Some("boot-2"));
+    admit_now(&ctx2, &cfg, "c");
+    managed::run_command(&ctx2, &guard, &s.opts, cfg.limits()).unwrap();
+    let sc = sidecar(&ctx2, "c");
+    assert_eq!(sc.phase, Phase::ChildStarted);
+    assert_eq!(sc.boot_id.as_deref(), Some("boot-2"));
+}
+
+#[test]
+fn resolve_settles_a_stranded_sidecar_with_no_ledger_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "c", "d", &["true"]);
+    let (_, g) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    orphan(&ctx, "c", Phase::LaunchIntent, None);
+    drop(g);
+    // What an older binary's reaper did: the entry is gone, the sidecar is not.
+    let mut l = ledger(&ctx);
+    l.remove("c");
+    l.save(&ctx.paths.ledger_file()).unwrap();
+    assert!(managed::register(&ctx, &cfg, &s).is_err());
+    let alive = ctx_with_scan(
+        dir.path(),
+        Arc::new(FakeClock::new(chrono::Utc::now())),
+        Probe::Alive,
+    );
+    let kept = managed::resolve_checked(&alive, "c").unwrap();
+    assert!(kept.found && !kept.released, "{kept:?}");
+    let gone = ctx_with_scan(
+        dir.path(),
+        Arc::new(FakeClock::new(chrono::Utc::now())),
+        Probe::Gone,
+    );
+    let done = managed::resolve_checked(&gone, "c").unwrap();
+    assert!(done.found && done.released, "{done:?}");
+    assert_eq!(sidecar(&gone, "c").phase, Phase::Terminal);
+    // The id can be registered again; it reports the outcome that was
+    // recorded, as for any settled id.
+    assert!(matches!(
+        managed::register(&gone, &cfg, &s).unwrap(),
+        Registration::AlreadyTerminal(_)
+    ));
+    // A terminal sidecar with no entry is not stranded.
+    let n = managed::resolve_checked(&gone, "c").unwrap();
+    assert!(!n.found && n.verdict == "NoEntry");
+}
+
+#[test]
+fn a_started_managed_run_of_this_state_dir_is_nested_without_its_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (_, g) =
+        registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
+    // After the registration: the scope names the directory as it resolves
+    // once it exists.
+    let scope = canirun::marker::scope(ctx.paths.state_dir());
+    let nested = |lease: Option<&str>, id: Option<&str>, sc: Option<&str>| {
+        exec::nested_run_id(&ctx, lease, id, sc).unwrap()
+    };
+    // Registered only: nothing started, so a caller is not inside it.
+    assert_eq!(nested(None, Some("c"), Some(&scope)), None);
+    orphan_with_live_child(&ctx, "c");
+    drop(g); // the supervisor and its lease are gone
+    assert_eq!(nested(None, Some("c"), Some(&scope)).as_deref(), Some("c"));
+    assert_eq!(
+        nested(Some("stale"), Some("c"), Some(&scope)).as_deref(),
+        Some("c")
+    );
+    // Another state dir's id, a missing half, or another id: gated as usual.
+    assert_eq!(nested(None, Some("c"), Some("0123456789abcdef")), None);
+    assert_eq!(nested(None, Some("c"), None), None);
+    assert_eq!(nested(None, None, Some(&scope)), None);
+    assert_eq!(nested(None, Some("other"), Some(&scope)), None);
+    // Settled by hand (no entry any more): not nested.
+    managed::resolve(&ctx, "c", TerminalKind::Interrupted, "test").unwrap();
+    assert_eq!(nested(None, Some("c"), Some(&scope)), None);
+}
+
+#[test]
+fn the_cli_runs_a_command_ungated_inside_an_orphaned_managed_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state/canirun");
+    let lib = Context::new(Paths::new(&state, dir.path().join("none.toml")))
+        .with_live(Arc::new(FixedLive(None)));
+    let (_, g) = registered(
+        managed::register(
+            &lib,
+            &Config::default(),
+            &spec(dir.path(), "c", "d", &["true"]),
+        )
+        .unwrap(),
+    );
+    orphan_with_live_child(&lib, "c");
+    drop(g);
+    let scope = canirun::marker::scope(lib.paths.state_dir());
+    let out = Command::new(env!("CARGO_BIN_EXE_canirun"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", dir.path())
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("CANIRUN_MANAGED_ID", "c")
+        .env("CANIRUN_MANAGED_SCOPE", &scope)
+        .args(["exec", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Ungated: no entry of its own and no history record.
+    assert_eq!(ledger(&lib).entries.len(), 1);
+    assert!(!lib.paths.state_dir().join("history.jsonl").exists());
 }

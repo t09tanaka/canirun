@@ -263,7 +263,10 @@ show yet). The crate is 0.x and that API is not stable.
 ### `canirun resolve <id> [--json] [--force]`
 
 A managed command (one driven through `canirun::managed` by another
-program) keeps its budget while its supervisor is gone, until nothing it
+program) needs every `canirun` that shares the state directory to be
+upgraded: a ledger that holds a managed entry is written in a new shape
+(`entries_v2`), and an older binary refuses to load it rather than reap
+entries it cannot recognise. It keeps its budget while its supervisor is gone, until nothing it
 started is still running. `status` lists such entries as `held, owner gone`,
 and `inspect` marks them `quarantined` with a `hint`. Most are released by
 themselves once their processes stop. Two kinds are not: an entry whose
@@ -272,7 +275,9 @@ those, `canirun resolve <id>` runs the same checks on demand: the owner's
 lease must be gone, and the child, its process group, every process of
 yours carrying `CANIRUN_MANAGED_ID=<id>` (and this state directory's
 `CANIRUN_MANAGED_SCOPE`) and every recorded descendant must be gone. It prints the entry's state, what was checked and the result, and
-records the outcome as `interrupted`. Exit 0 means released, 1 means kept
+records the outcome as `interrupted`. An id whose sidecar is not terminal
+but has no ledger entry (stranded, for example by an older binary) is settled
+the same way. Exit 0 means released, 1 means kept
 (still charged), 2 an error, 3 that the ledger has no entry with that id
 (it prints `no such entry`, and `--json` has `"found": false` and
 `"verdict": "NoEntry"`). It never kills anything.

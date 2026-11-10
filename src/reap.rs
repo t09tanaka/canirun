@@ -169,6 +169,34 @@ pub fn verdict(i: &Inputs) -> Verdict {
     }
 }
 
+/// What a supervisor taking over an existing registration does with the
+/// boot id the sidecar recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adopt {
+    /// Take it over as it is.
+    Keep,
+    /// Nothing was launched: stamp the current boot id and take it over.
+    RefreshBoot,
+    /// The recorded run began on an earlier boot. Whatever it started is
+    /// gone with that boot, so it is settled and the id registered afresh.
+    /// Taking it over with the old boot id would have the reaper's reboot
+    /// shortcut free the budget of a child that now runs on this boot.
+    SettleStale,
+}
+
+/// Pure: decide from the phase and the recorded and current boot ids. An
+/// unknown boot id on either side changes nothing, as in [`verdict`].
+pub fn adopt(phase: Phase, recorded: Option<&str>, current: Option<&str>) -> Adopt {
+    match (recorded, current) {
+        (Some(then), Some(now)) if then != now => match phase {
+            Phase::Registered => Adopt::RefreshBoot,
+            Phase::Terminal => Adopt::Keep,
+            Phase::LaunchIntent | Phase::ChildStarted => Adopt::SettleStale,
+        },
+        _ => Adopt::Keep,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +389,26 @@ mod tests {
         assert_eq!(verdict(&i), Verdict::Keep(Keep::DescendantsAlive));
         i.marker = Probe::Unknown;
         assert_eq!(verdict(&i), Verdict::Keep(Keep::ProbeUnknown));
+    }
+
+    #[test]
+    fn adopting_across_a_reboot_depends_on_how_far_the_run_got() {
+        use Phase::*;
+        let across = |p| adopt(p, Some("b0"), Some("b1"));
+        assert_eq!(across(Registered), Adopt::RefreshBoot);
+        assert_eq!(across(LaunchIntent), Adopt::SettleStale);
+        assert_eq!(across(ChildStarted), Adopt::SettleStale);
+        assert_eq!(across(Terminal), Adopt::Keep);
+    }
+
+    #[test]
+    fn adopting_on_the_same_boot_or_without_a_boot_id_changes_nothing() {
+        use Phase::*;
+        for p in [Registered, LaunchIntent, ChildStarted, Terminal] {
+            assert_eq!(adopt(p, Some("b1"), Some("b1")), Adopt::Keep);
+            assert_eq!(adopt(p, None, Some("b1")), Adopt::Keep);
+            assert_eq!(adopt(p, Some("b0"), None), Adopt::Keep);
+            assert_eq!(adopt(p, None, None), Adopt::Keep);
+        }
     }
 }

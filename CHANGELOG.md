@@ -9,6 +9,19 @@ the minor version).
 
 ### Changed
 
+- Adopting a registration after a reboot no longer carries the old boot id
+  forward: an unlaunched one is refreshed, one that reached its launch is
+  settled as interrupted and registered afresh (its earlier sidecar record
+  is replaced), and the boot id is stamped again at the launch intent and at
+  the spawn. Otherwise the reaper's reboot shortcut could free the budget of
+  a child that runs on the new boot.
+- `canirun resolve` also settles a sidecar that is not terminal but has no
+  ledger entry (it answered `NoEntry` and left the id blocked).
+- `canirun exec` run from inside a managed command whose child has started
+  (`CANIRUN_MANAGED_ID` and `CANIRUN_MANAGED_SCOPE` of this state directory)
+  runs ungated even after the supervisor and its lease are gone, instead of
+  waiting for a budget its own tree holds.
+
 - `runner::Outcome` gained `tracked_to_exit_at`, and `tracker::Record` now
   takes a stamp flag and returns whether it persisted; `Tracker::finish`
   takes whether the command was reaped. Pre-1.0: breaking.
@@ -73,8 +86,12 @@ the minor version).
   is a conflict) and returns a registered receipt only once the ledger
   entry exists. `try_admit`, `run_command`, `finish` and `record_measurement`
   split the admission path into stages. Ownership lives in a sidecar
-  (`managed/<id>.json`); ledger v1 is unchanged, so an older binary saving
-  the ledger leaves it alone.
+  (`managed/<id>.json`). A ledger that holds a managed entry is written as
+  version 2, with its entries under `entries_v2` and no `entries` key, so an
+  older binary refuses to load it instead of reaping the managed entries it
+  cannot recognise. Every binary sharing a state directory must be upgraded
+  before managed commands are used; a ledger without managed entries keeps
+  the old shape and stays readable by older binaries.
 - The reaper no longer frees a managed entry just because its owner's lease
   is gone: it keeps the charge until the recorded child and its process
   group are gone, or the boot id changed. An unreadable sidecar is never

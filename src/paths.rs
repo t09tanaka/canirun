@@ -60,8 +60,8 @@ impl Paths {
     }
 
     /// Sidecars of managed commands: `managed/<command_id>.json`. Not part
-    /// of the ledger, so an older binary rewriting `ledger.json` leaves
-    /// them alone.
+    /// of the ledger; their presence is what makes [`crate::ledger::Ledger`]
+    /// save the shape an older binary refuses to load.
     pub fn managed_dir(&self) -> PathBuf {
         self.state_dir.join("managed")
     }

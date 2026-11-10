@@ -22,9 +22,10 @@
 //! # The sidecar
 //!
 //! `managed/<command_id>.json` next to the ledger holds what the ledger
-//! (format v1, unchanged) cannot: the spec digest, the caller's correlation
-//! data, the stage, the boot id, the child's pid, start time and process
-//! group. An older canirun rewriting `ledger.json` does not touch it. The
+//! cannot: the spec digest, the caller's correlation data, the stage, the
+//! boot id, the child's pid, start time and process group. A ledger holding
+//! a managed entry is saved in a shape an older canirun cannot parse (see
+//! [`crate::ledger::Ledger`]), so it neither reaps nor rewrites it. The
 //! sidecar is written *before* the ledger entry, so an entry without a
 //! sidecar is a plain entry, never a managed one whose file went missing.
 //!
@@ -580,10 +581,35 @@ pub(crate) fn push_entry(
         }
         if let Some((seq, mut sc)) = existing {
             // A new supervisor adopting the registration.
-            sc.owner_pid = std::process::id();
-            sc.owner_start_time = process::start_time(std::process::id());
-            write_sidecar(ctx, &sc)?;
-            return Ok(Pushed::Existing { seq, sidecar: sc });
+            let boot = ctx.boot.boot_id();
+            match reap::adopt(sc.phase, sc.boot_id.as_deref(), boot.as_deref()) {
+                reap::Adopt::SettleStale => {
+                    // The old run belongs to an earlier boot: record that,
+                    // drop its entry and fall through to a fresh
+                    // registration under this boot.
+                    let at = ctx.clock.now();
+                    advance_sidecar(ctx, id, Phase::Terminal, |s| {
+                        s.terminal = Some(TerminalRecord {
+                            kind: TerminalKind::Interrupted,
+                            at,
+                            detail: Some(format!(
+                                "released: {}, then registered again",
+                                describe(Verdict::Release(reap::Release::BootChanged))
+                            )),
+                        });
+                    })?;
+                    ledger.remove(id);
+                }
+                adopt => {
+                    if adopt == reap::Adopt::RefreshBoot {
+                        sc.boot_id = boot;
+                    }
+                    sc.owner_pid = std::process::id();
+                    sc.owner_start_time = process::start_time(std::process::id());
+                    write_sidecar(ctx, &sc)?;
+                    return Ok(Pushed::Existing { seq, sidecar: sc });
+                }
+            }
         }
         let seq = ledger.take_seq();
         if let Some(m) = &managed {
@@ -834,8 +860,12 @@ pub fn run_command_with_tracker(
             }
         }
         let at = ctx.clock.now();
+        // Stamped here and again at the spawn: the boot a child runs on is
+        // what the reaper's reboot shortcut must compare with.
+        let boot = ctx.boot.boot_id();
         advance_sidecar(ctx, id, Phase::LaunchIntent, |s| {
-            s.launch_intent_at = Some(at)
+            s.launch_intent_at = Some(at);
+            s.boot_id = boot;
         })?;
     }
     // One sample right before the start: a run that begins on a saturated
@@ -851,7 +881,9 @@ pub fn run_command_with_tracker(
         // Best effort: if this fails the phase stays LaunchIntent, which
         // the reaper keeps (quarantine) rather than frees.
         let at = ctx.clock.now();
+        let boot = ctx.boot.boot_id();
         let _ = advance_sidecar(ctx, id, Phase::ChildStarted, |s| {
+            s.boot_id = boot;
             s.child = Some(identity);
             // The start of the heartbeat: with no `tracked_to_exit` the
             // window is open-ended, so this stamp is not an upper bound.
@@ -1104,7 +1136,15 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
     check_id("command_id", id)?;
     let _guard = lock::ledger(ctx)?;
     let ledger = Ledger::load(&ctx.paths.ledger_file())?;
-    if ledger.find(id).is_none() {
+    // A sidecar that is not terminal but has no ledger entry is stranded
+    // (an older binary dropped the entry, or the ledger was edited): it
+    // blocks the id, and is settled here by the same checks.
+    let stranded = match load_sidecar(ctx, id) {
+        Loaded::Ok(sc) => sc.phase != Phase::Terminal,
+        Loaded::Corrupt(_) => true,
+        Loaded::Missing => false,
+    };
+    if ledger.find(id).is_none() && !stranded {
         return Ok(Resolution {
             command_id: id.to_string(),
             phase: None,

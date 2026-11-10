@@ -15,12 +15,15 @@ pub fn run(ctx: &Context, cfg: &Config, opts: Opts) -> Result<i32> {
             "usage: canirun exec [--weight N] [--front] [--key K] -- <command> [args...]".into(),
         ));
     }
-    if let Some(lease) = std::env::var_os("CANIRUN_LEASE") {
-        let lease = lease.to_string_lossy().into_owned();
-        if exec::nested_lease_is_live(ctx, &lease)? {
-            let out = runner::run(ctx, &opts.argv, &opts.cwd, &lease, false)?;
-            return Ok(finish(out.exit));
-        }
+    let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    if let Some(lease) = exec::nested_run_id(
+        ctx,
+        var("CANIRUN_LEASE").as_deref(),
+        var(canirun::marker::ENV_VAR).as_deref(),
+        var(canirun::marker::SCOPE_VAR).as_deref(),
+    )? {
+        let out = runner::run(ctx, &opts.argv, &opts.cwd, &lease, false)?;
+        return Ok(finish(out.exit));
     }
     let id = exec::new_id();
     match run_gated(ctx, cfg, &opts, &id, &|| false)? {

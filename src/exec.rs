@@ -84,6 +84,46 @@ pub fn nested_lease_is_live(ctx: &Context, id: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// The id a caller running inside a gated command should run under, if its
+/// environment shows it is nested: the live running lease it names
+/// (`CANIRUN_LEASE`), or a managed run of this state directory whose child
+/// has started (`CANIRUN_MANAGED_ID` and `CANIRUN_MANAGED_SCOPE`). The
+/// second needs no lease: when the supervisor died the tree it left is
+/// still the run's, and gating its own sub-commands would wait for a budget
+/// that tree itself holds.
+pub fn nested_run_id(
+    ctx: &Context,
+    lease: Option<&str>,
+    managed_id: Option<&str>,
+    managed_scope: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(lease) = lease {
+        if nested_lease_is_live(ctx, lease)? {
+            return Ok(Some(lease.to_string()));
+        }
+    }
+    if let (Some(id), Some(scope)) = (managed_id, managed_scope) {
+        if scope == crate::marker::scope(ctx.paths.state_dir()) && managed_child_started(ctx, id) {
+            return Ok(Some(id.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Does the ledger hold `id` with its sidecar at `ChildStarted`?
+fn managed_child_started(ctx: &Context, id: &str) -> bool {
+    // A plain read: saves are atomic renames, and a stale copy can only
+    // skip the gate for a run that did start.
+    let in_ledger = crate::ledger::Ledger::load(&ctx.paths.ledger_file())
+        .map(|l| l.find(id).is_some())
+        .unwrap_or(false);
+    in_ledger
+        && matches!(
+            crate::managed::load_sidecar(ctx, id),
+            crate::managed::Loaded::Ok(sc) if sc.phase == crate::receipt::Phase::ChildStarted
+        )
+}
+
 /// How a gated run ended.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Gated {
