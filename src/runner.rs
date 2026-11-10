@@ -145,8 +145,13 @@ fn clear_group(ctx: &Context, pgid: libc::pid_t) -> bool {
 
 /// What the session `sid` (the leader's pid) still holds. The leader was
 /// just reaped by us, and its number is not handed out again while the
-/// session has members, so no reuse check is needed here.
+/// session has members, so a live process that has the number as its own pid
+/// is a new, unrelated one (the session was empty and the number was handed
+/// out again): the session is then not ours to stop.
 fn session_state(sid: libc::pid_t) -> crate::reap::Probe {
+    if u32::try_from(sid).is_ok_and(|p| crate::process::start_time(p).is_some()) {
+        return crate::reap::Probe::Gone;
+    }
     let (found, failed) = crate::process::session_members(sid);
     crate::reap::session_probe(found.len(), failed)
 }
@@ -426,6 +431,14 @@ fn normalise_maxrss(raw: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_live_process_with_the_sessions_number_means_it_was_reused() {
+        // This test process is alive and has a pid: as a "session leader's"
+        // number it is a different process, so the session is not ours.
+        let me = std::process::id() as libc::pid_t;
+        assert_eq!(super::session_state(me), crate::reap::Probe::Gone);
+    }
+
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
 

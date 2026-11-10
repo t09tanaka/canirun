@@ -111,6 +111,23 @@ impl ChildIdentity {
     }
 }
 
+impl ChildIdentity {
+    /// The identity of a just-spawned session leader: the child was started
+    /// with a successful `setsid` in `pre_exec` (the spawn succeeding proves
+    /// it), so its session and process group ids are its pid. Nothing is read
+    /// from the kernel for them, so a child that already exited (a zombie
+    /// cannot be asked) is still recorded with them.
+    pub fn capture_leader(pid: u32) -> Self {
+        let id = pid as i32;
+        ChildIdentity {
+            pid,
+            start_time: start_time(pid),
+            pgid: Some(id),
+            sid: Some(id),
+        }
+    }
+}
+
 /// The session id of `pid`, or `None` when the kernel will not say.
 fn session_of(pid: u32) -> Option<i32> {
     session_lookup(pid).ok()
@@ -133,7 +150,8 @@ pub fn session_members(sid: i32) -> (Vec<ProcRef>, bool) {
     let mut found = Vec::new();
     let mut failed = false;
     for row in TableReader::new().read() {
-        if row.proc.pid == me {
+        // `getsid(0)` is the caller's own session, never pid 0's.
+        if row.proc.pid == me || row.proc.pid == 0 {
             continue;
         }
         match session_lookup(row.proc.pid) {
@@ -516,6 +534,34 @@ mod tests {
             sid: None,
         };
         assert_eq!(probe_child(&gone), Probe::Gone);
+    }
+
+    #[test]
+    fn a_session_leader_is_recorded_without_asking_the_kernel() {
+        use std::os::unix::process::CommandExt;
+        let mut c = unsafe {
+            Command::new("true")
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        // Not waited for: it is a zombie as soon as it has exited, when
+        // getsid can no longer be asked.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let id = ChildIdentity::capture_leader(c.id());
+        assert_eq!(id.sid, Some(c.id() as i32));
+        assert_eq!(id.pgid, Some(c.id() as i32));
+        c.wait().unwrap();
+    }
+
+    #[test]
+    fn pid_zero_is_never_a_session_member() {
+        // getsid(0) is the caller's own session; it must not be counted.
+        let mine = unsafe { libc::getsid(0) };
+        assert!(session_members(mine).0.iter().all(|p| p.pid != 0));
     }
 
     #[test]

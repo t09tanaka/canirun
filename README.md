@@ -374,11 +374,14 @@ What is not found, and what follows:
   for an unreadable environment. A sidecar written before this has no `sid`
   and is judged as before. A consequence: the command has no controlling
   terminal of its own.
-- **Left the session.** A daemon that calls `setsid` (or `setpgid` into a
-  group of another session) deliberately gets out of the run's session, and
+- **Left the session.** A daemon that calls `setsid` deliberately gets out
+  of the run's session (`setpgid` cannot: POSIX does not let a process move
+  into a group of another session), and
   with an empty environment, born after the tracker last looked, nothing
   finds it: the entry can be freed while it runs. This is the residual
-  limitation; the marker and the recorded descendants still catch it in the
+  limitation. Another: the session check lists processes through the same
+  process table as everything else, so a process that table does not list is
+  missed; the marker and the recorded descendants still catch it in the
   common cases.
 - The process group check does not compare start times, so a group number
   that was reused by an unrelated group keeps an entry held for as long as
