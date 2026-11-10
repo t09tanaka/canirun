@@ -5,7 +5,7 @@ All notable changes to task-traffic-controller (called canirun before 0.5.0) are
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
-## [0.5.0]
+## [0.5.0] - 2026-11-10
 
 ### Renamed
 
