@@ -2075,6 +2075,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_clock_is_noted_exactly_when_entries_are_aged_from_utc() {
+        let n = node("n", 1, Runtime::measured(5.0, 3));
+        let note = |t: &Timing| {
+            t.assumptions
+                .iter()
+                .filter(|a| a.starts_with("legacy_clock"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let none = single(&insp(2, None, Vec::new()), n.clone());
+        assert!(note(&none).is_empty());
+        let one = single(
+            &insp(2, None, vec![running("r", 1, Some(30.0), 0)]),
+            n.clone(),
+        );
+        assert_eq!(note(&one).len(), 1);
+        assert!(note(&one)[0].contains("age of 1 ledger"));
+        // The note alone does not make the answer conditional.
+        let two = single(
+            &insp(
+                4,
+                None,
+                vec![running("a", 1, Some(30.0), 0), waiting("b", 1, None, 9)],
+            ),
+            n,
+        );
+        assert!(note(&two)[0].contains("age of 2 ledger"));
+    }
+
+    #[test]
     fn live_cpu_and_overload_guards_are_reported() {
         let busy = Some(LiveSnapshot {
             available_memory: 1 << 40,
