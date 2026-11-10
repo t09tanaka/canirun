@@ -57,7 +57,7 @@ pub struct Config {
     pub jobs_keep_days: u64,
     /// `gc` removes the sidecars (receipts) of managed commands that ended
     /// more than this many days ago, and leftover temporary files of that
-    /// age. A command that has not ended is never removed.
+    /// age. A command that has not ended is never removed. Must be 1 to 3650.
     pub managed_keep_days: u64,
     /// A job with no `wait`er is cancelled once this many seconds have
     /// passed since submit (unless submitted with `--detach`).
@@ -125,6 +125,11 @@ impl Config {
         if self.front_overload_factor.is_nan() || self.front_overload_factor < 0.0 {
             return Err(Error::Config(
                 "front_overload_factor must be 0 or more".into(),
+            ));
+        }
+        if !(1..=3650).contains(&self.managed_keep_days) {
+            return Err(Error::Config(
+                "managed_keep_days must be between 1 and 3650".into(),
             ));
         }
         for p in &self.patterns {
@@ -210,6 +215,15 @@ mod tests {
         assert_eq!(c.default_weight, 2);
         assert_eq!(c.budget, logical_cpus());
         assert!(c.patterns.is_empty());
+    }
+
+    #[test]
+    fn managed_keep_days_is_bounded() {
+        assert!(Config::parse("managed_keep_days = 1").is_ok());
+        assert!(Config::parse("managed_keep_days = 3650").is_ok());
+        assert!(Config::parse("managed_keep_days = 0").is_err());
+        assert!(Config::parse("managed_keep_days = 3651").is_err());
+        assert!(Config::parse("managed_keep_days = 9223372036854775807").is_err());
     }
 
     #[test]

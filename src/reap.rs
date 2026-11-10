@@ -193,6 +193,16 @@ pub fn reassess_due(prev: Option<(bool, i64)>, interval_secs: i64) -> bool {
     }
 }
 
+/// Is a live process group a *different* one that reused the recorded group
+/// number? Only positive evidence says so: a process whose pid is that number
+/// (the leader) is alive and started at a different time than the recorded
+/// child, which led the original group. No leader, or a start time missing on
+/// either side, cannot show reuse (the group may be the original one, with
+/// members that carry no marker), so the answer is no.
+pub fn group_reused(leader_start: Option<u64>, child_start: Option<u64>) -> bool {
+    matches!((leader_start, child_start), (Some(l), Some(c)) if l != c)
+}
+
 /// May a release verdict reached `age_secs` ago be acted on?
 pub fn release_usable(age_secs: i64) -> bool {
     (0..RELEASE_VALID_SECS).contains(&age_secs)
@@ -476,5 +486,18 @@ mod tests {
     fn a_clock_that_went_back_is_never_trusted() {
         assert!(reassess_due(Some((false, -1)), REASSESS_SECS));
         assert!(reassess_due(Some((true, -1)), REASSESS_SECS));
+    }
+
+    #[test]
+    fn group_reuse_needs_a_new_leader() {
+        // A new leader with another start time: reused.
+        assert!(group_reused(Some(200), Some(100)));
+        // No leader (the original group, members without a marker): not reused.
+        assert!(!group_reused(None, Some(100)));
+        // The leader is the recorded child itself.
+        assert!(!group_reused(Some(100), Some(100)));
+        // Start time unknown on the record: cannot tell.
+        assert!(!group_reused(Some(200), None));
+        assert!(!group_reused(None, None));
     }
 }

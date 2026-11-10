@@ -1204,6 +1204,31 @@ fn a_process_with_the_same_id_from_another_state_dir_is_left_alone() {
 }
 
 #[test]
+fn force_keeps_a_group_with_no_leader_even_if_no_member_is_marked() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    // The original group: its leader is gone but a member (one that carries
+    // no marker, as after `env -i`) lives on. Nobody leads the group, so it
+    // is not a reused number and must not be freed.
+    let mut leader = Command::new("sh")
+        .args(["-c", "sleep 60 & exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = leader.id() as i32;
+    leader.wait().unwrap();
+    let gone = ctx_with_fixed(dir.path(), clock.clone(), Scan::new(Probe::Gone, vec![]));
+    dead_child(dir.path(), &clock, "o1", move |sc| {
+        sc.child.as_mut().unwrap().pgid = Some(pgid);
+    });
+    let r = managed::resolve_checked_with(&gone, "o1", true).unwrap();
+    assert!(!r.released && !r.forced, "{r:?}");
+    assert!(ledger(&gone).find("o1").is_some());
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+}
+
+#[test]
 fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path());
@@ -2522,7 +2547,7 @@ fn force_frees_a_group_held_only_by_strangers_and_never_one_that_is_the_runs() {
     // Nothing marked, nothing recorded, the child gone: forced.
     let r = managed::resolve_checked_with(&gone, "g1", true).unwrap();
     assert!(r.released && r.forced, "{r:?}");
-    assert!(r.checked.contains("not this run's"), "{r:?}");
+    assert!(r.checked.contains("different process group"), "{r:?}");
     assert!(ledger(&gone).find("g1").is_none());
     assert_eq!(sidecar(&gone, "g1").phase, Phase::Terminal);
     stranger.kill().unwrap();

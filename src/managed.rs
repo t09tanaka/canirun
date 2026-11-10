@@ -1193,7 +1193,13 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
 /// to be running is ever forced: a held lease, a running child, marked
 /// process or recorded descendant keeps the entry. A live process group
 /// alone does not, when none of its members is the child, carries the
-/// run's id or is a recorded descendant: the group number was reused.
+/// run's id or is a recorded descendant, *and* a different process now leads
+/// that group (see [`reap::group_reused`]). Members without the marker are not
+/// proof of reuse: a process started with an empty environment, or one born
+/// after the tracker stopped, may still belong to the original group, and the
+/// group number cannot be reused while the group lives. With no leader, or a
+/// leader whose start time cannot be compared, the group is taken to be the
+/// original one and the entry stays.
 pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Resolution> {
     check_id("command_id", id)?;
     let _guard = lock::ledger(ctx)?;
@@ -1241,24 +1247,36 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
         r.checked = detail;
         return Ok(r);
     }
-    // A group that is only held by processes that are not this run's (a
-    // reused group number): nothing marked, nothing recorded, and the child
-    // itself gone. `--force` frees it; anything else would keep the budget
-    // for as long as the unrelated group lives.
-    if force
-        && a.verdict == Verdict::Keep(reap::Keep::DescendantsAlive)
-        && assess_with(ctx, id, true, true, true).verdict
-            == Verdict::Release(reap::Release::Stopped)
-    {
-        let detail =
-            "forced: the recorded process group is held by processes that are not this run's \
-             (none carries its id, none is a recorded descendant, and the child is gone)"
+    // A group number reused by an unrelated group: a different process leads
+    // the recorded group, and nothing marked or recorded runs with the child
+    // gone. `--force` frees it. A live group with no such leader may still be
+    // this run's (members the marker does not show), so it stays.
+    if force && a.verdict == Verdict::Keep(reap::Keep::DescendantsAlive) {
+        let child = match &a.sidecar {
+            Loaded::Ok(sc) => sc.child.as_ref(),
+            _ => None,
+        };
+        let reused = child.is_some_and(|c| {
+            let leader = c
+                .pgid
+                .and_then(|g| u32::try_from(g).ok())
+                .and_then(process::start_time);
+            reap::group_reused(leader, c.start_time)
+        });
+        if reused
+            && assess_with(ctx, id, true, true, true).verdict
+                == Verdict::Release(reap::Release::Stopped)
+        {
+            let detail = "forced: the recorded process group number now belongs to a different \
+                 process group (its leader started after this run's child; none of its \
+                 members carries the run's id or is a recorded descendant, and the child is gone)"
                 .to_string();
-        settle_by_hand(ctx, id, TerminalKind::Interrupted, &detail)?;
-        r.released = true;
-        r.forced = true;
-        r.checked = detail;
-        return Ok(r);
+            settle_by_hand(ctx, id, TerminalKind::Interrupted, &detail)?;
+            r.released = true;
+            r.forced = true;
+            r.checked = detail;
+            return Ok(r);
+        }
     }
     let Verdict::Release(why) = a.verdict else {
         if force {

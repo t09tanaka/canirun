@@ -300,9 +300,14 @@ releases the entry anyway and records `interrupted` with `forced: <reason>`
 running: a held lease, a running child, a marked process or a recorded
 descendant keeps the entry (exit 1), with or without `--force`. A live
 process group alone does not count as running when the group number was
-reused: with the child gone and no process carrying the run's id and no
-recorded descendant, `--force` releases the entry (`forced: the recorded
-process group is held by processes that are not this run's`). Exit codes
+reused, and only positive evidence shows that: a process whose pid is the
+recorded group number is alive and started at a different time than the
+recorded child (a new leader), the child is gone, and no process carries
+the run's id or is a recorded descendant. Then `--force` releases the entry
+(`forced: the recorded process group number now belongs to a different
+process group`). A live group with no such leader, or one whose start time
+cannot be compared, may be the original group (members without the marker)
+and stays held. Exit codes
 are the same (0 released, 1 kept, 2 error, 3 no such entry).
 
 How descendants are found, and what this cannot see:
@@ -356,11 +361,14 @@ What is not found, and what follows:
 - A descendant that cleared its environment (`env -i ...`) loses the
   marker; it is still found if it was recorded while its parent lived.
 - The process group check does not compare start times, so a group number
-  that was reused by an unrelated process keeps an entry held for as long as
+  that was reused by an unrelated group keeps an entry held for as long as
   that group lives. That errs on the side of keeping the budget; the way out
-  is `canirun resolve <id> --force`, which releases it when nothing in the
+  is `canirun resolve <id> --force`, which releases it only when a new
+  leader (the process whose pid is the group number, started at a different
+  time than the recorded child) proves the number was reused, nothing in the
   group carries the run's id or is a recorded descendant, and the child is
-  gone.
+  gone. Without that proof the group may be the original one (a member that
+  cleared its environment, or was born after tracking stopped) and stays.
 - A scan that could not read some process of the user is unknown and
   releases nothing, until `resolve --force`.
 - **A Mac entry that stays held.** On macOS a process that `launchd`
@@ -416,7 +424,8 @@ records per key (under the history lock), removes the
 `measurements/*.applied` markers that `managed::record_measurement` leaves
 once their record is trimmed away (a marker is kept as long as its
 record), and removes the receipts of managed commands (`managed/<id>.json`)
-that ended more than `managed_keep_days` (default 7) ago and have no ledger
+that ended more than `managed_keep_days` (default 7; 1 to 3650, anything else
+is a configuration error) ago and have no ledger
 entry, together with leftover temporary files of that age. A command that
 has not ended is never removed. Reaping also happens on the fly, so `gc` is
 only for tidiness.
@@ -443,7 +452,7 @@ backfill_max_job_secs = 300 # a command learned to take at most this may pass a 
 backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has waited this long
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
-managed_keep_days = 7       # ...and receipts of managed commands that ended longer ago
+managed_keep_days = 7       # ...and receipts of managed commands that ended longer ago (1..3650)
 
 [[pattern]]                 # glob over the full argv string, first match wins
 match = "*stryker*"
