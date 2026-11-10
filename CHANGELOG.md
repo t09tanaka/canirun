@@ -5,6 +5,22 @@ All notable changes to task-traffic-controller (called canirun before 0.5.0) are
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+### Added
+
+- `exec::Opts` has `env` (`Some` starts the child from exactly that map, then
+  adds the reserved `TASK_TRAFFIC_CONTROLLER_*` variables; `None` inherits) and
+  `stdout_log` (stdout and stderr appended to a file, stdin from `/dev/null`;
+  `None` inherits). Both reach the child through `managed::run_command`
+  (`runner::Spawn` has the same two fields). Neither is part of the history key,
+  and the CLI leaves both `None`. `Opts` now derives `Default`.
+- `inspect` lists `history_quality` per key (run count, oldest and latest run,
+  age of the latest, mean and spread of the wall time). It sits outside
+  `history`, so the snapshot digest does not move.
+- `forecast` adds a `legacy_clock` assumption when ledger entries are aged from
+  their UTC timestamps.
+
 ## [0.5.0] - 2026-11-10
 
 ### Renamed

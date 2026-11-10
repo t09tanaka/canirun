@@ -140,6 +140,7 @@ fn opts(cwd: &Path) -> Opts {
         key: Some("fixture-estimate-key".into()),
         argv: vec!["fixture-tool".into(), "--flag".into()],
         cwd: cwd.to_path_buf(),
+        ..Opts::default()
     }
 }
 
@@ -314,4 +315,61 @@ fn estimate_uses_recorded_history_and_never_invents_it() {
     assert_eq!(f.target.timing.execution_ms, Some(9000));
     assert_eq!(f.target.timing.start_in_ms, Some(0));
     assert_eq!(f.target.timing.finish_in_ms, Some(9000));
+}
+
+#[test]
+fn inspect_reports_history_quality_per_key() {
+    let e = env();
+    let _leases = populate(&e);
+    // Another run of "ka" a day earlier and slower: the spread widens.
+    let mut old = record("ka", 90.0);
+    old.started_at = t0() - chrono::Duration::days(1);
+    history::append(e.ctx.paths.history_file(), &old).unwrap();
+    e.clock.advance(std::time::Duration::from_secs(60));
+    let insp = inspect::inspect(&e.ctx).unwrap();
+    assert_eq!(insp.history_quality.len(), insp.history.len());
+    let ka = insp.history_quality.iter().find(|q| q.key == "ka").unwrap();
+    assert_eq!(ka.records, 3);
+    assert_eq!(ka.latest, Some(t0()));
+    assert_eq!(ka.oldest, Some(t0() - chrono::Duration::days(1)));
+    assert_eq!(ka.latest_age_secs, Some(60));
+    let mean = (30.0 + 31.0 + 90.0) / 3.0;
+    assert!((ka.wall_mean_secs.unwrap() - mean).abs() < 1e-9);
+    assert!(ka.wall_cv.unwrap() > 0.4);
+    let kb = insp.history_quality.iter().find(|q| q.key == "kb").unwrap();
+    assert_eq!(
+        (kb.records, kb.latest_age_secs, kb.wall_cv),
+        (0, None, None)
+    );
+    // The digest of the history is the same as without the quality block.
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&(&insp.entries, &insp.history)).unwrap();
+    assert_eq!(
+        insp.snapshot_digest,
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    );
+}
+
+#[test]
+fn forecast_names_the_legacy_clock_when_entries_age_from_utc() {
+    let e = env();
+    let cfg = task_traffic_controller::config::Config::default();
+    let cwd = e._dir.path().to_path_buf();
+    let plan = estimate::command_plan(&e.ctx, &cfg, &opts(&cwd)).unwrap();
+    // Empty ledger: nothing is aged from UTC, so nothing to note.
+    let insp = inspect::inspect(&e.ctx).unwrap();
+    let f = forecast::forecast(&e.ctx, &insp, &plan, &[]).unwrap();
+    assert!(!format!("{:?}", f.target.timing.assumptions).contains("legacy_clock"));
+    let _leases = populate(&e);
+    let insp = inspect::inspect(&e.ctx).unwrap();
+    let f = forecast::forecast(&e.ctx, &insp, &plan, &[]).unwrap();
+    assert!(
+        f.target
+            .timing
+            .assumptions
+            .iter()
+            .any(|a| a.starts_with("legacy_clock")),
+        "{:?}",
+        f.target.timing.assumptions
+    );
 }

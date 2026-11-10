@@ -630,6 +630,9 @@ struct Globals {
     live_missing: bool,
     any_live_hold: bool,
     overlay_applied: usize,
+    /// Ledger entries counted as aged from wall-clock (UTC) records: every
+    /// entry's queue or run age is estimated from its UTC stamps today.
+    legacy_clock_entries: usize,
 }
 
 impl Globals {
@@ -688,6 +691,13 @@ fn timing_of(
     let mut assumptions = vec!["no new external load".to_string()];
     assumptions.extend(g.conditions());
     let mut conditional = assumptions.len() > 1;
+    if g.legacy_clock_entries > 0 {
+        assumptions.push(format!(
+            "legacy_clock: ledger entries record UTC times and their age is estimated from them \
+             ({} entries), which a wall-clock step can skew",
+            g.legacy_clock_entries
+        ));
+    }
 
     if let Some(id) = meta.registered {
         assumptions.push(format!("already registered as ledger entry {id}"));
@@ -1379,6 +1389,7 @@ pub fn forecast(
         live_missing: insp.live.is_none(),
         any_live_hold: jobs.iter().any(|j| j.live_hold),
         overlay_applied: report.applied.len(),
+        legacy_clock_entries: insp.entries.len(),
     };
     let t0_running = insp.entries.iter().any(|e| e.entry.state == State::Running);
     let node_forecasts: Vec<NodeForecast> = plan
@@ -1562,6 +1573,7 @@ mod tests {
             ledger_locked: true,
             entries,
             history: Vec::new(),
+            history_quality: Vec::new(),
         }
     }
 
@@ -2060,6 +2072,36 @@ mod tests {
         assert_eq!(t.confidence, Confidence::Medium);
         assert!(t.assumptions.iter().any(|a| a.contains("live guard")));
         assert!(t.assumptions.iter().any(|a| a == "no new external load"));
+    }
+
+    #[test]
+    fn legacy_clock_is_noted_exactly_when_entries_are_aged_from_utc() {
+        let n = node("n", 1, Runtime::measured(5.0, 3));
+        let note = |t: &Timing| {
+            t.assumptions
+                .iter()
+                .filter(|a| a.starts_with("legacy_clock"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let none = single(&insp(2, None, Vec::new()), n.clone());
+        assert!(note(&none).is_empty());
+        let one = single(
+            &insp(2, None, vec![running("r", 1, Some(30.0), 0)]),
+            n.clone(),
+        );
+        assert_eq!(note(&one).len(), 1);
+        assert!(note(&one)[0].contains("(1 entries)"));
+        // The note alone does not make the answer conditional.
+        let two = single(
+            &insp(
+                4,
+                None,
+                vec![running("a", 1, Some(30.0), 0), waiting("b", 1, None, 9)],
+            ),
+            n,
+        );
+        assert!(note(&two)[0].contains("(2 entries)"));
     }
 
     #[test]
