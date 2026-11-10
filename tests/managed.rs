@@ -592,7 +592,10 @@ fn supervisor_entry() {
 #[test]
 fn a_sigkilled_supervisor_keeps_its_budget_until_its_tree_is_stopped() {
     let dir = tempfile::tempdir().unwrap();
-    let (ctx, _cfg) = (ctx(dir.path()), Config::default());
+    let (ctx, _cfg) = (
+        ctx(dir.path()).with_scan(Arc::new(NoAmbientHidden)),
+        Config::default(),
+    );
     let mut sup = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -813,7 +816,10 @@ fn a_clean_exit_stops_the_leftover_group_before_the_budget_is_released() {
 #[test]
 fn finish_keeps_the_entry_while_the_group_has_members() {
     let dir = tempfile::tempdir().unwrap();
-    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let (ctx, cfg) = (
+        ctx(dir.path()).with_scan(Arc::new(NoAmbientHidden)),
+        Config::default(),
+    );
     let s = spec(dir.path(), "live", "d", &["true"]);
     let (ran, guard) = run_to_end(&ctx, &cfg, &s);
     // A stand-in survivor in a group of its own, recorded as the child's.
@@ -1232,7 +1238,9 @@ fn force_keeps_a_group_with_no_leader_even_if_no_member_is_marked() {
 #[test]
 fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let ctx = ctx(dir.path());
+    // Unrelated hidden orphans on a busy machine would hold the entry as
+    // `ProbeUnknown` and make the final release flaky (see `NoAmbientHidden`).
+    let ctx = ctx(dir.path()).with_scan(Arc::new(NoAmbientHidden));
     let cfg = Config::default();
     let s = spec(dir.path(), "esc-held", "d", &["true"]);
     let (ran, guard) = run_to_end(&ctx, &cfg, &s);
