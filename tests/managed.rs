@@ -2939,7 +2939,17 @@ fn a_given_env_replaces_ours_and_keeps_the_reserved_variables() {
              echo to-stderr >&2",
         ],
     );
-    o.env = Some([("X".to_string(), "1".to_string())].into());
+    // Forged reserved variables must lose to the real ones.
+    o.env = Some(
+        [
+            ("X", "1"),
+            ("TASK_TRAFFIC_CONTROLLER_LEASE", "forged"),
+            ("TASK_TRAFFIC_CONTROLLER_MANAGED_ID", "forged"),
+            ("TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE", "forged"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .into(),
+    );
     o.stdout_log = Some(log.clone());
     assert_eq!(run_managed_opts(dir.path(), "env-1", o), 0);
     let text = std::fs::read_to_string(&log).unwrap();
@@ -2950,6 +2960,7 @@ fn a_given_env_replaces_ours_and_keeps_the_reserved_variables() {
     assert!(text.contains("lease=env-1"), "{text}");
     assert!(text.contains("id=env-1"), "{text}");
     assert!(text.contains("scope=set"), "{text}");
+    assert!(!text.contains("forged"), "{text}");
     assert!(text.contains("to-stderr"), "stderr goes to the log: {text}");
 }
 

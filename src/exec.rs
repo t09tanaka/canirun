@@ -41,7 +41,9 @@ pub struct Opts {
     /// The child's whole environment. `Some` clears the inherited one and
     /// starts from this map (the reserved `TASK_TRAFFIC_CONTROLLER_*`
     /// variables are still added on top); `None` inherits ours. Not part of
-    /// the history key.
+    /// the history key. When `Some`, nothing of the parent's environment is
+    /// inherited, `PATH` included: the caller passes every value it needs
+    /// (without `PATH`, the executable lookup falls back to the OS default).
     pub env: Option<std::collections::BTreeMap<String, String>>,
     /// `Some`: the child's stdout and stderr are appended to this file
     /// (created if missing) and its stdin is `/dev/null`. `None`: all three

@@ -342,7 +342,12 @@ fn inspect_reports_history_quality_per_key() {
         (0, None, None)
     );
     // The digest of the history is the same as without the quality block.
-    assert!(insp.snapshot_digest.starts_with("sha256:"));
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&(&insp.entries, &insp.history)).unwrap();
+    assert_eq!(
+        insp.snapshot_digest,
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    );
 }
 
 #[test]

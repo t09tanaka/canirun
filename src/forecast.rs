@@ -630,8 +630,8 @@ struct Globals {
     live_missing: bool,
     any_live_hold: bool,
     overlay_applied: usize,
-    /// Ledger entries whose queue or run age is read off their wall-clock
-    /// (UTC) stamps: an entry carries no monotonic time.
+    /// Ledger entries counted as aged from wall-clock (UTC) records: every
+    /// entry's queue or run age is estimated from its UTC stamps today.
     legacy_clock_entries: usize,
 }
 
@@ -693,8 +693,8 @@ fn timing_of(
     let mut conditional = assumptions.len() > 1;
     if g.legacy_clock_entries > 0 {
         assumptions.push(format!(
-            "legacy_clock: the age of {} ledger entries is estimated from their UTC timestamps, \
-             which a wall-clock step can skew",
+            "legacy_clock: ledger entries record UTC times and their age is estimated from them \
+             ({} entries), which a wall-clock step can skew",
             g.legacy_clock_entries
         ));
     }
@@ -2091,7 +2091,7 @@ mod tests {
             n.clone(),
         );
         assert_eq!(note(&one).len(), 1);
-        assert!(note(&one)[0].contains("age of 1 ledger"));
+        assert!(note(&one)[0].contains("(1 entries)"));
         // The note alone does not make the answer conditional.
         let two = single(
             &insp(
@@ -2101,7 +2101,7 @@ mod tests {
             ),
             n,
         );
-        assert!(note(&two)[0].contains("age of 2 ledger"));
+        assert!(note(&two)[0].contains("(2 entries)"));
     }
 
     #[test]
