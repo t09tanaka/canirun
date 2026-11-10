@@ -1,4 +1,4 @@
-//! End-to-end tests for the `canirun` binary.
+//! End-to-end tests for the `task-traffic-controller` binary.
 //!
 //! Every test gets its own [`TestEnv`]: a temp directory supplying
 //! `HOME` / `XDG_STATE_HOME` / `XDG_CONFIG_HOME` to the spawned binary via
@@ -23,18 +23,21 @@ impl TestEnv {
     }
 
     fn with_config(self, toml: &str) -> Self {
-        let p = self.dir.path().join("config/canirun/config.toml");
+        let p = self
+            .dir
+            .path()
+            .join("config/task-traffic-controller/config.toml");
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, toml).unwrap();
         self
     }
 
     fn state(&self) -> PathBuf {
-        self.dir.path().join("state/canirun")
+        self.dir.path().join("state/task-traffic-controller")
     }
 
     fn cmd(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_canirun"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_task-traffic-controller"));
         c.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", self.dir.path())
@@ -54,7 +57,7 @@ impl TestEnv {
         p
     }
 
-    /// Spawn `canirun exec <extra> -- sh -c '<script>'` detached from our
+    /// Spawn `task-traffic-controller exec <extra> -- sh -c '<script>'` detached from our
     /// stdio so tests can wait on it.
     fn spawn_exec(&self, extra: &[&str], script: &str) -> Child {
         self.cmd()
@@ -254,7 +257,7 @@ fn short_command_backfills_behind_a_head_that_does_not_fit() {
     let env = TestEnv::new()
         .with_config("budget = 4\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     let dir = env.marker_dir();
-    // Teach canirun that `quick` is short (a run of at least 1 s counts).
+    // Teach task-traffic-controller that `quick` is short (a run of at least 1 s counts).
     let learn = env.run(&["exec", "--key", "quick", "--", "sh", "-c", "sleep 1.1"]);
     assert!(learn.status.success());
     let mut resident = env.spawn_exec(&["--weight", "2"], &gated_script(&dir, "resident"));
@@ -410,7 +413,7 @@ fn killed_waiting_head_is_reaped_and_queue_moves_on() {
 #[test]
 fn nested_exec_inherits_lease_and_bogus_lease_is_gated() {
     let env = TestEnv::new().with_config("budget = 1\n");
-    let bin = env!("CARGO_BIN_EXE_canirun");
+    let bin = env!("CARGO_BIN_EXE_task-traffic-controller");
     // Outer takes the whole budget; inner must still run (inherited lease).
     let out = env.run(&[
         "exec",
@@ -439,7 +442,7 @@ fn nested_exec_inherits_lease_and_bogus_lease_is_gated() {
     }));
     let mut stale = env
         .cmd()
-        .env("CANIRUN_LEASE", "deadbeef")
+        .env("TASK_TRAFFIC_CONTROLLER_LEASE", "deadbeef")
         .args([
             "exec",
             "--",
@@ -506,10 +509,10 @@ fn hold_ledger_lock(env: &TestEnv) -> fs::File {
     f
 }
 
-/// `canirun exec -- echo ran` giving up on the ledger lock after 200 ms.
+/// `task-traffic-controller exec -- echo ran` giving up on the ledger lock after 200 ms.
 fn spawn_impatient_exec(env: &TestEnv) -> Child {
     env.cmd()
-        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .env("TASK_TRAFFIC_CONTROLLER_LEDGER_LOCK_TIMEOUT_MS", "200")
         .args(["exec", "--", "echo", "ran"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -565,7 +568,7 @@ fn status_reads_the_ledger_while_the_lock_is_busy() {
     let lock = hold_ledger_lock(&env);
     let out = env
         .cmd()
-        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .env("TASK_TRAFFIC_CONTROLLER_LEDGER_LOCK_TIMEOUT_MS", "200")
         .args(["status", "--json"])
         .output()
         .unwrap();
@@ -613,7 +616,7 @@ fn progress_is_printed_while_waiting() {
     let out = waiter.wait_with_output().unwrap();
     assert!(out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("canirun: waiting"), "{err}");
+    assert!(err.contains("task-traffic-controller: waiting"), "{err}");
     assert!(err.contains("running 1 (1/1 used)"), "{err}");
     assert!(hog.wait().unwrap().success());
 }
@@ -633,7 +636,7 @@ fn progress_lines_behind_hog(config: &str) -> usize {
     assert!(hog.wait().unwrap().success());
     String::from_utf8_lossy(&out.stderr)
         .lines()
-        .filter(|l| l.starts_with("canirun: waiting"))
+        .filter(|l| l.starts_with("task-traffic-controller: waiting"))
         .count()
 }
 
@@ -898,7 +901,9 @@ fn config_and_gc_commands() {
     let out = env.run(&["config"]);
     assert!(stdout(&out).contains("budget = 3"));
     let out = env.run(&["config", "--path"]);
-    assert!(stdout(&out).trim().ends_with("config/canirun/config.toml"));
+    assert!(stdout(&out)
+        .trim()
+        .ends_with("config/task-traffic-controller/config.toml"));
     env.run(&["exec", "--", "true"]);
     env.run(&["exec", "--", "true"]);
     let out = env.run(&["gc"]);

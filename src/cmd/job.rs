@@ -1,23 +1,23 @@
 use crate::signals::reraise;
-use canirun::admit::State;
-use canirun::config::Config;
-use canirun::display::{label, truncate};
-use canirun::error::{Error, Result};
-use canirun::exec::{self, Gated, Opts, POLL_INTERVAL};
-use canirun::jobs::{self, Job, JobState};
-use canirun::ledger::Ledger;
-use canirun::runner::Exit;
-use canirun::{lock, Context};
 use chrono::{Local, Utc};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::thread;
 use std::time::{Duration, Instant};
+use task_traffic_controller::admit::State;
+use task_traffic_controller::config::Config;
+use task_traffic_controller::display::{label, truncate};
+use task_traffic_controller::error::{Error, Result};
+use task_traffic_controller::exec::{self, Gated, Opts, POLL_INTERVAL};
+use task_traffic_controller::jobs::{self, Job, JobState};
+use task_traffic_controller::ledger::Ledger;
+use task_traffic_controller::runner::Exit;
+use task_traffic_controller::{lock, Context};
 
 pub fn submit(ctx: &Context, cfg: &Config, opts: Opts, detach: bool) -> Result<i32> {
     if opts.argv.is_empty() {
         return Err(Error::Spawn(
-            "usage: canirun submit [--weight N] [--front] [--key K] -- <command> [args...]".into(),
+            "usage: task-traffic-controller submit [--weight N] [--front] [--key K] -- <command> [args...]".into(),
         ));
     }
     let job = Job {
@@ -50,14 +50,20 @@ pub fn submit(ctx: &Context, cfg: &Config, opts: Opts, detach: bool) -> Result<i
     };
     let registered = ledger.find(&job.id).is_some();
     let estimate = registered
-        .then(|| canirun::eta::estimate(&exec::timed_queue(ctx, &ledger), cfg.limits(), &job.id))
+        .then(|| {
+            task_traffic_controller::eta::estimate(
+                &exec::timed_queue(ctx, &ledger),
+                cfg.limits(),
+                &job.id,
+            )
+        })
         .flatten();
     if !registered && jobs::read_exit(ctx, &job.id).is_none() {
         // The runner exists and may still start, so the id is printed and
         // the submit succeeds; but `state_of` stops treating a missing
         // entry as "starting" after the same grace, hence the warning.
         eprintln!(
-            "canirun: warning: job {} has not joined the queue within \
+            "task-traffic-controller: warning: job {} has not joined the queue within \
              {STARTING_GRACE_SECS}s; a later submit may start before it, \
              and `wait` may report it as lost",
             job.id
@@ -65,7 +71,11 @@ pub fn submit(ctx: &Context, cfg: &Config, opts: Opts, detach: bool) -> Result<i
     }
     println!("{}", job.id);
     if let Some(e) = estimate {
-        eprintln!("canirun: job {} {}", job.id, exec::fmt_estimate(&e));
+        eprintln!(
+            "task-traffic-controller: job {} {}",
+            job.id,
+            exec::fmt_estimate(&e)
+        );
     }
     Ok(0)
 }
@@ -97,7 +107,7 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
             reraise(sig);
         }
         Err(e) => {
-            eprintln!("canirun: {e}");
+            eprintln!("task-traffic-controller: {e}");
             jobs::write_exit(ctx, id, 2);
             return Ok(2);
         }
@@ -168,7 +178,7 @@ pub fn state_of(ctx: &Context, id: &str, ledger: &Ledger) -> JobState {
 pub fn wait(ctx: &Context, ids: &[String], no_output: bool) -> Result<i32> {
     if ids.is_empty() {
         return Err(Error::Spawn(
-            "usage: canirun wait [--no-output] <job-id>...".into(),
+            "usage: task-traffic-controller wait [--no-output] <job-id>...".into(),
         ));
     }
     let mut waiter_locks = Vec::with_capacity(ids.len());
@@ -233,12 +243,12 @@ pub fn wait(ctx: &Context, ids: &[String], no_output: bool) -> Result<i32> {
 
 fn report(ctx: &Context, id: &str, code: i32, lost: bool, no_output: bool) -> Result<()> {
     let job = jobs::load(ctx, id)?;
-    let argv = canirun::key::argv_string(&job.argv);
+    let argv = task_traffic_controller::key::argv_string(&job.argv);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(
         out,
-        "=== canirun job {id} {} — {argv}",
+        "=== task-traffic-controller job {id} {} — {argv}",
         if lost {
             "lost (runner died before finishing)".to_string()
         } else if job.orphaned {
@@ -294,15 +304,15 @@ pub fn list(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
         } else {
             state.label()
         };
-        let repo = canirun::gitctx::main_worktree(&j.cwd).unwrap_or_default();
+        let repo = task_traffic_controller::gitctx::main_worktree(&j.cwd).unwrap_or_default();
         let subdir = if repo.is_empty() {
             String::new()
         } else {
-            canirun::gitctx::subdir(&j.cwd)
+            task_traffic_controller::gitctx::subdir(&j.cwd)
         };
         let eta = match state {
             JobState::Queued | JobState::Running => {
-                canirun::eta::estimate(&timed, cfg.limits(), &j.id)
+                task_traffic_controller::eta::estimate(&timed, cfg.limits(), &j.id)
                     .map(|e| format!("  ({})", exec::fmt_estimate(&e)))
                     .unwrap_or_default()
             }
@@ -314,7 +324,11 @@ pub fn list(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
             state_label,
             j.submitted_at.with_timezone(&Local).format("%m-%d %H:%M"),
             truncate(
-                &label(&repo, &subdir, &canirun::key::argv_string(&j.argv)),
+                &label(
+                    &repo,
+                    &subdir,
+                    &task_traffic_controller::key::argv_string(&j.argv)
+                ),
                 70
             )
         );
@@ -324,7 +338,9 @@ pub fn list(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
 
 pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
     if ids.is_empty() {
-        return Err(Error::Spawn("usage: canirun cancel <job-id>...".into()));
+        return Err(Error::Spawn(
+            "usage: task-traffic-controller cancel <job-id>...".into(),
+        ));
     }
     let ledger = lock::load_reaped(ctx)?;
     for id in ids {

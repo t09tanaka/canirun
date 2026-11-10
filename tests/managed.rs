@@ -2,21 +2,25 @@
 //! measurement idempotence. Every test runs in its own temp state dir with
 //! an explicit `Context`; nothing touches the real user state.
 
-use canirun::admit::State;
-use canirun::config::Config;
-use canirun::exec::{self, Gated, Hooks, Opts};
-use canirun::history::{self, Record};
-use canirun::ledger::Ledger;
-use canirun::managed::{self, CommandSpec, Loaded, Measured, Registration, TerminalKind, TryAdmit};
-use canirun::marker::{HiddenProc, ProcRef, Scan};
-use canirun::reap::{Keep, Probe, Verdict};
-use canirun::receipt::Phase;
-use canirun::{lock, Context, FakeClock, FixedBoot, FixedLive, FixedScan, Paths, Supervisor};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use task_traffic_controller::admit::State;
+use task_traffic_controller::config::Config;
+use task_traffic_controller::exec::{self, Gated, Hooks, Opts};
+use task_traffic_controller::history::{self, Record};
+use task_traffic_controller::ledger::Ledger;
+use task_traffic_controller::managed::{
+    self, CommandSpec, Loaded, Measured, Registration, TerminalKind, TryAdmit,
+};
+use task_traffic_controller::marker::{HiddenProc, ProcRef, Scan};
+use task_traffic_controller::reap::{Keep, Probe, Verdict};
+use task_traffic_controller::receipt::Phase;
+use task_traffic_controller::{
+    lock, Context, FakeClock, FixedBoot, FixedLive, FixedScan, Paths, Supervisor,
+};
 
 fn ctx_with_boot(dir: &Path, boot: Option<&str>) -> Context {
     Context::new(Paths::new(dir.join("state"), dir.join("config.toml")))
@@ -108,7 +112,7 @@ fn register_is_idempotent_and_the_entry_exists_before_the_receipt() {
     // The owner is alive: a second registration cannot take the lease.
     assert!(matches!(
         managed::register(&ctx, &cfg, &s),
-        Err(canirun::error::Error::AlreadyOwned(_))
+        Err(task_traffic_controller::error::Error::AlreadyOwned(_))
     ));
     drop(g1);
     // A new supervisor re-registers the same id and digest: same entry.
@@ -122,7 +126,7 @@ fn register_is_idempotent_and_the_entry_exists_before_the_receipt() {
     let other = spec(dir.path(), "cmd-a", "digest-2", &["true"]);
     assert!(matches!(
         managed::register(&ctx, &cfg, &other),
-        Err(canirun::error::Error::Conflict(_))
+        Err(task_traffic_controller::error::Error::Conflict(_))
     ));
     assert_eq!(sidecar(&ctx, "cmd-a").spec_digest, "digest-1");
 }
@@ -337,7 +341,12 @@ fn an_identical_record_under_another_id_or_none_is_not_this_measurement() {
 }
 
 /// Pretend the supervisor died: drop its lease, keep everything else.
-fn orphan(ctx: &Context, id: &str, phase: Phase, child: Option<canirun::process::ChildIdentity>) {
+fn orphan(
+    ctx: &Context,
+    id: &str,
+    phase: Phase,
+    child: Option<task_traffic_controller::process::ChildIdentity>,
+) {
     let mut sc = sidecar(ctx, id);
     sc.phase = phase;
     sc.child = child;
@@ -403,7 +412,7 @@ fn an_unreadable_sidecar_is_not_free_capacity() {
     // Re-registering over a broken sidecar is refused, not papered over.
     assert!(matches!(
         managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])),
-        Err(canirun::error::Error::Conflict(_))
+        Err(task_traffic_controller::error::Error::Conflict(_))
     ));
     managed::resolve(&ctx, "c", TerminalKind::Interrupted, "unreadable").unwrap();
     assert!(reaped(&ctx).find("c").is_none());
@@ -415,9 +424,9 @@ fn a_changed_boot_id_releases_what_the_old_boot_left() {
     let (ctx1, cfg) = (ctx(dir.path()), Config::default());
     let (_, g) =
         registered(managed::register(&ctx1, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
-    let ghost = canirun::process::ChildIdentity {
+    let ghost = task_traffic_controller::process::ChildIdentity {
         pid: std::process::id(), // alive, would be "kept" on the same boot
-        start_time: canirun::process::start_time(std::process::id()),
+        start_time: task_traffic_controller::process::start_time(std::process::id()),
         pgid: Some(unsafe { libc::getpgid(0) }),
         sid: None,
     };
@@ -441,9 +450,9 @@ fn a_changed_boot_id_releases_what_the_old_boot_left() {
 /// The ledger types of the last release before managed entries existed,
 /// copied as they were: what an older binary parses the ledger with.
 mod old_ledger {
-    use canirun::admit::State;
     use chrono::{DateTime, Utc};
     use serde::Deserialize;
+    use task_traffic_controller::admit::State;
 
     #[derive(Debug, Deserialize)]
     #[allow(dead_code)]
@@ -512,7 +521,7 @@ fn a_plain_entry_keeps_the_old_ledger_readable() {
     let ctx = ctx(dir.path());
     let mut l = Ledger::default();
     let s = l.take_seq();
-    l.entries.push(canirun::ledger::Entry {
+    l.entries.push(task_traffic_controller::ledger::Entry {
         id: "plain".into(),
         pid: std::process::id(),
         state: State::Waiting,
@@ -545,7 +554,7 @@ fn inspect_reports_a_quarantined_entry_and_still_counts_it() {
         registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
     orphan(&ctx, "c", Phase::LaunchIntent, None);
     drop(g);
-    let insp = canirun::inspect::inspect_with(&ctx, &cfg).unwrap();
+    let insp = task_traffic_controller::inspect::inspect_with(&ctx, &cfg).unwrap();
     assert_eq!(insp.entries.len(), 1);
     assert!(insp.entries[0].suspect_dead);
     // Reading changed nothing.
@@ -565,11 +574,15 @@ fn a_quarantined_entry_is_demand_not_free_capacity_in_a_forecast() {
     admit_now(&ctx, &cfg, "q");
     orphan(&ctx, "q", Phase::LaunchIntent, None);
     drop(g);
-    let plan =
-        canirun::estimate::command_plan(&ctx, &cfg, &opts(dir.path(), &["fixture-tool"])).unwrap();
-    let insp = canirun::inspect::inspect_with(&ctx, &cfg).unwrap();
+    let plan = task_traffic_controller::estimate::command_plan(
+        &ctx,
+        &cfg,
+        &opts(dir.path(), &["fixture-tool"]),
+    )
+    .unwrap();
+    let insp = task_traffic_controller::inspect::inspect_with(&ctx, &cfg).unwrap();
     assert!(insp.entries[0].suspect_dead);
-    let f = canirun::forecast::forecast(&ctx, &insp, &plan, &[]).unwrap();
+    let f = task_traffic_controller::forecast::forecast(&ctx, &insp, &plan, &[]).unwrap();
     // The only slot is held by the quarantined entry: no start is promised.
     assert_eq!(f.target.timing.start_in_ms, None);
     assert!(ledger(&ctx).find("q").is_some());
@@ -578,7 +591,7 @@ fn a_quarantined_entry_is_demand_not_free_capacity_in_a_forecast() {
 /// Runs only when re-executed by the SIGKILL test below, as the supervisor.
 #[test]
 fn supervisor_entry() {
-    let Some(dir) = std::env::var_os("CANIRUN_TEST_SUPERVISOR_DIR") else {
+    let Some(dir) = std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_SUPERVISOR_DIR") else {
         return;
     };
     let dir = PathBuf::from(dir);
@@ -603,7 +616,7 @@ fn a_sigkilled_supervisor_keeps_its_budget_until_its_tree_is_stopped() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CANIRUN_TEST_SUPERVISOR_DIR", dir.path())
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_SUPERVISOR_DIR", dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -702,7 +715,7 @@ fn an_interrupted_wait_leaves_the_signal_handlers_to_the_caller() {
 #[test]
 fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state/canirun");
+    let state = dir.path().join("state/task-traffic-controller");
     let cfg = Config::default();
     // The library and the CLI share one state dir; real boot id on both.
     let lib = Context::new(Paths::new(&state, dir.path().join("none.toml")))
@@ -721,7 +734,7 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     managed::write_sidecar(&lib, &sc).unwrap();
     drop(g);
     let run = |args: &[&str]| {
-        let o = Command::new(env!("CARGO_BIN_EXE_canirun"))
+        let o = Command::new(env!("CARGO_BIN_EXE_task-traffic-controller"))
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", dir.path())
@@ -741,9 +754,12 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     assert_eq!(status["entries"][0]["id"], "c", "still charged");
     assert!(status.get("managed").is_none());
     assert!(status["entries"][0].get("managed").is_none());
-    assert_eq!(insp["managed"][0]["hint"], "canirun resolve c");
+    assert_eq!(
+        insp["managed"][0]["hint"],
+        "task-traffic-controller resolve c"
+    );
     let text = |args: &[&str]| {
-        let o = Command::new(env!("CARGO_BIN_EXE_canirun"))
+        let o = Command::new(env!("CARGO_BIN_EXE_task-traffic-controller"))
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", dir.path())
@@ -759,7 +775,10 @@ fn the_cli_shows_quarantine_in_inspect_and_leaves_status_json_alone() {
     };
     let (_, shown) = text(&["status"]);
     assert!(shown.contains("held, owner gone (1)"), "{shown}");
-    assert!(shown.contains("canirun resolve c"), "{shown}");
+    assert!(
+        shown.contains("task-traffic-controller resolve c"),
+        "{shown}"
+    );
     // Nothing runs, so `resolve` releases the launch intent and says why.
     let (code, said) = text(&["resolve", "c"]);
     assert_eq!(code, 0, "{said}");
@@ -788,7 +807,7 @@ fn run_to_end(
     ctx: &Context,
     cfg: &Config,
     s: &CommandSpec,
-) -> (canirun::managed::Ran, managed::OwnerGuard) {
+) -> (task_traffic_controller::managed::Ran, managed::OwnerGuard) {
     let (_, guard) = registered(managed::register(ctx, cfg, s).unwrap());
     admit_now(ctx, cfg, &s.command_id);
     let ran = managed::run_command(ctx, &guard, &s.opts, cfg.limits()).unwrap();
@@ -932,7 +951,7 @@ fn a_launch_intent_is_released_only_after_the_grace_with_a_clear_scan() {
         v[0].quarantined && v[0].reason.contains("ProbeUnknown"),
         "{v:?}"
     );
-    assert_eq!(v[0].hint, "canirun resolve l");
+    assert_eq!(v[0].hint, "task-traffic-controller resolve l");
     // Clear: nothing is running, so it is settled and recorded.
     assert!(reaped(&with(Probe::Gone)).find("l").is_none());
     let sc = sidecar(&with(Probe::Gone), "l");
@@ -978,7 +997,7 @@ fn resolve_checked_releases_only_what_the_checks_allow() {
         .unwrap()
         .detail
         .unwrap()
-        .contains("canirun resolve"));
+        .contains("task-traffic-controller resolve"));
     let again = managed::resolve_checked(&with(Probe::Gone), "r").unwrap();
     assert!(!again.released && !again.found && again.verdict == "NoEntry");
 }
@@ -1038,7 +1057,10 @@ fn a_managed_command_carries_its_id_in_its_environment() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, cfg) = (ctx(dir.path()), Config::default());
     let out = dir.path().join("id.txt");
-    let script = format!("printf %s \"$CANIRUN_MANAGED_ID\" > {}", out.display());
+    let script = format!(
+        "printf %s \"$TASK_TRAFFIC_CONTROLLER_MANAGED_ID\" > {}",
+        out.display()
+    );
     let s = spec(dir.path(), "env-id", "d", &["sh", "-c", &script]);
     let (ran, guard) = run_to_end(&ctx, &cfg, &s);
     assert!(!ran.outcome.descendants_left);
@@ -1055,14 +1077,14 @@ fn a_managed_command_carries_its_id_in_its_environment() {
 #[allow(clippy::zombie_processes)]
 #[test]
 fn helper_entry() {
-    let Ok(role) = std::env::var("CANIRUN_TEST_ROLE") else {
+    let Ok(role) = std::env::var("TASK_TRAFFIC_CONTROLLER_TEST_ROLE") else {
         return;
     };
-    let pidfile = std::env::var_os("CANIRUN_TEST_PIDFILE");
+    let pidfile = std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_PIDFILE");
     if role == "escape" {
         let mut c = Command::new(std::env::current_exe().unwrap());
         c.args(["--exact", "helper_entry", "--nocapture"])
-            .env("CANIRUN_TEST_ROLE", "sleep")
+            .env("TASK_TRAFFIC_CONTROLLER_TEST_ROLE", "sleep")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1083,7 +1105,7 @@ fn helper_entry() {
             }
         }
     } else {
-        if std::env::var_os("CANIRUN_TEST_IGNORE_TERM").is_some() {
+        if std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_IGNORE_TERM").is_some() {
             unsafe {
                 libc::signal(libc::SIGTERM, libc::SIG_IGN);
             }
@@ -1096,10 +1118,16 @@ fn helper_entry() {
 }
 
 fn helper_command(role: &str, pidfile: &Path, ignore_term: bool) -> Vec<String> {
-    let mut v = vec!["env".to_string(), format!("CANIRUN_TEST_ROLE={role}")];
-    v.push(format!("CANIRUN_TEST_PIDFILE={}", pidfile.display()));
+    let mut v = vec![
+        "env".to_string(),
+        format!("TASK_TRAFFIC_CONTROLLER_TEST_ROLE={role}"),
+    ];
+    v.push(format!(
+        "TASK_TRAFFIC_CONTROLLER_TEST_PIDFILE={}",
+        pidfile.display()
+    ));
     if ignore_term {
-        v.push("CANIRUN_TEST_IGNORE_TERM=1".into());
+        v.push("TASK_TRAFFIC_CONTROLLER_TEST_IGNORE_TERM=1".into());
     }
     v.push(std::env::current_exe().unwrap().display().to_string());
     v.extend(["--exact", "helper_entry", "--nocapture"].map(String::from));
@@ -1191,11 +1219,11 @@ fn a_process_with_the_same_id_from_another_state_dir_is_left_alone() {
     // and not a reason to hold the budget.
     let mut stranger = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "helper_entry", "--nocapture"])
-        .env("CANIRUN_TEST_ROLE", "sleep")
-        .env(canirun::marker::ENV_VAR, "shared-id")
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_ROLE", "sleep")
+        .env(task_traffic_controller::marker::ENV_VAR, "shared-id")
         .env(
-            canirun::marker::SCOPE_VAR,
-            canirun::marker::scope(other.path()),
+            task_traffic_controller::marker::SCOPE_VAR,
+            task_traffic_controller::marker::scope(other.path()),
         )
         .stdout(Stdio::null())
         .spawn()
@@ -1247,11 +1275,11 @@ fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
     // A stand-in survivor outside the group, marked like the real thing.
     let mut survivor = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "helper_entry", "--nocapture"])
-        .env("CANIRUN_TEST_ROLE", "sleep")
-        .env(canirun::marker::ENV_VAR, "esc-held")
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_ROLE", "sleep")
+        .env(task_traffic_controller::marker::ENV_VAR, "esc-held")
         .env(
-            canirun::marker::SCOPE_VAR,
-            canirun::marker::scope(ctx.paths.state_dir()),
+            task_traffic_controller::marker::SCOPE_VAR,
+            task_traffic_controller::marker::scope(ctx.paths.state_dir()),
         )
         .stdout(Stdio::null())
         .spawn()
@@ -1366,7 +1394,7 @@ fn trimming_the_history_waits_for_the_history_lock() {
 /// so only the recorded descendants can find it there.
 #[test]
 fn setsid_supervisor_entry() {
-    let Some(dir) = std::env::var_os("CANIRUN_TEST_SETSID_DIR") else {
+    let Some(dir) = std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_SETSID_DIR") else {
         return;
     };
     let dir = PathBuf::from(dir);
@@ -1376,7 +1404,7 @@ fn setsid_supervisor_entry() {
     let script = "use POSIX qw(setsid); my $p = fork(); if (!$p) { setsid(); \
         open(F, '>', $ARGV[0] . '.tmp'); print F $$; close F; \
         rename($ARGV[0] . '.tmp', $ARGV[0]); \
-        delete $ENV{CANIRUN_MANAGED_ID}; delete $ENV{CANIRUN_MANAGED_SCOPE}; \
+        delete $ENV{TASK_TRAFFIC_CONTROLLER_MANAGED_ID}; delete $ENV{TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE}; \
         exec('sleep', '60'); } sleep 60;";
     let pidfile = dir.join("sleeper.pid");
     let s = spec(
@@ -1430,9 +1458,9 @@ impl Drop for Cleanup {
 /// here only the recorded descendant decides.
 struct NoAmbientHidden;
 
-impl canirun::ProcessScan for NoAmbientHidden {
+impl task_traffic_controller::ProcessScan for NoAmbientHidden {
     fn scan(&self, id: &str, scope: &str) -> Scan {
-        let mut s = canirun::process::scan_system(id, scope);
+        let mut s = task_traffic_controller::process::scan_system(id, scope);
         s.hidden.clear();
         s
     }
@@ -1449,7 +1477,7 @@ fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CANIRUN_TEST_SETSID_DIR", dir.path())
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_SETSID_DIR", dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -1519,7 +1547,7 @@ fn dead_child(
     );
     let mut sc = sidecar(&c, id);
     sc.phase = Phase::ChildStarted;
-    sc.child = Some(canirun::process::ChildIdentity {
+    sc.child = Some(task_traffic_controller::process::ChildIdentity {
         pid: 0x3fff_fff0,
         start_time: Some(1),
         pgid: Some(0x3fff_fff0),
@@ -1605,7 +1633,7 @@ fn force_never_releases_what_is_known_to_be_running() {
     let mut live = Command::new("sleep").arg("60").spawn().unwrap();
     let rec = ProcRef {
         pid: live.id(),
-        start_time: canirun::process::start_time(live.id()),
+        start_time: task_traffic_controller::process::start_time(live.id()),
     };
     dead_child(dir.path(), &clock, "m1", |_| {});
     dead_child(dir.path(), &clock, "m2", |sc| {
@@ -1716,8 +1744,11 @@ fn a_hidden_orphan_started_since_the_intent_keeps_a_launch_intent() {
 }
 
 /// A recorder that cannot start, as when the command cannot be read.
-fn failing_tracker(root: u32, record: canirun::tracker::Record) -> canirun::tracker::Tracker {
-    canirun::tracker::Tracker::failed(root, record)
+fn failing_tracker(
+    root: u32,
+    record: task_traffic_controller::tracker::Record,
+) -> task_traffic_controller::tracker::Tracker {
+    task_traffic_controller::tracker::Tracker::failed(root, record)
 }
 
 #[test]
@@ -1868,15 +1899,18 @@ fn a_supervisor_that_died_mid_run_leaves_the_window_open_so_a_late_hidden_fork_h
     assert!(reaped(&hidden(0)).find("sd2").is_none(), "before the child");
 }
 
-fn idle_tracker(root: u32, record: canirun::tracker::Record) -> canirun::tracker::Tracker {
-    canirun::tracker::Tracker::idle(root, record)
+fn idle_tracker(
+    root: u32,
+    record: task_traffic_controller::tracker::Record,
+) -> task_traffic_controller::tracker::Tracker {
+    task_traffic_controller::tracker::Tracker::idle(root, record)
 }
 
 #[test]
 fn a_clean_run_closes_the_window_and_one_not_tracked_to_the_exit_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
-    let now = canirun::Clock::now(&*clock);
+    let now = task_traffic_controller::Clock::now(&*clock);
     let hidden = |start: u64| {
         let mut s = Scan::new(Probe::Gone, vec![]);
         s.hidden.push(HiddenProc {
@@ -1931,7 +1965,7 @@ fn a_clean_run_closes_the_window_and_one_not_tracked_to_the_exit_does_not() {
 /// always later.
 struct Ticking(std::sync::Mutex<chrono::DateTime<chrono::Utc>>);
 
-impl canirun::Clock for Ticking {
+impl task_traffic_controller::Clock for Ticking {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         let mut t = self.0.lock().unwrap();
         *t += chrono::Duration::seconds(10);
@@ -1965,7 +1999,7 @@ fn the_window_closes_at_the_time_after_the_stop_not_at_the_spawn_stamp() {
 fn a_run_that_left_descendants_does_not_close_the_window() {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
-    let start = canirun::Clock::now(&*clock).timestamp() as u64;
+    let start = task_traffic_controller::Clock::now(&*clock).timestamp() as u64;
     let hidden = |start: u64, probe: Probe, alive: Vec<ProcRef>| {
         let mut s = Scan::new(probe, alive);
         s.hidden.push(HiddenProc {
@@ -2008,9 +2042,9 @@ fn a_run_that_left_descendants_does_not_close_the_window() {
 /// A ChildStarted entry whose child (this test process) is alive and whose
 /// supervisor is gone, as of `ctx`'s boot.
 fn orphan_with_live_child(ctx: &Context, id: &str) {
-    let ghost = canirun::process::ChildIdentity {
+    let ghost = task_traffic_controller::process::ChildIdentity {
         pid: std::process::id(),
-        start_time: canirun::process::start_time(std::process::id()),
+        start_time: task_traffic_controller::process::start_time(std::process::id()),
         pgid: Some(unsafe { libc::getpgid(0) }),
         sid: None,
     };
@@ -2074,8 +2108,8 @@ struct CopyOnSample {
     to: PathBuf,
 }
 
-impl canirun::LiveProvider for CopyOnSample {
-    fn snapshot(&self) -> Option<canirun::admit::LiveSnapshot> {
+impl task_traffic_controller::LiveProvider for CopyOnSample {
+    fn snapshot(&self) -> Option<task_traffic_controller::admit::LiveSnapshot> {
         std::fs::copy(&self.from, &self.to).unwrap();
         None
     }
@@ -2160,7 +2194,7 @@ fn a_started_managed_run_of_this_state_dir_is_nested_without_its_lease() {
         registered(managed::register(&ctx, &cfg, &spec(dir.path(), "c", "d", &["true"])).unwrap());
     // After the registration: the scope names the directory as it resolves
     // once it exists.
-    let scope = canirun::marker::scope(ctx.paths.state_dir());
+    let scope = task_traffic_controller::marker::scope(ctx.paths.state_dir());
     let nested = |lease: Option<&str>, id: Option<&str>, sc: Option<&str>| {
         exec::nested_run_id(&ctx, lease, id, sc).unwrap()
     };
@@ -2183,18 +2217,18 @@ fn a_started_managed_run_of_this_state_dir_is_nested_without_its_lease() {
     assert_eq!(nested(None, Some("c"), Some(&scope)), None);
 }
 
-/// Run `canirun exec -- true` against `lib`'s state directory with only the
+/// Run `task-traffic-controller exec -- true` against `lib`'s state directory with only the
 /// given managed variables set.
 fn cli_true(dir: &Path, lib: &Context, vars: Option<(&str, &str)>) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_canirun"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_task-traffic-controller"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", dir)
         .env("XDG_STATE_HOME", dir.join("state"))
         .env("XDG_CONFIG_HOME", dir.join("config"));
     if let Some((id, scope)) = vars {
-        cmd.env("CANIRUN_MANAGED_ID", id)
-            .env("CANIRUN_MANAGED_SCOPE", scope);
+        cmd.env("TASK_TRAFFIC_CONTROLLER_MANAGED_ID", id)
+            .env("TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE", scope);
     }
     let out = cmd.args(["exec", "--", "true"]).output().unwrap();
     assert!(
@@ -2207,11 +2241,11 @@ fn cli_true(dir: &Path, lib: &Context, vars: Option<(&str, &str)>) -> std::proce
 }
 
 fn cli_state(dir: &Path) -> (Context, String) {
-    let state = dir.join("state/canirun");
+    let state = dir.join("state/task-traffic-controller");
     let lib = Context::new(Paths::new(&state, dir.join("none.toml")))
         .with_live(Arc::new(FixedLive(None)));
     // A roomy budget and no machine guards, so a gated run starts at once.
-    let conf = dir.join("config/canirun/config.toml");
+    let conf = dir.join("config/task-traffic-controller/config.toml");
     std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
     std::fs::write(
         &conf,
@@ -2223,7 +2257,7 @@ fn cli_state(dir: &Path) -> (Context, String) {
         registered(managed::register(&lib, &cfg, &spec(dir, "c", "d", &["true"])).unwrap());
     admit_now(&lib, &cfg, "c");
     drop(g);
-    let scope = canirun::marker::scope(lib.paths.state_dir());
+    let scope = task_traffic_controller::marker::scope(lib.paths.state_dir());
     (lib, scope)
 }
 
@@ -2256,9 +2290,9 @@ fn a_process_that_only_inherited_the_managed_variables_is_still_gated() {
         .process_group(0)
         .spawn()
         .unwrap();
-    let ghost = canirun::process::ChildIdentity {
+    let ghost = task_traffic_controller::process::ChildIdentity {
         pid: other.id(),
-        start_time: canirun::process::start_time(other.id()),
+        start_time: task_traffic_controller::process::start_time(other.id()),
         pgid: Some(other.id() as i32),
         sid: None,
     };
@@ -2327,7 +2361,7 @@ impl SlowScan {
     }
 }
 
-impl canirun::ProcessScan for SlowScan {
+impl task_traffic_controller::ProcessScan for SlowScan {
     fn scan(&self, _id: &str, _scope: &str) -> Scan {
         self.calls.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(self.delay);
@@ -2527,7 +2561,7 @@ fn force_frees_a_group_held_only_by_strangers_and_never_one_that_is_the_runs() {
     let pgid = stranger.id() as i32;
     let stranger_ref = ProcRef {
         pid: stranger.id(),
-        start_time: canirun::process::start_time(stranger.id()),
+        start_time: task_traffic_controller::process::start_time(stranger.id()),
     };
     let set_group = move |sc: &mut managed::Sidecar| {
         sc.child.as_mut().unwrap().pgid = Some(pgid);
@@ -2575,17 +2609,17 @@ fn force_frees_a_group_held_only_by_strangers_and_never_one_that_is_the_runs() {
 /// process group (`SID_ESCAPE=group`) or a new session (`SID_ESCAPE=session`).
 #[test]
 fn session_supervisor_entry() {
-    let Some(dir) = std::env::var_os("CANIRUN_TEST_SID_DIR") else {
+    let Some(dir) = std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_SID_DIR") else {
         return;
     };
     let dir = PathBuf::from(dir);
     let (ctx, cfg) = (ctx(&dir), Config::default());
     // The helper is forked before the "forked" file appears, and the escaped
     // process writes its pid only after it has left the group or session.
-    let script = "( sleep 2; perl -e 'if ($ENV{CANIRUN_TEST_SID_ESCAPE} eq \"session\") { \
+    let script = "( sleep 2; perl -e 'if ($ENV{TASK_TRAFFIC_CONTROLLER_TEST_SID_ESCAPE} eq \"session\") { \
          require POSIX; POSIX::setsid(); } else { setpgrp(0, 0); } \
-         open F, \">$ENV{CANIRUN_TEST_SID_PIDFILE}\"; print F $$; close F; \
-         exec q(env), q(-i), q(sleep), q(60)' & ) & : > \"$CANIRUN_TEST_SID_FORKED\"; wait";
+         open F, \">$ENV{TASK_TRAFFIC_CONTROLLER_TEST_SID_PIDFILE}\"; print F $$; close F; \
+         exec q(env), q(-i), q(sleep), q(60)' & ) & : > \"$TASK_TRAFFIC_CONTROLLER_TEST_SID_FORKED\"; wait";
     let s = spec(&dir, "sid-1", "d", &["sh", "-c", script]);
     let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
     admit_now(&ctx, &cfg, "sid-1");
@@ -2650,10 +2684,10 @@ fn orphan_after_escape(escape: &str) -> (tempfile::TempDir, Context, Reap) {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CANIRUN_TEST_SID_DIR", dir.path())
-        .env("CANIRUN_TEST_SID_PIDFILE", &pidfile)
-        .env("CANIRUN_TEST_SID_FORKED", &forked)
-        .env("CANIRUN_TEST_SID_ESCAPE", escape)
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_SID_DIR", dir.path())
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_SID_PIDFILE", &pidfile)
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_SID_FORKED", &forked)
+        .env("TASK_TRAFFIC_CONTROLLER_TEST_SID_ESCAPE", escape)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -2766,7 +2800,7 @@ fn a_reused_session_number_is_not_a_false_match() {
 
     // The same leader, recorded with its true start time, is a member.
     let dir2 = tempfile::tempdir().unwrap();
-    let start = canirun::process::start_time(other.id()).unwrap();
+    let start = task_traffic_controller::process::start_time(other.id()).unwrap();
     let c = gone_run_with_session(dir2.path(), "same", sid, start);
     let held = managed::resolve_checked_with(&c, "same", true).unwrap();
     assert!(!held.released && !held.forced, "{held:?}");
@@ -2777,9 +2811,12 @@ fn a_reused_session_number_is_not_a_false_match() {
 #[test]
 fn a_sidecar_without_a_session_keeps_the_old_rules() {
     let json = r#"{"pid": 7, "start_time": 3, "pgid": 7}"#;
-    let c: canirun::process::ChildIdentity = serde_json::from_str(json).unwrap();
+    let c: task_traffic_controller::process::ChildIdentity = serde_json::from_str(json).unwrap();
     assert_eq!(c.sid, None);
-    assert_eq!(canirun::process::probe_session(&c), Probe::Gone);
+    assert_eq!(
+        task_traffic_controller::process::probe_session(&c),
+        Probe::Gone
+    );
     assert!(!serde_json::to_string(&c).unwrap().contains("sid"));
 }
 
@@ -2799,11 +2836,11 @@ impl SessionAnswer {
     }
 }
 
-impl canirun::ProcessScan for SessionAnswer {
+impl task_traffic_controller::ProcessScan for SessionAnswer {
     fn scan(&self, _id: &str, _scope: &str) -> Scan {
         Scan::new(Probe::Gone, vec![])
     }
-    fn probe_session(&self, _c: &canirun::process::ChildIdentity) -> Probe {
+    fn probe_session(&self, _c: &task_traffic_controller::process::ChildIdentity) -> Probe {
         self.asked.fetch_add(1, Ordering::SeqCst);
         self.probe
     }

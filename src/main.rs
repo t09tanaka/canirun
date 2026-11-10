@@ -1,17 +1,17 @@
-//! canirun — "Can I run?" A local admission controller for heavy commands.
+//! task-traffic-controller: a local admission controller for heavy commands.
 
 mod cmd;
 mod env;
 mod signals;
 
-use canirun::{config::Config, error, exec::Opts};
 use clap::{Parser, Subcommand};
+use task_traffic_controller::{config::Config, error, exec::Opts};
 
 #[derive(Parser)]
 #[command(
-    name = "canirun",
+    name = "task-traffic-controller",
     version,
-    about = "Can I run? Gate heavy commands behind a shared budget"
+    about = "Gate heavy commands behind a shared budget"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -133,7 +133,7 @@ fn main() {
     let code = match run(cli) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("canirun: {e}");
+            eprintln!("task-traffic-controller: {e}");
             2
         }
     };

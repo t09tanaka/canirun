@@ -1,4 +1,4 @@
-# canirun — Design Spec
+# task-traffic-controller — Design Spec
 
 - **Date:** 2026-10-16
 - **Status:** Approved for implementation (2026-10-16)
@@ -16,7 +16,7 @@ and the total throughput drops below running them one after another.
 The same happens when a human `git push` triggers a pre-push hook that
 runs mutation tests while agents are already saturating the machine.
 
-`canirun` is a traffic controller for that situation. It is deliberately
+`task-traffic-controller` is a traffic controller for that situation. It is deliberately
 shaped like `portool` (a passive ledger plus a thin execution boundary,
 no daemon), but it differs in one way: it **waits** and it **measures**.
 
@@ -45,9 +45,9 @@ The two outcomes that define success:
   disappears from the ledger without any cleanup step.
 - Interactive callers (a human at the keyboard, e.g. a pre-push hook) can
   jump the queue with `--front`.
-- Nested calls (a gated command that itself calls `canirun exec`) do not
+- Nested calls (a gated command that itself calls `task-traffic-controller exec`) do not
   deadlock: the inner call inherits the outer lease.
-- Repositories that adopt `canirun` in git hooks keep working on machines
+- Repositories that adopt `task-traffic-controller` in git hooks keep working on machines
   that do not have it installed.
 
 ## Non-goals (v0.1)
@@ -60,7 +60,7 @@ The two outcomes that define success:
 - No cross-user or cross-machine coordination (same scope rule as
   portool: one OS user + `XDG_STATE_HOME`).
 - No wait timeout. A caller waits until admitted or interrupted; the
-  human decides by looking at `canirun status`.
+  human decides by looking at `task-traffic-controller status`.
 
 ## Anti-goals
 
@@ -82,11 +82,11 @@ The two outcomes that define success:
 
 ## Constraints
 
-- Rust, single binary, `cargo install canirun`. MSRV, CI matrix
+- Rust, single binary, `cargo install task-traffic-controller`. MSRV, CI matrix
   (ubuntu + macos), release tarballs, Keep a Changelog, and SemVer rules
   mirror `portool`.
 - macOS and Linux only.
-- Public repository under `t09tanaka/canirun`. The README, specs, tests,
+- Public repository under `t09tanaka/task-traffic-controller`. The README, specs, tests,
   commit messages, and examples must not name the author's employer,
   clients, or their repositories. Examples use a bundled `examples/`
   project only.
@@ -97,18 +97,18 @@ The two outcomes that define success:
 ## CLI surface
 
 ```
-canirun exec [--weight N] [--front] [--key K] -- <command> [args...]
-canirun status [--json]
-canirun history [--key K] [--json]
-canirun config [--path]
-canirun gc
+task-traffic-controller exec [--weight N] [--front] [--key K] -- <command> [args...]
+task-traffic-controller status [--json]
+task-traffic-controller history [--key K] [--json]
+task-traffic-controller config [--path]
+task-traffic-controller gc
 ```
 
-### `canirun exec`
+### `task-traffic-controller exec`
 
 1. Resolve the **command key** (see below) and the **weight** (see
    below).
-2. If `CANIRUN_LEASE` is set *and* names a lease that is currently
+2. If `TASK_TRAFFIC_CONTROLLER_LEASE` is set *and* names a lease that is currently
    `running` in the ledger, this is a nested call: run the command
    immediately with no reservation and no measurement. Otherwise
    continue.
@@ -119,13 +119,13 @@ canirun gc
    lock, print a progress line to stderr (rate-limited to once every 5
    seconds), sleep 500 ms, repeat. SIGINT/SIGTERM while waiting removes
    the entry and exits 130/143.
-5. Spawn the command with inherited stdio and `CANIRUN_LEASE=<id>` in
-   its environment, **in canirun's own process group** so that a
+5. Spawn the command with inherited stdio and `TASK_TRAFFIC_CONTROLLER_LEASE=<id>` in
+   its environment, **in task-traffic-controller's own process group** so that a
    terminal Ctrl-C reaches the child directly and the child stays the
-   tty foreground job. canirun itself ignores SIGINT and SIGQUIT while
+   tty foreground job. task-traffic-controller itself ignores SIGINT and SIGQUIT while
    the child runs (the terminal already delivered them to the child; a
    second copy would make test runners force-quit) and forwards only
-   SIGTERM and SIGHUP, which arrive via `kill(2)` addressed to canirun's
+   SIGTERM and SIGHUP, which arrive via `kill(2)` addressed to task-traffic-controller's
    pid. Wait with `wait4` to collect rusage.
 6. Remove the entry, append a history record, and exit with the child's
    exit code. If the child died from a signal, re-raise the same signal
@@ -144,25 +144,25 @@ Flags:
 - `--key K` overrides the command key (for callers whose argv carries
   volatile parts like temp paths).
 
-### `canirun status`
+### `task-traffic-controller status`
 
 Lists running entries (pid, key, weight, elapsed) and waiting entries
 (pid, key, weight, waited, front flag) plus `used/budget`. `--json` emits
 the ledger as-is for scripts. Dead entries are reaped first, so the view
 is accurate without a daemon.
 
-### `canirun history`
+### `task-traffic-controller history`
 
 Shows recent runs for a key (or all keys): wall time, CPU time, derived
 parallelism, max RSS, exit code, and the weight and predicted memory
 that will be used next.
 
-### `canirun config`
+### `task-traffic-controller config`
 
 Prints the effective configuration (defaults merged with the file).
 `--path` prints the config file location.
 
-### `canirun gc`
+### `task-traffic-controller gc`
 
 Reaps dead ledger entries and trims history to the configured retention.
 Reaping also happens on every `exec` and `status`, so `gc` is only for
@@ -200,13 +200,13 @@ machine looks able to take it *now*:
 
 Both are read from the OS on every poll (the `sysinfo` crate; on macOS
 "available" = free + inactive pages). They are brakes, not the budget:
-the budget decides how much canirun *plans* to run, the guards delay the
-next start when something outside canirun (an IDE, a browser, a Docker
+the budget decides how much task-traffic-controller *plans* to run, the guards delay the
+next start when something outside task-traffic-controller (an IDE, a browser, a Docker
 VM) is already using the machine.
 
-**Starvation rule:** if no canirun-managed entry is currently `running`,
+**Starvation rule:** if no task-traffic-controller-managed entry is currently `running`,
 the live guards are skipped and the head is admitted on the budget check
-alone. Otherwise a machine kept busy by processes canirun does not
+alone. Otherwise a machine kept busy by processes task-traffic-controller does not
 manage would hold the queue forever, violating the first anti-goal.
 
 The reason the head is waiting (`budget`, `memory`, `cpu`) is part of
@@ -271,8 +271,8 @@ the history. `--key` is the escape hatch.
 
 ## Configuration
 
-`$XDG_CONFIG_HOME/canirun/config.toml` (default
-`~/.config/canirun/config.toml`). Absent file means all defaults.
+`$XDG_CONFIG_HOME/task-traffic-controller/config.toml` (default
+`~/.config/task-traffic-controller/config.toml`). Absent file means all defaults.
 
 ```toml
 budget = 12               # default: logical CPU count
@@ -300,14 +300,14 @@ and `min_weight`/`initial_weight` are mutually exclusive in one entry.
 
 ## Ledger and locking
 
-`$XDG_STATE_HOME/canirun/` (default `~/.local/state/canirun/`):
+`$XDG_STATE_HOME/task-traffic-controller/` (default `~/.local/state/task-traffic-controller/`):
 
 - `ledger.json` — the single source of truth: entries with `id`, `pid`,
   `state` (`waiting`/`running`), `front`, `weight`, `repo`, `argv`,
   `enqueued_at`, `started_at`. Schema carries a `version` field.
 - `ledger.lock` — exclusive flock guarding reads and writes of
   `ledger.json`. Writes are temp-file + rename, as in portool.
-- `leases/<id>.lock` — one file per entry. The owning `canirun` process
+- `leases/<id>.lock` — one file per entry. The owning `task-traffic-controller` process
   holds an exclusive flock on it from registration until exit. The lock
   fd is **not** inherited by the child (`O_CLOEXEC`): if the wrapper is
   SIGKILLed while its child tree survives, that tree runs off-ledger
@@ -325,7 +325,7 @@ and `min_weight`/`initial_weight` are mutually exclusive in one entry.
   `history_keep` per key.
 
 Nested-call validation uses the same rule: an inner call honours
-`CANIRUN_LEASE` only if the ledger has a `running` entry with that id
+`TASK_TRAFFIC_CONTROLLER_LEASE` only if the ledger has a `running` entry with that id
 whose lease lock is held by someone. A stale variable in a long-lived
 shell therefore gates normally instead of bypassing.
 
@@ -334,8 +334,8 @@ shell therefore gates normally instead of bypassing.
 While waiting, once every `progress_interval_secs`, to stderr:
 
 ```
-canirun: waiting 0:42 (budget) — running 3 (10/12 used), ahead of you 2
-canirun: waiting 1:07 (memory 1.1 GiB available, need 3.4 GiB) — running 2 (6/12 used)
+task-traffic-controller: waiting 0:42 (budget) — running 3 (10/12 used), ahead of you 2
+task-traffic-controller: waiting 1:07 (memory 1.1 GiB available, need 3.4 GiB) — running 2 (6/12 used)
 ```
 
 Nothing is printed when admitted immediately. Nothing is ever printed to
@@ -344,14 +344,14 @@ stdout by `exec`.
 ## Integration (outside this repository, documented here only)
 
 - **Agent local-CI skill.** The parallel-dispatch step should run each
-  unit as `canirun exec -- <unit command>`. Because a unit may now wait
+  unit as `task-traffic-controller exec -- <unit command>`. Because a unit may now wait
   for minutes before it even starts, the skill must run units in the
   background (or under a monitor) rather than inside a foreground tool
   call with a hard timeout. That change is a one-line edit in a local,
   untracked skill file and is not part of this repository.
-- **Git hooks (e.g. husky pre-push).** One line that prefers `canirun`
+- **Git hooks (e.g. husky pre-push).** One line that prefers `task-traffic-controller`
   when present and falls back to the bare command otherwise, e.g.
-  `if command -v canirun >/dev/null; then canirun exec --front -- npm
+  `if command -v task-traffic-controller >/dev/null; then task-traffic-controller exec --front -- npm
   test; else npm test; fi`. Those edits land in each adopting
   repository separately and are out of scope here.
 
@@ -389,8 +389,8 @@ examples/          a tiny project with fake "lint"/"test" scripts
 - `tests/liveness.rs`: kill a waiting head with SIGKILL; assert the next
   waiter is admitted within one poll interval.
 - `tests/nested.rs`: an outer `exec` spawning an inner `exec` with a full
-  budget completes; an inner call with a bogus `CANIRUN_LEASE` waits.
-- `tests/signals.rs`: SIGINT to `canirun exec` reaches the child; exit
+  budget completes; an inner call with a bogus `TASK_TRAFFIC_CONTROLLER_LEASE` waits.
+- `tests/signals.rs`: SIGINT to `task-traffic-controller exec` reaches the child; exit
   status mirrors the child's.
 - `admit` unit tests cover each live-guard reason and the starvation
   rule with synthetic `LiveSnapshot`s (the OS is never read in tests).
@@ -409,7 +409,7 @@ examples/          a tiny project with fake "lint"/"test" scripts
 - Default weight 2 when nothing is known.
 - Memory and CPU usage are live brakes on the next start, never a reason
   to touch a running process. Defaults: 2 GiB reserve, CPU ≤ 85% busy.
-- Live guards are skipped when canirun has nothing running (starvation
+- Live guards are skipped when task-traffic-controller has nothing running (starvation
   rule).
 - Head-of-queue reservation (strict FIFO), accepting some idle CPU.
   (Relaxed by backfill of short commands, see the 2026-10-19 addendum.)
@@ -418,7 +418,7 @@ examples/          a tiny project with fake "lint"/"test" scripts
 - Lease liveness by flock, never by pid.
 - `exec` runs the command without a shell.
 - No wait timeout flag in v0.1.
-- Child shares canirun's process group; canirun ignores SIGINT/SIGQUIT
+- Child shares task-traffic-controller's process group; task-traffic-controller ignores SIGINT/SIGQUIT
   and forwards only SIGTERM/SIGHUP (builder-check question 1).
 - Lease fd is close-on-exec; a SIGKILLed wrapper under-counts rather
   than a leaked child pinning the ledger (builder-check question 2).
@@ -445,10 +445,10 @@ caller or be collected in a batch.
 ## Commands
 
 ```
-canirun submit [--weight N] [--front] [--key K] -- <command> [args...]
-canirun wait [--no-output] <job-id>...
-canirun jobs [--json]
-canirun cancel <job-id>...
+task-traffic-controller submit [--weight N] [--front] [--key K] -- <command> [args...]
+task-traffic-controller wait [--no-output] <job-id>...
+task-traffic-controller jobs [--json]
+task-traffic-controller cancel <job-id>...
 ```
 
 ### `submit`
@@ -458,7 +458,7 @@ Creates a job and returns immediately, printing the job id on stdout.
 1. `id` = a fresh lease id (the job id **is** the ledger entry id).
 2. Writes `jobs/<id>.json`: id, argv, cwd (the submitter's), weight
    flags, `submitted_at`, `submitter_pid`.
-3. Spawns a detached **runner**: `canirun __run-job <id>` in its own
+3. Spawns a detached **runner**: `task-traffic-controller __run-job <id>` in its own
    session (`setsid`), stdin from `/dev/null`, stdout and stderr both
    appended to `jobs/<id>.log`, environment inherited from the
    submitter, cwd = the job's cwd.
@@ -548,10 +548,10 @@ workflow YAML and services) and is left for later.
 # v0.2.1 addendum — first-day feedback (2026-10-16)
 
 Another session reported, after a day of mixed use (most load still not
-going through canirun):
+going through task-traffic-controller):
 
 1. **Unmanaged load starved managed `--front` entries.** The budget was
-   2/12 used, CPU 100% from processes outside canirun, and a human's
+   2/12 used, CPU 100% from processes outside task-traffic-controller, and a human's
    pre-push waited over a minute on the CPU guard. Decision: `--front`
    skips the CPU guard (memory guard stays), and every head gives up on
    the CPU guard after `cpu_guard_max_wait_secs` (default 120). Both are
@@ -561,7 +561,7 @@ going through canirun):
    the record `contended` when busy > threshold; `usable_window` drops
    contended records whenever a calm one exists, before taking the last
    five. Config `min_weight` remains the floor for Docker-hosted load.
-3. Hooks outside canirun: addressed by the six pre-push PRs.
+3. Hooks outside task-traffic-controller: addressed by the six pre-push PRs.
 4. Light commands wrapped (`sleep`, `npm ci`, `git commit`): README and
    the user's global instructions now list what not to wrap; no tool
    change.

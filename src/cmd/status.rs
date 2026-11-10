@@ -1,11 +1,11 @@
-use canirun::admit::{self, Decision, Reason, State};
-use canirun::config::Config;
-use canirun::display::{
+use task_traffic_controller::admit::{self, Decision, Reason, State};
+use task_traffic_controller::config::Config;
+use task_traffic_controller::display::{
     fmt_bytes, fmt_duration, is_idle, label, running_for, truncate, IDLE_AFTER, IDLE_CORES,
 };
-use canirun::error::Result;
-use canirun::ledger::Ledger;
-use canirun::{exec, lock, managed, Context};
+use task_traffic_controller::error::Result;
+use task_traffic_controller::ledger::Ledger;
+use task_traffic_controller::{exec, lock, managed, Context};
 
 pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     let ledger = lock::load_reaped(ctx)?;
@@ -30,15 +30,15 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     let timed = exec::timed_queue(ctx, &ledger);
     let limits = cfg.limits();
     let eta_of = |id: &str| {
-        canirun::eta::estimate(&timed, limits, id)
+        task_traffic_controller::eta::estimate(&timed, limits, id)
             .map(|e| format!("  ({})", exec::fmt_estimate(&e)))
             .unwrap_or_default()
     };
 
     println!("budget {used}/{} used", cfg.budget);
-    if format > canirun::ledger::SCHEMA_VERSION {
+    if format > task_traffic_controller::ledger::SCHEMA_VERSION {
         println!(
-            "ledger format v{format}: older canirun binaries refuse it until every managed entry is settled (`canirun resolve <id> [--force]`)"
+            "ledger format v{format}: older task-traffic-controller binaries refuse it until every managed entry is settled (`task-traffic-controller resolve <id> [--force]`)"
         );
     }
     if let Some(s) = ctx.live.snapshot() {

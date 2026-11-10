@@ -1,19 +1,19 @@
-# canirun
+# task-traffic-controller
 
-**Can I run?** A local admission controller for heavy commands.
+A local admission controller for heavy commands.
 
 A command asks before it starts, waits until the machine has room, runs,
 and reports what it cost so the next run of the same command knows its
 weight. No daemon, no process supervision, one JSON ledger per user.
 
 ```sh
-canirun exec -- npm test                 # waits for budget, then runs
-canirun exec --front -- npm run lint     # a human is waiting: jump the queue
-canirun status                           # who is running, who is waiting, why, and when
-canirun history                          # what each command measured, next weight
+task-traffic-controller exec -- npm test                 # waits for budget, then runs
+task-traffic-controller exec --front -- npm run lint     # a human is waiting: jump the queue
+task-traffic-controller status                           # who is running, who is waiting, why, and when
+task-traffic-controller history                          # what each command measured, next weight
 
-id=$(canirun submit -- npm run test:e2e) # async: returns a job id and a rough ETA
-canirun wait "$id"                       # keeps the job alive, prints its log, mirrors its exit
+id=$(task-traffic-controller submit -- npm run test:e2e) # async: returns a job id and a rough ETA
+task-traffic-controller wait "$id"                       # keeps the job alive, prints its log, mirrors its exit
 ```
 
 ## What & why
@@ -25,10 +25,10 @@ takes longer than running them one after another. The same happens when a
 `pre-push` hook starts mutation tests while the machine is already
 saturated.
 
-`canirun` is the traffic controller:
+`task-traffic-controller` is the traffic controller:
 
 - **One budget.** A number of "slots" (default: logical CPU count) shared
-  by every `canirun exec` of the same OS user. The sum of running weights
+  by every `task-traffic-controller exec` of the same OS user. The sum of running weights
   never exceeds it.
 - **Learned weights.** Every run is measured (`wait4` rusage: CPU time,
   wall time, peak RSS). A command's weight is the ceiling of the highest
@@ -37,13 +37,13 @@ saturated.
   machine are marked `contended` and ignored while calmer runs exist,
   because contention makes parallelism read low. Nothing to hand-tune;
   `config.toml` holds only hints and exceptions.
-- **Live brakes.** Before the head of the queue starts, canirun also
+- **Live brakes.** Before the head of the queue starts, task-traffic-controller also
   checks the machine as it is right now: available memory must cover the
   command's learned peak RSS plus a reserve, and global CPU usage must be
   under a threshold. These delay the *next* start; a running command is
   never paused or killed. `--front` entries skip the CPU brake, and any
   head gives up on it after `cpu_guard_max_wait_secs`, so load that does
-  not go through canirun cannot hold the queue indefinitely. On a
+  not go through task-traffic-controller cannot hold the queue indefinitely. On a
   machine that is badly overloaded (load average at least
   `front_overload_factor` x budget) a `--front` entry still waits, for at
   most `front_overload_max_wait_secs` (30 s). Likewise, measured use
@@ -51,13 +51,13 @@ saturated.
   that long; after that only declared weights count for it. (The load
   average is the trigger because measured cores cannot exceed the core
   count, so "twice the budget" is only visible as runnable processes.)
-- **Measured, not just declared.** While a command runs, canirun samples
+- **Measured, not just declared.** While a command runs, task-traffic-controller samples
   the CPU its whole process tree uses. A command declared (or learned) at
   weight 2 that is using 5 cores takes 5 from the budget until it slows
   down, so the next start waits instead of piling on. The running
   command itself is never slowed or stopped.
 - **Crash-safe queue.** Each waiting or running entry holds an `flock` on
-  its own lease file. A Ctrl-C'd, SIGKILLed, or crashed `canirun` — waiting
+  its own lease file. A Ctrl-C'd, SIGKILLed, or crashed `task-traffic-controller` — waiting
   or running — vanishes from the ledger on the next poll. No cleanup step,
   no daemon, no pid heuristics.
 - **FIFO with reservation, plus backfill.** The head of the queue
@@ -69,7 +69,7 @@ saturated.
   nothing new passes it after it has waited `backfill_max_wait_secs`
   (default 5 min), or at once when it is `--front`. `--front` lets a human
   at the keyboard jump ahead.
-- **Nesting-safe.** A gated command that itself calls `canirun exec`
+- **Nesting-safe.** A gated command that itself calls `task-traffic-controller exec`
   inherits the outer lease instead of deadlocking.
 - **Async jobs that die with their waiter.** `submit` returns a job id as
   soon as the job is queued; `wait` collects the log and exit code later. A job nobody is
@@ -82,25 +82,29 @@ saturated.
 ## Install
 
 ```sh
-cargo install canirun
+cargo install task-traffic-controller
 ```
+
+Coming from `canirun` (before 0.5.0)? Run `cargo uninstall canirun` first.
+The old state and config directories are not read; delete
+`~/.local/state/canirun` and `~/.config/canirun` when you are done with them.
 
 Requires macOS or Linux. Prebuilt binaries for macOS (Apple Silicon /
 Intel) and Linux (x86_64 / arm64) are attached to each
-[release](https://github.com/t09tanaka/canirun/releases/latest).
+[release](https://github.com/t09tanaka/task-traffic-controller/releases/latest).
 
 ## Usage
 
-### `canirun exec`
+### `task-traffic-controller exec`
 
 ```
-canirun exec [--weight N] [--front] [--key K] -- <command> [args...]
+task-traffic-controller exec [--weight N] [--front] [--key K] -- <command> [args...]
 ```
 
 Waits until admitted, then runs `<command>` with inherited stdin/stdout/
-stderr in canirun's own process group, with `CANIRUN_LEASE=<id>` in its
+stderr in task-traffic-controller's own process group, with `TASK_TRAFFIC_CONTROLLER_LEASE=<id>` in its
 environment. The exit code is the child's; a child killed by a signal
-makes canirun die from the same signal. The command runs directly
+makes task-traffic-controller die from the same signal. The command runs directly
 (`execvp` semantics), not through a shell — pass `sh -c '...'` yourself
 if you need one.
 
@@ -123,7 +127,7 @@ one-off shell line still learns from earlier runs:
   `go test|build|vet`, `dart test|run|analyze` or
   `flutter test|build|analyze`. Redirections are dropped, so
   `cd api && npm run test 2>&1 | tail -5` is keyed as `npm run test` and
-  shares its history with `canirun exec -- npm run test`.
+  shares its history with `task-traffic-controller exec -- npm run test`.
 - A script under a temporary directory (`/tmp`, `/private/tmp`,
   `/var/folders`, `$TMPDIR`, or any `scratchpad` directory), run directly
   or as `bash /tmp/x.sh`: its first 8 KiB are read and the same rule
@@ -137,10 +141,10 @@ derived key as `key: ...` under the command.
 While waiting, a progress line goes to stderr every few seconds:
 
 ```
-canirun: waiting 0:42 (queue) — running 3 (10/12 used), ahead of you 2
-canirun: waiting 52:10 (budget) — running 2 (4/12 used); held by 48211 w2 idle 52:30 api: make api, 48190 w2 idle 51:02 app: flutter run
-canirun: waiting 1:07 (memory 1.1 GiB available, need 3.4 GiB) — running 2 (6/12 used)
-canirun: waiting 0:12 (cpu 93% busy, threshold 85%) — running 2 (6/12 used)
+task-traffic-controller: waiting 0:42 (queue) — running 3 (10/12 used), ahead of you 2
+task-traffic-controller: waiting 52:10 (budget) — running 2 (4/12 used); held by 48211 w2 idle 52:30 api: make api, 48190 w2 idle 51:02 app: flutter run
+task-traffic-controller: waiting 1:07 (memory 1.1 GiB available, need 3.4 GiB) — running 2 (6/12 used)
+task-traffic-controller: waiting 0:12 (cpu 93% busy, threshold 85%) — running 2 (6/12 used)
 ```
 
 A line waiting on the budget names the running entries holding it
@@ -153,12 +157,12 @@ every `progress_interval_secs_non_tty` (default 60) as a heartbeat, so a
 long wait does not fill the output with identical lines.
 
 If the program is not found and the command after `--` is a single
-argument containing spaces (`-- "npm run x"`), canirun adds a hint to pass
+argument containing spaces (`-- "npm run x"`), task-traffic-controller adds a hint to pass
 the words separately (`-- npm run x`) or use `sh -c '...'`.
 
-Nothing is written to stdout by canirun itself.
+Nothing is written to stdout by task-traffic-controller itself.
 
-### `canirun status`
+### `task-traffic-controller status`
 
 ```
 budget 10/12 used
@@ -187,7 +191,7 @@ that started ahead of a head that did not fit. `--json`
 dumps the ledger. Dead entries are reaped first, so the view is accurate
 without a daemon.
 
-### `canirun history [--key K] [--json] [--limit N] [-- <command>]`
+### `task-traffic-controller history [--key K] [--json] [--limit N] [-- <command>]`
 
 Measured runs per command key, and the weight and memory that will be
 used next:
@@ -199,13 +203,13 @@ webapp: npm run test:e2e
   10-16 20:12  wall   190.7s  cpu   640.1s  x3.4  rss   3.2 GiB  exit 0   w2
 ```
 
-### `canirun submit` / `wait` / `jobs` / `cancel`
+### `task-traffic-controller submit` / `wait` / `jobs` / `cancel`
 
 ```
-canirun submit [--detach] [--weight N] [--front] [--key K] -- <command> [args...]
-canirun wait [--no-output] <job-id>...
-canirun jobs [--json]
-canirun cancel <job-id>...
+task-traffic-controller submit [--detach] [--weight N] [--front] [--key K] -- <command> [args...]
+task-traffic-controller wait [--no-output] <job-id>...
+task-traffic-controller jobs [--json]
+task-traffic-controller cancel <job-id>...
 ```
 
 `submit` writes a job descriptor, starts a detached runner (own session,
@@ -216,8 +220,8 @@ it warns and returns anyway) and prints the job id on stdout, with a
 rough estimate on stderr:
 
 ```
-$ id=$(canirun submit -- npm run test:e2e)
-canirun: job 3f9c… start in ~1:10, done in ~4:20
+$ id=$(task-traffic-controller submit -- npm run test:e2e)
+task-traffic-controller: job 3f9c… start in ~1:10, done in ~4:20
 ```
 
 `wait` blocks until every named job has finished, prints a header and the
@@ -235,7 +239,7 @@ The runner is the same admission path as `exec`: weights, guards, history
 and liveness all apply. Job files live in `jobs/` under the state
 directory; `gc` removes those finished more than `jobs_keep_days` ago.
 
-### `canirun inspect --json` and `canirun estimate --json -- <command>`
+### `task-traffic-controller inspect --json` and `task-traffic-controller estimate --json -- <command>`
 
 Both only read; they never register an entry, take a lease, reap a dead
 entry or write history (`status` reaps, `inspect` does not).
@@ -255,30 +259,30 @@ machines, not an ETA). A running entry past its recorded runtime has an
 unknown remaining time, not zero. Live memory and CPU guards are read once;
 what depends on them is marked `conditional`.
 
-The same machinery is available to Rust callers as `canirun::inspect` and
-`canirun::forecast` (a multi-node `WorkloadPlan` with dependencies, external
+The same machinery is available to Rust callers as `task_traffic_controller::inspect` and
+`task_traffic_controller::forecast` (a multi-node `WorkloadPlan` with dependencies, external
 delays and shared setup, plus an overlay of demands the ledger does not
 show yet). The crate is 0.x and that API is not stable.
 
-### `canirun resolve <id> [--json] [--force]`
+### `task-traffic-controller resolve <id> [--json] [--force]`
 
-A managed command (one driven through `canirun::managed` by another
-program) needs every `canirun` that shares the state directory to be
+A managed command (one driven through `task_traffic_controller::managed` by another
+program) needs every `task-traffic-controller` that shares the state directory to be
 upgraded: a ledger that holds a managed entry is written in a new shape
 (`entries_v2`), and an older binary refuses to load it rather than reap
 entries it cannot recognise (every command then exits 2). To go back to an
-older binary, settle every managed entry (`canirun resolve <id>`, or
+older binary, settle every managed entry (`task-traffic-controller resolve <id>`, or
 `--force`); the next save writes the old shape (`version` 1) and older
-binaries work again. `canirun status` shows the format (`ledger_format` in
+binaries work again. `task-traffic-controller status` shows the format (`ledger_format` in
 `--json`). It keeps its budget while its supervisor is gone, until nothing it
 started is still running. `status` lists such entries as `held, owner gone`,
 and `inspect` marks them `quarantined` with a `hint`. Most are released by
 themselves once their processes stop. Two kinds are not: an entry whose
 sidecar cannot be read, and a launch intent whose timestamp is missing. For
-those, `canirun resolve <id>` runs the same checks on demand: the owner's
+those, `task-traffic-controller resolve <id>` runs the same checks on demand: the owner's
 lease must be gone, and the child, its process group, every process of
-yours carrying `CANIRUN_MANAGED_ID=<id>` (and this state directory's
-`CANIRUN_MANAGED_SCOPE`) and every recorded descendant must be gone. It prints the entry's state, what was checked and the result, and
+yours carrying `TASK_TRAFFIC_CONTROLLER_MANAGED_ID=<id>` (and this state directory's
+`TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE`) and every recorded descendant must be gone. It prints the entry's state, what was checked and the result, and
 records the outcome as `interrupted`. An id whose sidecar is not terminal
 but has no ledger entry (stranded, for example by an older binary) is settled
 the same way. Exit 0 means released, 1 means kept
@@ -312,8 +316,8 @@ are the same (0 released, 1 kept, 2 error, 3 no such entry).
 
 How descendants are found, and what this cannot see:
 
-- **Marker.** A managed command carries `CANIRUN_MANAGED_ID` and
-  `CANIRUN_MANAGED_SCOPE` (the first 16 hex digits of the SHA-256 of the
+- **Marker.** A managed command carries `TASK_TRAFFIC_CONTROLLER_MANAGED_ID` and
+  `TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE` (the first 16 hex digits of the SHA-256 of the
   state directory's canonical path), which its descendants inherit. Two
   state directories that use the same command id do not see, hold or stop
   each other's processes. Only the innermost managed command is tracked:
@@ -386,7 +390,7 @@ What is not found, and what follows:
 - The process group check does not compare start times, so a group number
   that was reused by an unrelated group keeps an entry held for as long as
   that group lives. That errs on the side of keeping the budget; the way out
-  is `canirun resolve <id> --force`, which releases it only when a new
+  is `task-traffic-controller resolve <id> --force`, which releases it only when a new
   leader (the process whose pid is the group number, started at a different
   time than the recorded child) proves the number was reused, nothing in the
   group carries the run's id or is a recorded descendant, and the child is
@@ -406,7 +410,7 @@ What is not found, and what follows:
   sidecar, stamped after that stop); with no record, or when the
   supervisor died mid-run (the command may have forked later), the window
   has no end. Such a hold is expected, not a bug,
-  and the way out is `canirun resolve <id> --force`, after checking that
+  and the way out is `task-traffic-controller resolve <id> --force`, after checking that
   nothing of the command still runs.
 - Recording the descendants that fails is written to the sidecar too
   (`descendants_truncated`), and the supervisor that saw it fail does not
@@ -414,7 +418,7 @@ What is not found, and what follows:
 - If the kernel cannot tell the owner of a process of yours (macOS
   `proc_pidinfo` refused both ways), a process whose environment is hidden
   is unreadable, the scan is unknown, and the entry is held. The way out
-  is the same: `canirun resolve <id> --force`.
+  is the same: `task-traffic-controller resolve <id> --force`.
 - Recording the descendants that fails (the thread panics or cannot start,
   or the command cannot be read while it runs) counts as "could not be
   checked", never as "no descendants". A recorded descendant is dropped only
@@ -428,18 +432,18 @@ What is not found, and what follows:
   the first.
 - A single failed look is sticky on purpose: even a transient read failure
   of the process table marks the record truncated, and the run is held until
-  `canirun resolve <id> --force`. The last look is told the command was
+  `task-traffic-controller resolve <id> --force`. The last look is told the command was
   reaped, so it does not ask the kernel about a pid that may be reused.
 - **More than 4096 live descendants.** Only 4096 are recorded; past that the
   rest are unknown, so the record is marked truncated and the entry stays
   held after the command ends, by design. The way out is
-  `canirun resolve <id> --force`, after checking that nothing of the command
+  `task-traffic-controller resolve <id> --force`, after checking that nothing of the command
   still runs.
 - On macOS a process whose environment the kernel refuses with anything but
   `EINVAL`/`EPERM`, or whose owner the kernel did not confirm, is
   unreadable and makes the scan unknown.
 
-### `canirun config [--path]` and `canirun gc`
+### `task-traffic-controller config [--path]` and `task-traffic-controller gc`
 
 `config` prints the effective configuration (defaults merged with the
 file). `gc` reaps dead entries and trims history to `history_keep`
@@ -455,7 +459,7 @@ only for tidiness.
 
 ## Configuration
 
-`~/.config/canirun/config.toml` (or `$XDG_CONFIG_HOME/canirun/config.toml`).
+`~/.config/task-traffic-controller/config.toml` (or `$XDG_CONFIG_HOME/task-traffic-controller/config.toml`).
 Absent file means all defaults.
 
 ```toml
@@ -505,14 +509,14 @@ takes over.
 
 ## How it works
 
-State lives in `~/.local/state/canirun/` (or `$XDG_STATE_HOME/canirun/`):
+State lives in `~/.local/state/task-traffic-controller/` (or `$XDG_STATE_HOME/task-traffic-controller/`):
 
 - `ledger.json` — the queue: id, pid, state, weight, repo, argv, times.
   Writes are temp-file + rename under `ledger.lock`. A waiting `exec` that
   cannot get the lock skips that poll and tries again; `status`, `jobs`,
   `wait`, `cancel` and `submit` read the file without the lock when it
   stays busy for a second.
-- `leases/<id>.lock` — one file per entry; the owning `canirun` holds an
+- `leases/<id>.lock` — one file per entry; the owning `task-traffic-controller` holds an
   exclusive `flock` on it from registration until exit. **Liveness is
   "this flock cannot be taken."** Anyone holding the ledger lock probes
   each lease non-blockingly and drops the entries whose lock it obtains.
@@ -542,9 +546,9 @@ A head held up by something else — a long build, or a server that never
 exits — is passed for as long as that lasts, because backfill does not
 delay it. When nothing
 managed is running the live guards are skipped, so a machine kept busy by
-processes canirun does not manage cannot hold the queue forever.
+processes task-traffic-controller does not manage cannot hold the queue forever.
 
-While a command runs, a background thread in its `canirun` samples the
+While a command runs, a background thread in its `task-traffic-controller` samples the
 CPU used by the command and all of its descendants once a second and
 writes the peak of the last three samples to the ledger entry as
 `using`. Admission charges each running entry `max(weight,
@@ -577,7 +581,7 @@ own process tree (see below) while the machine is busy, and an idle
 server can start a full rebuild at any moment. Either way the budget
 would admit more than the machine can take. Instead, `status` marks such
 entries `idle` and the waiting line names them, so they can be stopped
-or run without canirun.
+or run without task-traffic-controller.
 
 ### Known blind spot
 
@@ -590,12 +594,12 @@ live CPU and memory guards still see the real load.
 
 ### Git hooks
 
-Keep working on machines without canirun:
+Keep working on machines without task-traffic-controller:
 
 ```sh
 # .husky/pre-push
-if command -v canirun >/dev/null 2>&1; then
-  canirun exec --front -- npm test
+if command -v task-traffic-controller >/dev/null 2>&1; then
+  task-traffic-controller exec --front -- npm test
 else
   npm test
 fi
@@ -613,7 +617,7 @@ heavy head that does not fit next to it waits until it is stopped.
 
 ### Agent / CI-runner scripts
 
-Prefix every unit with `canirun exec --`, or `submit` the independent
+Prefix every unit with `task-traffic-controller exec --`, or `submit` the independent
 units and `wait` for them all in one call. A unit may wait minutes
 before it starts; with `exec` run it in the background or under a
 monitor rather than inside a foreground step with a short hard timeout.
@@ -624,7 +628,7 @@ process dies, so do its jobs.
 
 macOS and Linux. `flock`, `wait4`, process groups and signal forwarding
 are POSIX; `ru_maxrss` units (bytes on macOS, KiB on Linux) are
-normalised. The ledger scope is one OS user + `XDG_STATE_HOME`; canirun
+normalised. The ledger scope is one OS user + `XDG_STATE_HOME`; task-traffic-controller
 does not coordinate across users, containers with a different `HOME`, or
 machines.
 

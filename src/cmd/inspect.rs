@@ -1,6 +1,6 @@
-use canirun::config::Config;
-use canirun::error::Result;
-use canirun::{inspect, managed, Context};
+use task_traffic_controller::config::Config;
+use task_traffic_controller::error::Result;
+use task_traffic_controller::{inspect, managed, Context};
 
 pub fn run(ctx: &Context, cfg: &Config) -> Result<i32> {
     let insp = inspect::inspect_with(ctx, cfg)?;

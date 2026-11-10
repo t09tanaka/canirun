@@ -1,4 +1,4 @@
-//! Where canirun keeps its files. The library never looks at `HOME` or the
+//! Where task-traffic-controller keeps its files. The library never looks at `HOME` or the
 //! XDG variables itself: whoever builds the [`crate::Context`] decides the
 //! state directory, so tests and embedders get their own scope.
 

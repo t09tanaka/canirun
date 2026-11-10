@@ -1,8 +1,8 @@
 //! The CLI's [`Supervisor`]: process-global signal handlers, kept out of
 //! the library because they cannot be shared by concurrent runs.
 
-use canirun::Supervisor;
 use std::sync::atomic::{AtomicI32, Ordering};
+use task_traffic_controller::Supervisor;
 
 static PENDING: AtomicI32 = AtomicI32::new(0);
 

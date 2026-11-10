@@ -4,13 +4,13 @@
 //! the process signal handlers.
 
 use crate::signals::ProcessSignals;
-use canirun::{Context, Paths};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use task_traffic_controller::{Context, Paths};
 
 /// Overrides the ledger lock timeout, in milliseconds (for tests).
-const LEDGER_LOCK_TIMEOUT_ENV: &str = "CANIRUN_LEDGER_LOCK_TIMEOUT_MS";
+const LEDGER_LOCK_TIMEOUT_ENV: &str = "TASK_TRAFFIC_CONTROLLER_LEDGER_LOCK_TIMEOUT_MS";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -23,12 +23,12 @@ fn paths() -> Paths {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/state"))
-        .join("canirun");
+        .join("task-traffic-controller");
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
-        .join("canirun/config.toml");
+        .join("task-traffic-controller/config.toml");
     Paths::new(state, config)
 }
 

@@ -1,7 +1,7 @@
 //! Measured CPU use of a running command's process tree (spec "Measured
 //! usage").
 //!
-//! The running `canirun` samples its own child's process tree from a
+//! The running `task-traffic-controller` samples its own child's process tree from a
 //! background thread and writes the cores it uses to its ledger entry, so
 //! admission (and `status`) can charge a command that uses more than it
 //! declared. Nothing here slows down or stops the command.
@@ -91,7 +91,7 @@ impl Monitor {
         // everything while spawning so the new thread inherits the mask.
         let old = block_all_signals();
         let handle = std::thread::Builder::new()
-            .name("canirun-usage".into())
+            .name("task-traffic-controller-usage".into())
             .spawn(move || sample_loop(&ctx, &id, root, &rx))
             .ok();
         restore_signals(&old);

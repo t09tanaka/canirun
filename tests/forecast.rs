@@ -1,16 +1,16 @@
 //! `inspect` and `forecast` against a real state directory: they read, and
 //! nothing else changes (spec A06).
 
-use canirun::exec::Opts;
-use canirun::forecast::{self, FutureDemand, Priority, Runtime};
-use canirun::history::{self, Record};
-use canirun::ledger::{Entry, Ledger};
-use canirun::{estimate, inspect, lock, Context, FakeClock, FixedLive, Paths};
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
+use task_traffic_controller::exec::Opts;
+use task_traffic_controller::forecast::{self, FutureDemand, Priority, Runtime};
+use task_traffic_controller::history::{self, Record};
+use task_traffic_controller::ledger::{Entry, Ledger};
+use task_traffic_controller::{estimate, inspect, lock, Context, FakeClock, FixedLive, Paths};
 
 fn t0() -> DateTime<Utc> {
     "2030-06-01T12:00:00Z".parse().unwrap()
@@ -36,7 +36,7 @@ fn env() -> Env {
     }
 }
 
-fn entry(id: &str, state: canirun::admit::State, seq: u64, key: &str) -> Entry {
+fn entry(id: &str, state: task_traffic_controller::admit::State, seq: u64, key: &str) -> Entry {
     Entry {
         id: id.into(),
         pid: 4242,
@@ -51,7 +51,7 @@ fn entry(id: &str, state: canirun::admit::State, seq: u64, key: &str) -> Entry {
         key: key.into(),
         seq,
         enqueued_at: t0(),
-        started_at: (state == canirun::admit::State::Running).then(t0),
+        started_at: (state == task_traffic_controller::admit::State::Running).then(t0),
         using: None,
         backfilled: false,
     }
@@ -82,12 +82,24 @@ fn populate(e: &Env) -> Vec<lock::Lock> {
     std::fs::create_dir_all(state.join("jobs")).unwrap();
     std::fs::write(state.join("jobs/j1.json"), b"{}").unwrap();
     let mut l = Ledger::default();
-    l.entries
-        .push(entry("run1", canirun::admit::State::Running, 1, "ka"));
-    l.entries
-        .push(entry("wait1", canirun::admit::State::Waiting, 2, "kb"));
-    l.entries
-        .push(entry("gone1", canirun::admit::State::Running, 3, "kc"));
+    l.entries.push(entry(
+        "run1",
+        task_traffic_controller::admit::State::Running,
+        1,
+        "ka",
+    ));
+    l.entries.push(entry(
+        "wait1",
+        task_traffic_controller::admit::State::Waiting,
+        2,
+        "kb",
+    ));
+    l.entries.push(entry(
+        "gone1",
+        task_traffic_controller::admit::State::Running,
+        3,
+        "kc",
+    ));
     l.next_seq = 4;
     l.save(&e.ctx.paths.ledger_file()).unwrap();
     // The ledger lock file exists, as after any earlier run.
@@ -138,7 +150,7 @@ fn a_hundred_forecasts_change_nothing() {
     let state = e.ctx.paths.state_dir().to_path_buf();
     let before = tree(&state);
     assert!(before.contains_key("ledger.lock"));
-    let cfg = canirun::config::Config::load(e.ctx.paths.config_file()).unwrap();
+    let cfg = task_traffic_controller::config::Config::load(e.ctx.paths.config_file()).unwrap();
     let demand = FutureDemand {
         attempt_id: "att".into(),
         plan_digest: "sha256:p".into(),
@@ -211,7 +223,7 @@ fn digests_follow_their_inputs() {
     // The default budget is the machine's CPU count, so the override must
     // differ from it on any machine (a fixed 3 equals the default on a
     // 3-core CI runner and leaves the effective policy unchanged).
-    let budget = canirun::config::logical_cpus() + 1;
+    let budget = task_traffic_controller::config::logical_cpus() + 1;
     std::fs::write(e.ctx.paths.config_file(), format!("budget = {budget}\n")).unwrap();
     let d = inspect::inspect(&e.ctx).unwrap();
     assert_ne!(c.policy_digest, d.policy_digest);
@@ -224,7 +236,7 @@ fn digests_follow_their_inputs() {
 fn policy_digest_follows_the_effective_config_not_the_file() {
     let e = env();
     let a = inspect::inspect(&e.ctx).unwrap();
-    let same = canirun::config::logical_cpus();
+    let same = task_traffic_controller::config::logical_cpus();
     std::fs::write(e.ctx.paths.config_file(), format!("budget = {same}\n")).unwrap();
     let b = inspect::inspect(&e.ctx).unwrap();
     assert_eq!(a.policy_digest, b.policy_digest);
@@ -279,7 +291,7 @@ fn estimate_uses_recorded_history_and_never_invents_it() {
     let e = env();
     let _leases = populate(&e);
     std::fs::write(e.ctx.paths.config_file(), "budget = 16\n").unwrap();
-    let cfg = canirun::config::Config::load(e.ctx.paths.config_file()).unwrap();
+    let cfg = task_traffic_controller::config::Config::load(e.ctx.paths.config_file()).unwrap();
     let cwd = e.ctx.paths.state_dir().to_path_buf();
     // No history for the command: fallback, no measured finish (spec A09).
     let plan = estimate::command_plan(&e.ctx, &cfg, &opts(&cwd)).unwrap();

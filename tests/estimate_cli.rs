@@ -1,4 +1,4 @@
-//! `canirun inspect --json` and `canirun estimate --json -- <command>`.
+//! `task-traffic-controller inspect --json` and `task-traffic-controller estimate --json -- <command>`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -15,11 +15,11 @@ impl TestEnv {
     }
 
     fn state(&self) -> PathBuf {
-        self.dir.path().join("state/canirun")
+        self.dir.path().join("state/task-traffic-controller")
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_canirun"))
+        Command::new(env!("CARGO_BIN_EXE_task-traffic-controller"))
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", self.dir.path())

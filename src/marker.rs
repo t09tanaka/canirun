@@ -3,7 +3,7 @@
 //! environment says ([`Seen`]) and this decides.
 //!
 //! A managed command is started with two variables in its environment:
-//! `CANIRUN_MANAGED_ID=<id>` and `CANIRUN_MANAGED_SCOPE=<scope>`, where the
+//! `TASK_TRAFFIC_CONTROLLER_MANAGED_ID=<id>` and `TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=<scope>`, where the
 //! scope names the state directory the command was admitted by. Command ids
 //! are chosen by the caller, so the same id can exist in two state
 //! directories; a process counts only when both match. Environments are
@@ -20,9 +20,9 @@ use std::path::Path;
 
 /// The environment variable a managed command and everything it starts
 /// carries.
-pub const ENV_VAR: &str = "CANIRUN_MANAGED_ID";
+pub const ENV_VAR: &str = "TASK_TRAFFIC_CONTROLLER_MANAGED_ID";
 /// The state directory the command was admitted by (see [`scope`]).
-pub const SCOPE_VAR: &str = "CANIRUN_MANAGED_SCOPE";
+pub const SCOPE_VAR: &str = "TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE";
 
 /// The scope of a state directory: the first 16 hex digits of the SHA-256
 /// of its canonical path (the path as given when it cannot be resolved).
@@ -319,14 +319,17 @@ mod tests {
 
     #[test]
     fn the_marker_is_found_among_the_strings() {
-        let env = b"PATH=/bin\0CANIRUN_MANAGED_ID=run-1\0CANIRUN_MANAGED_SCOPE=abc\0HOME=/x\0";
+        let env = b"PATH=/bin\0TASK_TRAFFIC_CONTROLLER_MANAGED_ID=run-1\0TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=abc\0HOME=/x\0";
         assert_eq!(find_marker(env), marked("run-1", "abc"));
         assert_eq!(find_marker(b"PATH=/bin\0"), Marker::Absent);
         assert_eq!(find_marker(b""), Marker::Absent);
         // The scope alone is not a marker; without it the id has none.
-        assert_eq!(find_marker(b"CANIRUN_MANAGED_SCOPE=abc\0"), Marker::Absent);
         assert_eq!(
-            find_marker(b"CANIRUN_MANAGED_ID=a\0"),
+            find_marker(b"TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=abc\0"),
+            Marker::Absent
+        );
+        assert_eq!(
+            find_marker(b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=a\0"),
             Marker::Marked {
                 id: "a".into(),
                 scope: None
@@ -335,13 +338,16 @@ mod tests {
         // The first one wins; a similar name or an empty value is exact.
         assert_eq!(
             find_marker(
-                b"CANIRUN_MANAGED_ID=a\0CANIRUN_MANAGED_ID=b\0CANIRUN_MANAGED_SCOPE=1\0CANIRUN_MANAGED_SCOPE=2\0"
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=a\0TASK_TRAFFIC_CONTROLLER_MANAGED_ID=b\0TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=1\0TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=2\0"
             ),
             marked("a", "1")
         );
-        assert_eq!(find_marker(b"CANIRUN_MANAGED_IDX=a\0"), Marker::Absent);
         assert_eq!(
-            find_marker(b"CANIRUN_MANAGED_ID=\0"),
+            find_marker(b"TASK_TRAFFIC_CONTROLLER_MANAGED_IDX=a\0"),
+            Marker::Absent
+        );
+        assert_eq!(
+            find_marker(b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=\0"),
             Marker::Marked {
                 id: String::new(),
                 scope: None
@@ -369,8 +375,8 @@ mod tests {
                 b"x",
                 b"-c",
                 b"PATH=/bin",
-                b"CANIRUN_MANAGED_ID=m",
-                b"CANIRUN_MANAGED_SCOPE=s",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=m",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=s",
             ],
         );
         assert_eq!(parse_procargs(&buf), marked("m", "s"));
@@ -382,7 +388,11 @@ mod tests {
         let only_arg = procargs(
             2,
             b"/bin/x",
-            &[b"x", b"CANIRUN_MANAGED_ID=other", b"PATH=/bin"],
+            &[
+                b"x",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=other",
+                b"PATH=/bin",
+            ],
         );
         assert_eq!(parse_procargs(&only_arg), Marker::Absent);
         // A decoy in argv in front of the real one.
@@ -391,9 +401,9 @@ mod tests {
             b"/bin/x",
             &[
                 b"x",
-                b"CANIRUN_MANAGED_ID=other",
-                b"CANIRUN_MANAGED_ID=real",
-                b"CANIRUN_MANAGED_SCOPE=s",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=other",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=real",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=s",
             ],
         );
         assert_eq!(parse_procargs(&both), marked("real", "s"));
@@ -404,8 +414,8 @@ mod tests {
             &[
                 b"x",
                 b"",
-                b"CANIRUN_MANAGED_ID=other",
-                b"CANIRUN_MANAGED_ID=r",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=other",
+                b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=r",
             ],
         );
         assert_eq!(
@@ -429,7 +439,7 @@ mod tests {
         padded.extend_from_slice(&[0, 0, 0]);
         assert_eq!(parse_procargs(&padded), Marker::Hidden);
         let mut bare = procargs(1, b"/bin/x", &[b"x"]);
-        bare.extend_from_slice(b"CANIRUN_MANAGED_ID=u");
+        bare.extend_from_slice(b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=u");
         assert_eq!(
             parse_procargs(&bare),
             Marker::Marked {
@@ -488,14 +498,18 @@ mod tests {
 
     #[test]
     fn a_truncated_buffer_is_unreadable() {
-        let full = procargs(2, b"/bin/x", &[b"x", b"-c", b"CANIRUN_MANAGED_ID=m"]);
+        let full = procargs(
+            2,
+            b"/bin/x",
+            &[b"x", b"-c", b"TASK_TRAFFIC_CONTROLLER_MANAGED_ID=m"],
+        );
         // No count, no end of the path, fewer arguments than the count.
         assert_eq!(parse_procargs(&[]), Marker::Unreadable);
         assert_eq!(parse_procargs(&full[..3]), Marker::Unreadable);
         assert_eq!(parse_procargs(&full[..8]), Marker::Unreadable);
         let one_arg = procargs(2, b"/bin/x", &[b"x"]);
         assert_eq!(parse_procargs(&one_arg), Marker::Unreadable);
-        let half_arg = &full[..full.len() - "c\0CANIRUN_MANAGED_ID=m\0".len()];
+        let half_arg = &full[..full.len() - "c\0TASK_TRAFFIC_CONTROLLER_MANAGED_ID=m\0".len()];
         assert_eq!(parse_procargs(half_arg), Marker::Unreadable);
         // A negative count is garbage.
         let mut bad = full.clone();

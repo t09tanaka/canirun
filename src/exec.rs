@@ -74,7 +74,7 @@ fn read_head(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// True when `id` (the `CANIRUN_LEASE` of the calling environment) names a
+/// True when `id` (the `TASK_TRAFFIC_CONTROLLER_LEASE` of the calling environment) names a
 /// live running entry, i.e. we are already inside a gated command.
 pub fn nested_lease_is_live(ctx: &Context, id: &str) -> Result<bool> {
     let ledger = lock::load_reaped(ctx)?;
@@ -86,8 +86,8 @@ pub fn nested_lease_is_live(ctx: &Context, id: &str) -> Result<bool> {
 
 /// The id a caller running inside a gated command should run under, if its
 /// environment shows it is nested: the live running lease it names
-/// (`CANIRUN_LEASE`), or a managed run of this state directory whose child
-/// has started (`CANIRUN_MANAGED_ID` and `CANIRUN_MANAGED_SCOPE`) and the
+/// (`TASK_TRAFFIC_CONTROLLER_LEASE`), or a managed run of this state directory whose child
+/// has started (`TASK_TRAFFIC_CONTROLLER_MANAGED_ID` and `TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE`) and the
 /// caller is inside it (its process group, or below its child or a recorded
 /// descendant). The second needs no lease: when the supervisor died the tree
 /// it left is still the run's, and gating its own sub-commands would wait
@@ -312,7 +312,7 @@ pub fn run_gated(
                 _ => admit::used_budget(&queue),
             };
             (hooks.progress)(&format!(
-                "canirun: waiting {} ({}) — running {running} ({used}/{} used){}{}{}",
+                "task-traffic-controller: waiting {} ({}) — running {running} ({used}/{} used){}{}{}",
                 fmt_duration(waited()),
                 describe(&reason),
                 limits.budget,

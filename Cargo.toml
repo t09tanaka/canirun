@@ -1,22 +1,23 @@
 [package]
-name = "canirun"
-version = "0.4.2"
+name = "task-traffic-controller"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Can I run? A local admission controller that gates heavy commands behind a shared CPU budget and learns their weight"
+description = "A local admission controller that gates heavy commands behind a shared CPU budget and learns their weight"
 license = "MIT"
-repository = "https://github.com/t09tanaka/canirun"
+repository = "https://github.com/t09tanaka/task-traffic-controller"
+homepage = "https://github.com/t09tanaka/task-traffic-controller"
 readme = "README.md"
 keywords = ["ci", "concurrency", "throttle", "semaphore", "dev-tools"]
 categories = ["command-line-utilities", "development-tools"]
 include = ["src/**/*", "tests/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [lib]
-name = "canirun"
+name = "task_traffic_controller"
 path = "src/lib.rs"
 
 [[bin]]
-name = "canirun"
+name = "task-traffic-controller"
 path = "src/main.rs"
 
 [dependencies]

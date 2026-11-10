@@ -179,7 +179,7 @@ pub fn snapshot_read_only(ctx: &Context) -> Result<ReadOnlySnapshot> {
     })
 }
 
-/// Take the lease for `id`. Held by the owning canirun process until it
+/// Take the lease for `id`. Held by the owning task-traffic-controller process until it
 /// exits; the fd is close-on-exec (Rust std default) so children never
 /// inherit it.
 pub fn take_lease(ctx: &Context, id: &str) -> Result<Lock> {

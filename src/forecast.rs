@@ -100,7 +100,7 @@ pub enum Priority {
     Front,
 }
 
-/// One command that will be admitted through canirun.
+/// One command that will be admitted through task-traffic-controller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandNode {
     pub node_id: String,
