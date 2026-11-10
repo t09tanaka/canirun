@@ -143,6 +143,51 @@ fn clear_group(ctx: &Context, pgid: libc::pid_t) -> bool {
     false
 }
 
+/// What the session `sid` (the leader's pid) still holds. The leader was
+/// just reaped by us, and its number is not handed out again while the
+/// session has members, so a live process that has the number as its own pid
+/// is a new, unrelated one (the session was empty and the number was handed
+/// out again): the session is then not ours to stop.
+fn session_state(sid: libc::pid_t) -> crate::reap::Probe {
+    if u32::try_from(sid).is_ok_and(|p| crate::process::start_time(p).is_some()) {
+        return crate::reap::Probe::Gone;
+    }
+    let (found, failed) = crate::process::session_members(sid);
+    crate::reap::session_probe(found.len(), failed)
+}
+
+/// Stop whatever is left of the session `sid` (members that left the group
+/// but not the session): SIGTERM, a grace, then SIGKILL, signalling only a
+/// pid that is still the process that was seen. True once the session is
+/// confirmed empty, and every process could be read.
+fn clear_session(ctx: &Context, sid: libc::pid_t) -> bool {
+    use crate::reap::Probe;
+    if session_state(sid) == Probe::Gone {
+        return true;
+    }
+    for (sig, wait) in [
+        (libc::SIGTERM, GROUP_TERM_GRACE),
+        (libc::SIGKILL, MARKER_KILL_WAIT),
+    ] {
+        for p in &crate::process::session_members(sid).0 {
+            crate::process::signal_if_same(p, sig);
+        }
+        let until = ctx.clock.monotonic() + wait;
+        loop {
+            ctx.clock.sleep(MARKER_POLL);
+            match session_state(sid) {
+                Probe::Gone => return true,
+                Probe::Unknown => return false,
+                Probe::Alive => {}
+            }
+            if ctx.clock.monotonic() >= until {
+                break;
+            }
+        }
+    }
+    false
+}
+
 /// Scan for the processes of managed command `id` (marked, or recorded in
 /// `tracked`) until the answer can be
 /// believed. A process that exits while the scan reads it can make one scan
@@ -221,7 +266,16 @@ pub fn run_with(
     let mut cmd = Command::new(prog);
     cmd.args(args).current_dir(cwd).env("CANIRUN_LEASE", lease);
     if spawn.own_process_group {
-        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        // Its own session (so also its own group, with the pid as both ids):
+        // a descendant that clears its environment still stays in it.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     if let Some(id) = spawn.marker_id {
         cmd.env(marker::ENV_VAR, id)
@@ -314,7 +368,7 @@ pub fn run_with(
     }
     let tracker_unknown = tracked.truncated;
     let descendants_left = spawn.own_process_group && {
-        let group = clear_group(ctx, pid);
+        let group = clear_group(ctx, pid) && clear_session(ctx, pid);
         let marked = spawn
             .marker_id
             .is_none_or(|id| stop_marked(ctx, id, &tracked));
@@ -377,6 +431,14 @@ fn normalise_maxrss(raw: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_live_process_with_the_sessions_number_means_it_was_reused() {
+        // This test process is alive and has a pid: as a "session leader's"
+        // number it is a different process, so the session is not ours.
+        let me = std::process::id() as libc::pid_t;
+        assert_eq!(super::session_state(me), crate::reap::Probe::Gone);
+    }
+
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
 

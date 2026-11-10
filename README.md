@@ -359,7 +359,30 @@ What is not found, and what follows:
   of something other than `launchd` (for example reparented to a user
   subreaper): not found once the command's own record is gone.
 - A descendant that cleared its environment (`env -i ...`) loses the
-  marker; it is still found if it was recorded while its parent lived.
+  marker; it is still found if it was recorded while its parent lived, and
+  in any case while it stays in the run's **session**.
+- **Session.** A managed command is started in its own session (`setsid`;
+  its session id and process group id are the child's pid, recorded in the
+  sidecar as `sid`). `env -i`, a double fork, a process born after the
+  supervisor died or between two samples, and a job-control shell that
+  moves its jobs to new process groups all stay in it, so the reaper and
+  `resolve --force` see them as members and keep the entry. A session id is
+  a pid, so it counts only while it is still the child's session: a process
+  that leads that number now and started at a different time than the
+  recorded child is a different session (reuse), and its members are not
+  counted. If a process's session cannot be read the scan is unknown, as
+  for an unreadable environment. A sidecar written before this has no `sid`
+  and is judged as before. A consequence: the command has no controlling
+  terminal of its own.
+- **Left the session.** A daemon that calls `setsid` deliberately gets out
+  of the run's session (`setpgid` cannot: POSIX does not let a process move
+  into a group of another session), and
+  with an empty environment, born after the tracker last looked, nothing
+  finds it: the entry can be freed while it runs. This is the residual
+  limitation. Another: the session check lists processes through the same
+  process table as everything else, so a process that table does not list is
+  missed; the marker and the recorded descendants still catch it in the
+  common cases.
 - The process group check does not compare start times, so a group number
   that was reused by an unrelated group keeps an entry held for as long as
   that group lives. That errs on the side of keeping the budget; the way out

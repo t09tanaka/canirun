@@ -147,6 +147,10 @@ pub trait ProcessScan: Send + Sync {
     fn alive_recorded(&self, recorded: &[crate::marker::ProcRef]) -> Vec<crate::marker::ProcRef> {
         crate::process::alive_among(recorded)
     }
+    /// Whether anyone still belongs to the run's session.
+    fn probe_session(&self, c: &crate::process::ChildIdentity) -> crate::reap::Probe {
+        crate::process::probe_session(c)
+    }
 }
 
 /// This machine's processes of the current user.

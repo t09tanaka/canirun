@@ -4,7 +4,7 @@
 
 use crate::lineage::{self, Row};
 use crate::marker::{self, Marker, ProcRef, Scan, Seen};
-use crate::reap::Probe;
+use crate::reap::{self, Probe};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
@@ -91,6 +91,11 @@ pub struct ChildIdentity {
     pub start_time: Option<u64>,
     /// The child's own process group (a managed child leads one).
     pub pgid: Option<i32>,
+    /// The child's own session (a managed child leads one, started with
+    /// `setsid`), so its id is the child's pid. `env -i` cannot leave a
+    /// session; only a deliberate `setsid` can. Absent in older sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<i32>,
 }
 
 impl ChildIdentity {
@@ -101,8 +106,78 @@ impl ChildIdentity {
             pid,
             start_time: start_time(pid),
             pgid: (pgid > 0).then_some(pgid),
+            sid: session_of(pid).filter(|s| *s > 0),
         }
     }
+}
+
+impl ChildIdentity {
+    /// The identity of a just-spawned session leader: the child was started
+    /// with a successful `setsid` in `pre_exec` (the spawn succeeding proves
+    /// it), so its session and process group ids are its pid. Nothing is read
+    /// from the kernel for them, so a child that already exited (a zombie
+    /// cannot be asked) is still recorded with them.
+    pub fn capture_leader(pid: u32) -> Self {
+        let id = pid as i32;
+        ChildIdentity {
+            pid,
+            start_time: start_time(pid),
+            pgid: Some(id),
+            sid: Some(id),
+        }
+    }
+}
+
+/// The session id of `pid`, or `None` when the kernel will not say.
+fn session_of(pid: u32) -> Option<i32> {
+    session_lookup(pid).ok()
+}
+
+/// `getsid(pid)`: `Err(true)` when the process is gone, `Err(false)` for any
+/// other failure (`EPERM`, ...).
+fn session_lookup(pid: u32) -> Result<i32, bool> {
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    if sid >= 0 {
+        return Ok(sid);
+    }
+    Err(std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
+/// Every live, non-zombie process (other than this one) whose session is
+/// `sid`, and whether some process's session could not be read.
+pub fn session_members(sid: i32) -> (Vec<ProcRef>, bool) {
+    let me = std::process::id();
+    let mut found = Vec::new();
+    let mut failed = false;
+    for row in TableReader::new().read() {
+        // `getsid(0)` is the caller's own session, never pid 0's.
+        if row.proc.pid == me || row.proc.pid == 0 {
+            continue;
+        }
+        match session_lookup(row.proc.pid) {
+            Ok(s) if s == sid => found.push(row.proc),
+            Ok(_) => {}
+            Err(true) => {}
+            Err(false) => failed = true,
+        }
+    }
+    (found, failed)
+}
+
+/// Does anyone still belong to the run's session? A session id is a pid, so
+/// it only counts while it is still the child's session (see
+/// [`reap::session_member`]). A child recorded without a session (an older
+/// sidecar) has none to look at: gone.
+pub fn probe_session(c: &ChildIdentity) -> Probe {
+    let Some(sid) = c.sid else {
+        return Probe::Gone;
+    };
+    let leader = u32::try_from(sid).ok().and_then(start_time);
+    if !reap::session_member(leader, c.start_time) {
+        return Probe::Gone;
+    }
+    let (found, failed) = session_members(sid);
+    reap::session_probe(found.len(), failed)
 }
 
 /// Is the recorded child itself still running? A pid that now has a
@@ -456,8 +531,37 @@ mod tests {
             pid: 0x3fff_fff0,
             start_time: Some(1),
             pgid: None,
+            sid: None,
         };
         assert_eq!(probe_child(&gone), Probe::Gone);
+    }
+
+    #[test]
+    fn a_session_leader_is_recorded_without_asking_the_kernel() {
+        use std::os::unix::process::CommandExt;
+        let mut c = unsafe {
+            Command::new("true")
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        // Not waited for: it is a zombie as soon as it has exited, when
+        // getsid can no longer be asked.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let id = ChildIdentity::capture_leader(c.id());
+        assert_eq!(id.sid, Some(c.id() as i32));
+        assert_eq!(id.pgid, Some(c.id() as i32));
+        c.wait().unwrap();
+    }
+
+    #[test]
+    fn pid_zero_is_never_a_session_member() {
+        // getsid(0) is the caller's own session; it must not be counted.
+        let mine = unsafe { libc::getsid(0) };
+        assert!(session_members(mine).0.iter().all(|p| p.pid != 0));
     }
 
     #[test]

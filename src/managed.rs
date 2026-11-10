@@ -339,6 +339,11 @@ fn assess_with(
                     } else {
                         process::probe_group(c.pgid)
                     };
+                    // Whatever left the group but not the session (and
+                    // whatever cleared its environment) still belongs to it.
+                    if scan && child_probe != Probe::Alive && group_probe != Probe::Alive {
+                        group_probe = reap::merge_probes(group_probe, ctx.scan.probe_session(c));
+                    }
                 }
                 // A live child or group already keeps the entry.
                 if child_probe != Probe::Alive && group_probe != Probe::Alive {
@@ -927,7 +932,7 @@ pub fn run_command_with_tracker(
         .unwrap_or(false);
     let started_at = ctx.clock.now();
     let on_spawn = |pid: u32| {
-        let identity = ChildIdentity::capture(pid);
+        let identity = ChildIdentity::capture_leader(pid);
         // Best effort: if this fails the phase stays LaunchIntent, which
         // the reaper keeps (quarantine) rather than frees.
         let at = ctx.clock.now();
@@ -1026,6 +1031,14 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
                     if process::probe_group(Some(pgid)) == Probe::Alive {
                         return Err(Error::Ledger(format!(
                             "{id}: process group {pgid} still has members; the entry keeps \
+                             its budget until they stop"
+                        )));
+                    }
+                }
+                if let Some(c) = &sc.child {
+                    if ctx.scan.probe_session(c) != Probe::Gone {
+                        return Err(Error::Ledger(format!(
+                            "{id}: the command's session still has members; the entry keeps \
                              its budget until they stop"
                         )));
                     }
