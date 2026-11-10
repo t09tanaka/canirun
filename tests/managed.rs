@@ -1275,10 +1275,27 @@ impl Drop for Cleanup {
     }
 }
 
+/// The real process scan, minus the hidden processes it reports. The
+/// supervisor in this test is killed, so the window in which a hidden
+/// orphan counts as a possible descendant stays open, and any unrelated
+/// process the OS starts meanwhile and keeps running (Spotlight's
+/// `mdworker_shared` appears while a build writes files) would hold the
+/// entry as `ProbeUnknown`. That rule has its own tests with fixed scans;
+/// here only the recorded descendant decides.
+struct NoAmbientHidden;
+
+impl canirun::ProcessScan for NoAmbientHidden {
+    fn scan(&self, id: &str, scope: &str) -> Scan {
+        let mut s = canirun::process::scan_system(id, scope);
+        s.hidden.clear();
+        s
+    }
+}
+
 #[test]
 fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
     let dir = tempfile::tempdir().unwrap();
-    let ctx = ctx(dir.path());
+    let ctx = ctx(dir.path()).with_scan(Arc::new(NoAmbientHidden));
     let sup = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -1331,7 +1348,8 @@ fn a_descendant_that_left_the_group_is_recorded_and_keeps_the_budget() {
     unsafe { libc::kill(sleeper as libc::pid_t, libc::SIGKILL) };
     assert!(
         until(20, || reaped(&ctx).find("sup-2").is_none()),
-        "not released after the descendant stopped"
+        "not released after the descendant stopped: {:?}",
+        managed::views(&ctx, &ledger(&ctx).entries)
     );
 }
 
