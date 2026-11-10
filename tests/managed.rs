@@ -1830,4 +1830,10 @@ fn a_run_that_left_descendants_does_not_close_the_window() {
     // after the run: with the window open it may be the command's.
     let late = hidden(start + 3600, Probe::Gone, vec![]);
     assert!(reaped(&late).find("dl").is_some(), "held");
+    // And it is held for the open window, not for some other reason.
+    let kept = managed::resolve_checked(&late, "dl").unwrap();
+    assert!(
+        !kept.released && kept.verdict.contains("ProbeUnknown"),
+        "{kept:?}"
+    );
 }
