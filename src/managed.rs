@@ -978,6 +978,8 @@ pub fn run_command_with_tracker(
             on_spawn: guard.managed.then_some(&on_spawn),
             on_descendants: guard.managed.then_some(record),
             start_tracker,
+            env: opts.env.as_ref(),
+            stdout_log: opts.stdout_log.as_deref(),
         },
     )?;
     if let Some(at) = outcome.tracked_to_exit_at {

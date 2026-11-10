@@ -15,7 +15,7 @@ use crate::marker;
 use crate::reap::Probe;
 use crate::Context;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,6 +92,11 @@ pub struct Spawn<'a> {
     /// Replaces [`crate::tracker::Tracker::start`] (tests make it fail).
     #[doc(hidden)]
     pub start_tracker: Option<StartTracker>,
+    /// The child's whole environment (see [`crate::exec::Opts::env`]); the
+    /// reserved variables are added after it. `None` inherits.
+    pub env: Option<&'a std::collections::BTreeMap<String, String>>,
+    /// Append stdout and stderr to this file, stdin from `/dev/null`.
+    pub stdout_log: Option<&'a Path>,
 }
 
 /// Starts the recorder of a command's descendants.
@@ -264,9 +269,25 @@ pub fn run_with(
     ctx.supervisor.running();
     let start = ctx.clock.monotonic();
     let mut cmd = Command::new(prog);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("TASK_TRAFFIC_CONTROLLER_LEASE", lease);
+    cmd.args(args).current_dir(cwd);
+    if let Some(env) = spawn.env {
+        cmd.env_clear().envs(env);
+    }
+    cmd.env("TASK_TRAFFIC_CONTROLLER_LEASE", lease);
+    if let Some(log) = spawn.stdout_log {
+        let open = |p: &Path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+        };
+        let out = open(log)
+            .map_err(|e| Error::Spawn(format!("cannot open log {}: {e}", log.display())))?;
+        let err = out
+            .try_clone()
+            .map_err(|e| Error::Spawn(format!("cannot open log {}: {e}", log.display())))?;
+        cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+    }
     if spawn.own_process_group {
         // Its own session (so also its own group, with the pid as both ids):
         // a descendant that clears its environment still stays in it.

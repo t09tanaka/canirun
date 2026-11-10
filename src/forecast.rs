@@ -630,6 +630,9 @@ struct Globals {
     live_missing: bool,
     any_live_hold: bool,
     overlay_applied: usize,
+    /// Ledger entries whose queue or run age is read off their wall-clock
+    /// (UTC) stamps: an entry carries no monotonic time.
+    legacy_clock_entries: usize,
 }
 
 impl Globals {
@@ -688,6 +691,13 @@ fn timing_of(
     let mut assumptions = vec!["no new external load".to_string()];
     assumptions.extend(g.conditions());
     let mut conditional = assumptions.len() > 1;
+    if g.legacy_clock_entries > 0 {
+        assumptions.push(format!(
+            "legacy_clock: the age of {} ledger entries is estimated from their UTC timestamps, \
+             which a wall-clock step can skew",
+            g.legacy_clock_entries
+        ));
+    }
 
     if let Some(id) = meta.registered {
         assumptions.push(format!("already registered as ledger entry {id}"));
@@ -1379,6 +1389,7 @@ pub fn forecast(
         live_missing: insp.live.is_none(),
         any_live_hold: jobs.iter().any(|j| j.live_hold),
         overlay_applied: report.applied.len(),
+        legacy_clock_entries: insp.entries.len(),
     };
     let t0_running = insp.entries.iter().any(|e| e.entry.state == State::Running);
     let node_forecasts: Vec<NodeForecast> = plan
@@ -1562,6 +1573,7 @@ mod tests {
             ledger_locked: true,
             entries,
             history: Vec::new(),
+            history_quality: Vec::new(),
         }
     }
 

@@ -204,5 +204,6 @@ fn opts(
         key,
         argv,
         cwd: std::env::current_dir()?,
+        ..Opts::default()
     })
 }

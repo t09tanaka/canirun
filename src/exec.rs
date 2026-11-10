@@ -29,7 +29,7 @@ use std::time::Duration;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// What to run and how it should be queued.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Opts {
     pub weight: Option<u32>,
     pub front: bool,
@@ -38,6 +38,15 @@ pub struct Opts {
     /// Directory the command runs in; also what the history key is derived
     /// from.
     pub cwd: PathBuf,
+    /// The child's whole environment. `Some` clears the inherited one and
+    /// starts from this map (the reserved `TASK_TRAFFIC_CONTROLLER_*`
+    /// variables are still added on top); `None` inherits ours. Not part of
+    /// the history key.
+    pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// `Some`: the child's stdout and stderr are appended to this file
+    /// (created if missing) and its stdin is `/dev/null`. `None`: all three
+    /// are inherited.
+    pub stdout_log: Option<PathBuf>,
 }
 
 /// The history key for `argv` run from `cwd`, as `exec`, `submit` and
@@ -535,6 +544,7 @@ mod tests {
                 key: None,
                 argv: argv.iter().map(|s| s.to_string()).collect(),
                 cwd: dir.to_path_buf(),
+                ..Opts::default()
             }
         }
 

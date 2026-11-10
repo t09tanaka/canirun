@@ -39,6 +39,7 @@ fn opts(dir: &Path, argv: &[&str]) -> Opts {
         key: Some("managed-test".into()),
         argv: argv.iter().map(|s| s.to_string()).collect(),
         cwd: dir.to_path_buf(),
+        ..Opts::default()
     }
 }
 
@@ -2908,4 +2909,82 @@ fn the_session_is_recorded_even_for_a_child_that_exits_at_once() {
         assert_eq!(child.pgid, Some(child.pid as i32), "{id}");
         managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
     }
+}
+
+/// Registers, admits and runs `opts.argv` as a managed command and returns
+/// its exit code.
+fn run_managed_opts(dir: &Path, id: &str, opts: Opts) -> i32 {
+    let (ctx, cfg) = (ctx(dir), Config::default());
+    let mut s = spec(dir, id, "d", &["true"]);
+    s.opts = opts;
+    let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    admit_now(&ctx, &cfg, id);
+    let ran = managed::run_command(&ctx, &guard, &s.opts, cfg.limits()).unwrap();
+    let code = ran.outcome.exit.code();
+    managed::finish(&ctx, guard, ran.outcome.exit.into()).unwrap();
+    code
+}
+
+#[test]
+fn a_given_env_replaces_ours_and_keeps_the_reserved_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("out.log");
+    let mut o = opts(
+        dir.path(),
+        &[
+            "/bin/sh",
+            "-c",
+            "echo \"home=${HOME-unset} x=$X lease=$TASK_TRAFFIC_CONTROLLER_LEASE \
+             id=$TASK_TRAFFIC_CONTROLLER_MANAGED_ID scope=${TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE:+set}\"; \
+             echo to-stderr >&2",
+        ],
+    );
+    o.env = Some([("X".to_string(), "1".to_string())].into());
+    o.stdout_log = Some(log.clone());
+    assert_eq!(run_managed_opts(dir.path(), "env-1", o), 0);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("x=1"), "{text}");
+    // Our own HOME is set; the child must not see it.
+    assert!(std::env::var_os("HOME").is_some());
+    assert!(text.contains("home=unset"), "parent env leaked: {text}");
+    assert!(text.contains("lease=env-1"), "{text}");
+    assert!(text.contains("id=env-1"), "{text}");
+    assert!(text.contains("scope=set"), "{text}");
+    assert!(text.contains("to-stderr"), "stderr goes to the log: {text}");
+}
+
+#[test]
+fn stdout_log_is_appended_to_and_stdin_is_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("a.log");
+    std::fs::write(&log, "before\n").unwrap();
+    let mk = |script: &str| {
+        let mut o = opts(dir.path(), &["/bin/sh", "-c", script]);
+        o.stdout_log = Some(log.clone());
+        o
+    };
+    // `cat` returns at once only when stdin is at end of file.
+    assert_eq!(run_managed_opts(dir.path(), "l-1", mk("echo one; cat")), 0);
+    assert_eq!(run_managed_opts(dir.path(), "l-2", mk("echo two")), 0);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "before\none\ntwo\n");
+}
+
+#[test]
+fn without_env_the_child_inherits_ours() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = opts(dir.path(), &["/bin/sh", "-c", "test -n \"$PATH\""]);
+    assert!(o.env.is_none() && o.stdout_log.is_none());
+    assert_eq!(run_managed_opts(dir.path(), "inh-1", o), 0);
+}
+
+#[test]
+fn env_and_log_do_not_change_the_history_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let plain = opts(dir.path(), &["tool", "--flag"]);
+    let mut other = plain.clone();
+    other.env = Some([("X".to_string(), "1".to_string())].into());
+    other.stdout_log = Some(dir.path().join("x.log"));
+    let key = |o: &Opts| exec::plan(&ctx, &Config::default(), o).unwrap().key;
+    assert_eq!(key(&plain).hash, key(&other).hash);
 }

@@ -89,6 +89,7 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
         key: job.key.clone(),
         argv: job.argv.clone(),
         cwd: job.cwd.clone(),
+        ..Opts::default()
     };
     if !job.detach {
         spawn_orphan_watchdog(
