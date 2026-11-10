@@ -266,7 +266,11 @@ A managed command (one driven through `canirun::managed` by another
 program) needs every `canirun` that shares the state directory to be
 upgraded: a ledger that holds a managed entry is written in a new shape
 (`entries_v2`), and an older binary refuses to load it rather than reap
-entries it cannot recognise. It keeps its budget while its supervisor is gone, until nothing it
+entries it cannot recognise (every command then exits 2). To go back to an
+older binary, settle every managed entry (`canirun resolve <id>`, or
+`--force`); the next save writes the old shape (`version` 1) and older
+binaries work again. `canirun status` shows the format (`ledger_format` in
+`--json`). It keeps its budget while its supervisor is gone, until nothing it
 started is still running. `status` lists such entries as `held, owner gone`,
 and `inspect` marks them `quarantined` with a `hint`. Most are released by
 themselves once their processes stop. Two kinds are not: an entry whose
@@ -293,8 +297,12 @@ checked**: a process that could not be read, a launch intent that a hidden
 process may belong to, or a record of descendants that did not fit. It
 releases the entry anyway and records `interrupted` with `forced: <reason>`
 (`--json` has `"forced": true`). It never releases what is known to be
-running: a held lease, a running child, group, marked process or recorded
-descendant keeps the entry (exit 1), with or without `--force`. Exit codes
+running: a held lease, a running child, a marked process or a recorded
+descendant keeps the entry (exit 1), with or without `--force`. A live
+process group alone does not count as running when the group number was
+reused: with the child gone and no process carrying the run's id and no
+recorded descendant, `--force` releases the entry (`forced: the recorded
+process group is held by processes that are not this run's`). Exit codes
 are the same (0 released, 1 kept, 2 error, 3 no such entry).
 
 How descendants are found, and what this cannot see:
@@ -347,9 +355,12 @@ What is not found, and what follows:
   subreaper): not found once the command's own record is gone.
 - A descendant that cleared its environment (`env -i ...`) loses the
   marker; it is still found if it was recorded while its parent lived.
-- The process group check does not compare start times, so a pid that was
-  reused by an unrelated process in the same group id can keep an entry held
-  for a while. That errs on the side of keeping the budget.
+- The process group check does not compare start times, so a group number
+  that was reused by an unrelated process keeps an entry held for as long as
+  that group lives. That errs on the side of keeping the budget; the way out
+  is `canirun resolve <id> --force`, which releases it when nothing in the
+  group carries the run's id or is a recorded descendant, and the child is
+  gone.
 - A scan that could not read some process of the user is unknown and
   releases nothing, until `resolve --force`.
 - **A Mac entry that stays held.** On macOS a process that `launchd`
@@ -401,9 +412,13 @@ What is not found, and what follows:
 
 `config` prints the effective configuration (defaults merged with the
 file). `gc` reaps dead entries and trims history to `history_keep`
-records per key, and keeps the newest `history_keep` of the
-`measurements/*.applied` markers that `managed::record_measurement`
-leaves (one per measurement); both also happen on the fly, so `gc` is
+records per key (under the history lock), removes the
+`measurements/*.applied` markers that `managed::record_measurement` leaves
+once their record is trimmed away (a marker is kept as long as its
+record), and removes the receipts of managed commands (`managed/<id>.json`)
+that ended more than `managed_keep_days` (default 7) ago and have no ledger
+entry, together with leftover temporary files of that age. A command that
+has not ended is never removed. Reaping also happens on the fly, so `gc` is
 only for tidiness.
 
 ## Configuration
@@ -428,6 +443,7 @@ backfill_max_job_secs = 300 # a command learned to take at most this may pass a 
 backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has waited this long
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
+managed_keep_days = 7       # ...and receipts of managed commands that ended longer ago
 
 [[pattern]]                 # glob over the full argv string, first match wins
 match = "*stryker*"

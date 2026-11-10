@@ -55,6 +55,10 @@ pub struct Config {
     pub backfill_max_wait_secs: u64,
     /// `gc` removes finished job files older than this.
     pub jobs_keep_days: u64,
+    /// `gc` removes the sidecars (receipts) of managed commands that ended
+    /// more than this many days ago, and leftover temporary files of that
+    /// age. A command that has not ended is never removed.
+    pub managed_keep_days: u64,
     /// A job with no `wait`er is cancelled once this many seconds have
     /// passed since submit (unless submitted with `--detach`).
     pub jobs_orphan_grace_secs: u64,
@@ -86,6 +90,7 @@ impl Default for Config {
             backfill_max_job_secs: 300,
             backfill_max_wait_secs: 300,
             jobs_keep_days: 7,
+            managed_keep_days: 7,
             jobs_orphan_grace_secs: 30,
             patterns: Vec::new(),
         }

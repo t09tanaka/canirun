@@ -1237,32 +1237,90 @@ fn a_reaper_keeps_the_entry_while_an_escaped_descendant_runs() {
     assert!(until(20, || reaped(&ctx).find("esc-held").is_none()));
 }
 
+fn record_for(key: &str, mid: Option<&str>) -> Record {
+    Record {
+        key: key.into(),
+        repo: String::new(),
+        subdir: String::new(),
+        argv: "x".into(),
+        key_argv: String::new(),
+        started_at: chrono::Utc::now(),
+        wall_secs: 1.0,
+        cpu_secs: 1.0,
+        max_rss_bytes: 1,
+        exit_code: 0,
+        weight_used: 1,
+        contended: false,
+        measurement_id: mid.map(String::from),
+    }
+}
+
 #[test]
-fn gc_keeps_only_the_newest_applied_markers() {
+fn gc_keeps_a_marker_exactly_as_long_as_its_record() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path());
-    let m = ctx.paths.measurements_dir();
-    std::fs::create_dir_all(&m).unwrap();
-    let base = std::time::SystemTime::now() - Duration::from_secs(1000);
-    for i in 0..5u64 {
-        let f = std::fs::File::create(m.join(format!("m{i}.applied"))).unwrap();
-        f.set_modified(base + Duration::from_secs(i * 10)).unwrap();
+    // Three measurements of one key and two of another, history_keep 2.
+    for (key, id) in [
+        ("a", "m0"),
+        ("a", "m1"),
+        ("a", "m2"),
+        ("b", "m3"),
+        ("b", "m4"),
+    ] {
+        assert_eq!(
+            managed::record_measurement(&ctx, id, &record_for(key, None)).unwrap(),
+            Measured::Applied
+        );
     }
-    std::fs::write(m.join("p.pending"), b"").unwrap();
-    assert_eq!(managed::gc_measurements(&ctx, 3).unwrap(), 2);
-    let mut left: Vec<String> = std::fs::read_dir(&m)
+    std::fs::write(ctx.paths.measurements_dir().join("p.pending"), b"").unwrap();
+    // Per key: only m0 (the oldest of "a") loses its record.
+    assert_eq!(managed::trim_history(&ctx, 2).unwrap(), 1);
+    assert_eq!(managed::gc_measurements(&ctx).unwrap(), 1);
+    let mut left: Vec<String> = std::fs::read_dir(ctx.paths.measurements_dir())
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     left.sort();
     assert_eq!(
         left,
-        ["m2.applied", "m3.applied", "m4.applied", "p.pending"]
+        [
+            "m1.applied",
+            "m2.applied",
+            "m3.applied",
+            "m4.applied",
+            "p.pending"
+        ]
     );
-    assert_eq!(managed::gc_measurements(&ctx, 3).unwrap(), 0);
-    assert_eq!(managed::gc_measurements(&ctx, 0).unwrap(), 3);
+    // Every marker left has its record, so none is dropped (the old
+    // behaviour kept the newest N markers overall and could keep one whose
+    // record was gone, or drop one whose record was not).
+    assert_eq!(managed::gc_measurements(&ctx).unwrap(), 0);
+    assert_eq!(
+        managed::record_measurement(&ctx, "m4", &record_for("b", None)).unwrap(),
+        Measured::Duplicate
+    );
     let none = ctx_with_boot(tempfile::tempdir().unwrap().path(), None);
-    assert_eq!(managed::gc_measurements(&none, 3).unwrap(), 0);
+    assert_eq!(managed::gc_measurements(&none).unwrap(), 0);
+}
+
+#[test]
+fn trimming_the_history_waits_for_the_history_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path()).with_ledger_lock_timeout(Duration::from_millis(200));
+    managed::record_measurement(&ctx, "m0", &record_for("a", None)).unwrap();
+    managed::record_measurement(&ctx, "m1", &record_for("a", None)).unwrap();
+    // A recorder is in the middle of its append: the trim must not run.
+    let held = lock::acquire(&ctx.paths.history_lock(), Duration::from_secs(1)).unwrap();
+    let err = managed::trim_history(&ctx, 1).unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert_eq!(
+        history::read_all(ctx.paths.history_file()).unwrap().len(),
+        2
+    );
+    drop(held);
+    assert_eq!(managed::trim_history(&ctx, 1).unwrap(), 1);
+    // The marker of the dropped record goes with the next gc, not before.
+    assert_eq!(managed::gc_measurements(&ctx).unwrap(), 1);
 }
 
 // ---- descendants recorded while the command runs, and `resolve --force` ----
@@ -1923,26 +1981,39 @@ fn orphan_with_live_child(ctx: &Context, id: &str) {
     orphan(ctx, id, Phase::ChildStarted, Some(ghost));
 }
 
-#[test]
-fn adopting_a_started_run_after_a_reboot_does_not_free_the_new_childs_budget() {
-    let dir = tempfile::tempdir().unwrap();
-    let (ctx1, cfg) = (ctx(dir.path()), Config::default());
-    let s = spec(dir.path(), "c", "d", &["true"]);
+/// A started run whose supervisor died, then the machine rebooted; `settler`
+/// is who notices first. Returns what a later registration of the id gets.
+fn after_a_reboot(dir: &Path, id: &str, by_reaper: bool) -> (Box<managed::Sidecar>, usize) {
+    let (ctx1, cfg) = (ctx(dir), Config::default());
+    let s = spec(dir, id, "d", &["true"]);
     let (_, g) = registered(managed::register(&ctx1, &cfg, &s).unwrap());
-    orphan_with_live_child(&ctx1, "c");
+    orphan_with_live_child(&ctx1, id);
     drop(g);
-    // The machine rebooted; the same id is registered again.
-    let ctx2 = ctx_with_boot(dir.path(), Some("boot-2"));
-    let (rc, g2) = registered(managed::register(&ctx2, &cfg, &s).unwrap());
-    assert_eq!(rc.phase, Phase::Registered);
-    assert!(rc.newly_registered);
-    assert_eq!(rc.boot_id.as_deref(), Some("boot-2"));
-    assert_eq!(sidecar(&ctx2, "c").boot_id.as_deref(), Some("boot-2"));
-    // The child of this boot lives on while its supervisor dies: kept.
-    orphan_with_live_child(&ctx2, "c");
-    drop(g2);
-    assert!(reaped(&ctx2).find("c").is_some());
-    assert_eq!(sidecar(&ctx2, "c").phase, Phase::ChildStarted);
+    let ctx2 = ctx_with_boot(dir, Some("boot-2"));
+    if by_reaper {
+        assert!(reaped(&ctx2).find(id).is_none());
+    }
+    // Registering again never runs it again: the outcome is the recorded one.
+    match managed::register(&ctx2, &cfg, &s).unwrap() {
+        Registration::AlreadyTerminal(sc) => (sc, ledger(&ctx2).entries.len()),
+        Registration::Registered(..) => panic!("the run was registered afresh"),
+    }
+}
+
+#[test]
+fn the_outcome_after_a_reboot_is_the_same_whether_the_reaper_or_register_settles_first() {
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (by_register, n1) = after_a_reboot(d1.path(), "c", false);
+    let (by_reaper, n2) = after_a_reboot(d2.path(), "c", true);
+    assert_eq!((n1, n2), (0, 0));
+    for sc in [&by_register, &by_reaper] {
+        assert_eq!(sc.phase, Phase::Terminal);
+        let t = sc.terminal.as_ref().unwrap();
+        assert_eq!(t.kind, TerminalKind::Interrupted);
+        assert!(t.detail.as_ref().unwrap().contains("BootChanged"), "{t:?}");
+    }
+    let detail = |sc: &managed::Sidecar| sc.terminal.as_ref().unwrap().detail.clone();
+    assert_eq!(detail(&by_register), detail(&by_reaper));
 }
 
 #[test]
@@ -1960,6 +2031,20 @@ fn adopting_an_unlaunched_registration_after_a_reboot_refreshes_its_boot_id() {
     assert_eq!(sidecar(&ctx2, "c").boot_id.as_deref(), Some("boot-2"));
 }
 
+/// A live-metrics source that copies one file the moment it is asked: the
+/// run asks once after the launch intent and before the spawn.
+struct CopyOnSample {
+    from: PathBuf,
+    to: PathBuf,
+}
+
+impl canirun::LiveProvider for CopyOnSample {
+    fn snapshot(&self) -> Option<canirun::admit::LiveSnapshot> {
+        std::fs::copy(&self.from, &self.to).unwrap();
+        None
+    }
+}
+
 #[test]
 fn the_current_boot_is_stamped_at_the_launch_and_at_the_spawn() {
     let dir = tempfile::tempdir().unwrap();
@@ -1969,7 +2054,24 @@ fn the_current_boot_is_stamped_at_the_launch_and_at_the_spawn() {
     // Registered on boot-1, launched on boot-2 (no re-registration).
     let ctx2 = ctx_with_boot(dir.path(), Some("boot-2"));
     admit_now(&ctx2, &cfg, "c");
+    // The stamp is written with the intent, before anything is spawned: a
+    // supervisor that dies right there must not leave boot-1 behind. The
+    // run takes its one live sample after the intent and before the spawn,
+    // so a source that copies the sidecar then sees it in between.
+    let from = ctx2.paths.managed_file("c");
+    let ctx2 = ctx2.with_live(Arc::new(CopyOnSample {
+        from,
+        to: dir.path().join("at-intent.json"),
+    }));
     managed::run_command(&ctx2, &guard, &s.opts, cfg.limits()).unwrap();
+    let at_intent: managed::Sidecar =
+        serde_json::from_slice(&std::fs::read(dir.path().join("at-intent.json")).unwrap()).unwrap();
+    assert_eq!(at_intent.phase, Phase::LaunchIntent, "{at_intent:?}");
+    assert_eq!(
+        at_intent.boot_id.as_deref(),
+        Some("boot-2"),
+        "{at_intent:?}"
+    );
     let sc = sidecar(&ctx2, "c");
     assert_eq!(sc.phase, Phase::ChildStarted);
     assert_eq!(sc.boot_id.as_deref(), Some("boot-2"));
@@ -2045,40 +2147,384 @@ fn a_started_managed_run_of_this_state_dir_is_nested_without_its_lease() {
     assert_eq!(nested(None, Some("c"), Some(&scope)), None);
 }
 
-#[test]
-fn the_cli_runs_a_command_ungated_inside_an_orphaned_managed_tree() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state/canirun");
-    let lib = Context::new(Paths::new(&state, dir.path().join("none.toml")))
-        .with_live(Arc::new(FixedLive(None)));
-    let (_, g) = registered(
-        managed::register(
-            &lib,
-            &Config::default(),
-            &spec(dir.path(), "c", "d", &["true"]),
-        )
-        .unwrap(),
-    );
-    orphan_with_live_child(&lib, "c");
-    drop(g);
-    let scope = canirun::marker::scope(lib.paths.state_dir());
-    let out = Command::new(env!("CARGO_BIN_EXE_canirun"))
-        .env_clear()
+/// Run `canirun exec -- true` against `lib`'s state directory with only the
+/// given managed variables set.
+fn cli_true(dir: &Path, lib: &Context, vars: Option<(&str, &str)>) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_canirun"));
+    cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", dir.path())
-        .env("XDG_STATE_HOME", dir.path().join("state"))
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env("CANIRUN_MANAGED_ID", "c")
-        .env("CANIRUN_MANAGED_SCOPE", &scope)
-        .args(["exec", "--", "true"])
-        .output()
-        .unwrap();
+        .env("HOME", dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("XDG_CONFIG_HOME", dir.join("config"));
+    if let Some((id, scope)) = vars {
+        cmd.env("CANIRUN_MANAGED_ID", id)
+            .env("CANIRUN_MANAGED_SCOPE", scope);
+    }
+    let out = cmd.args(["exec", "--", "true"]).output().unwrap();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let _ = lib;
+    out
+}
+
+fn cli_state(dir: &Path) -> (Context, String) {
+    let state = dir.join("state/canirun");
+    let lib = Context::new(Paths::new(&state, dir.join("none.toml")))
+        .with_live(Arc::new(FixedLive(None)));
+    // A roomy budget and no machine guards, so a gated run starts at once.
+    let conf = dir.join("config/canirun/config.toml");
+    std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+    std::fs::write(
+        &conf,
+        "budget = 64\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n",
+    )
+    .unwrap();
+    let cfg = Config::default();
+    let (_, g) =
+        registered(managed::register(&lib, &cfg, &spec(dir, "c", "d", &["true"])).unwrap());
+    admit_now(&lib, &cfg, "c");
+    drop(g);
+    let scope = canirun::marker::scope(lib.paths.state_dir());
+    (lib, scope)
+}
+
+#[test]
+fn the_cli_runs_a_command_ungated_inside_an_orphaned_managed_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lib, scope) = cli_state(dir.path());
+    // The recorded child is this test process, the parent of the binary.
+    orphan_with_live_child(&lib, "c");
+    cli_true(dir.path(), &lib, Some(("c", &scope)));
     // Ungated: no entry of its own and no history record.
     assert_eq!(ledger(&lib).entries.len(), 1);
     assert!(!lib.paths.state_dir().join("history.jsonl").exists());
+    // Control: the same command without the variables is gated, and leaves
+    // a history record.
+    cli_true(dir.path(), &lib, None);
+    assert!(lib.paths.state_dir().join("history.jsonl").exists());
+}
+
+#[test]
+fn a_process_that_only_inherited_the_managed_variables_is_still_gated() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (lib, scope) = cli_state(dir.path());
+    // The run's recorded child is somebody else's process in its own group:
+    // this test (and the binary it starts) is neither in that group nor
+    // below it, as a daemon that inherited the environment would be.
+    let mut other = Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let ghost = canirun::process::ChildIdentity {
+        pid: other.id(),
+        start_time: canirun::process::start_time(other.id()),
+        pgid: Some(other.id() as i32),
+    };
+    orphan(&lib, "c", Phase::ChildStarted, Some(ghost));
+    cli_true(dir.path(), &lib, Some(("c", &scope)));
+    assert!(
+        lib.paths.state_dir().join("history.jsonl").exists(),
+        "the outsider skipped the gate"
+    );
+    other.kill().unwrap();
+    other.wait().unwrap();
+}
+
+#[test]
+fn a_settled_stranded_sidecar_does_not_block_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    let ctx = ctx_with_fixed(dir.path(), clock, Scan::new(Probe::Gone, vec![]));
+    let cfg = Config::default();
+    std::fs::create_dir_all(ctx.paths.managed_dir()).unwrap();
+    // Nothing parseable, and nothing parseable that names a digest.
+    std::fs::write(ctx.paths.managed_file("bad"), b"{").unwrap();
+    // Parseable JSON that is not a sidecar, but still names its digest.
+    std::fs::write(
+        ctx.paths.managed_file("keep"),
+        br#"{"spec_digest":"d","phase":7}"#,
+    )
+    .unwrap();
+    for id in ["bad", "keep"] {
+        let r = managed::resolve_checked(&ctx, id).unwrap();
+        assert!(r.released, "{r:?}");
+    }
+    // The id answers with its finished outcome, not a conflict.
+    let again = |id: &str, digest: &str| {
+        managed::register(&ctx, &cfg, &spec(dir.path(), id, digest, &["true"]))
+    };
+    assert!(matches!(
+        again("bad", "d").unwrap(),
+        Registration::AlreadyTerminal(_)
+    ));
+    // The digest that could be read is kept: another one is still a conflict.
+    assert!(matches!(
+        again("keep", "d").unwrap(),
+        Registration::AlreadyTerminal(_)
+    ));
+    let err = again("keep", "other").unwrap_err();
+    assert!(err.to_string().contains("digest"), "{err}");
+}
+
+// ---- the reaper's scans stay out of the ledger lock ----
+
+/// A scan that takes `delay` and counts how often it ran.
+struct SlowScan {
+    delay: Duration,
+    probe: std::sync::Mutex<Probe>,
+    calls: AtomicU32,
+}
+
+impl SlowScan {
+    fn new(delay: Duration, probe: Probe) -> Arc<Self> {
+        Arc::new(SlowScan {
+            delay,
+            probe: std::sync::Mutex::new(probe),
+            calls: AtomicU32::new(0),
+        })
+    }
+}
+
+impl canirun::ProcessScan for SlowScan {
+    fn scan(&self, _id: &str, _scope: &str) -> Scan {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        Scan::new(*self.probe.lock().unwrap(), vec![])
+    }
+}
+
+fn ctx_slow(dir: &Path, clock: Arc<FakeClock>, scan: Arc<SlowScan>) -> Context {
+    ctx(dir).with_clock(clock).with_scan(scan)
+}
+
+#[test]
+fn the_ledger_lock_is_not_held_while_the_reaper_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_child(dir.path(), &clock, "slow", |_| {});
+    let scan = SlowScan::new(Duration::from_millis(250), Probe::Gone);
+    let c = ctx_slow(dir.path(), clock.clone(), scan.clone());
+    let worker = {
+        let c = c.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            lock::snapshot(&c).unwrap();
+            t.elapsed()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(60));
+    let t = Instant::now();
+    drop(lock::ledger(&c).unwrap());
+    let waited = t.elapsed();
+    let scanned = worker.join().unwrap();
+    assert!(
+        scanned >= Duration::from_millis(400),
+        "the scan did not run long enough to prove anything: {scanned:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(100),
+        "the lock was held during the scan: {waited:?}"
+    );
+    // The answer was kept: the reap under the lock needs no scan of its own.
+    let before = scan.calls.load(Ordering::SeqCst);
+    let t = Instant::now();
+    assert!(reaped(&c).find("slow").is_none());
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(scan.calls.load(Ordering::SeqCst), before);
+}
+
+#[test]
+fn a_kept_entry_is_assessed_again_only_every_few_seconds_and_a_stale_keep_never_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_child(dir.path(), &clock, "held", |_| {});
+    let scan = SlowScan::new(Duration::ZERO, Probe::Alive);
+    let c = ctx_slow(dir.path(), clock.clone(), scan.clone());
+    assert!(reaped(&c).find("held").is_some());
+    let first = scan.calls.load(Ordering::SeqCst);
+    assert!(first >= 1);
+    // Polling at once, and just under the interval: no new scan.
+    assert!(reaped(&c).find("held").is_some());
+    clock.advance(Duration::from_secs(4));
+    assert!(reaped(&c).find("held").is_some());
+    assert_eq!(scan.calls.load(Ordering::SeqCst), first);
+    // The process is gone now, but the cached answer is a Keep: it cannot
+    // become a release without a fresh look.
+    *scan.probe.lock().unwrap() = Probe::Gone;
+    assert!(reaped(&c).find("held").is_some());
+    assert_eq!(scan.calls.load(Ordering::SeqCst), first);
+    clock.advance(Duration::from_secs(1));
+    assert!(reaped(&c).find("held").is_none());
+    assert!(scan.calls.load(Ordering::SeqCst) > first);
+}
+
+#[test]
+fn a_release_answer_is_not_acted_on_once_the_sidecar_has_changed_or_it_is_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_child(dir.path(), &clock, "chg", |_| {});
+    let scan = SlowScan::new(Duration::ZERO, Probe::Gone);
+    let c = ctx_slow(dir.path(), clock.clone(), scan.clone());
+    lock::refresh_verdicts(&c);
+    // The sidecar moved on after the assessment (a descendant was
+    // recorded): the answer no longer describes the entry.
+    let mut sc = sidecar(&c, "chg");
+    sc.recorded_at = Some(chrono::Utc::now());
+    managed::write_sidecar(&c, &sc).unwrap();
+    *scan.probe.lock().unwrap() = Probe::Alive;
+    assert!(reaped(&c).find("chg").is_some());
+}
+
+// ---- gc of managed receipts ----
+
+fn terminal_sidecar(
+    ctx: &Context,
+    id: &str,
+    ended: chrono::DateTime<chrono::Utc>,
+    in_ledger: bool,
+) -> Option<managed::OwnerGuard> {
+    let (_, g) = registered(
+        managed::register(
+            ctx,
+            &Config::default(),
+            &spec(Path::new("/"), id, "d", &["true"]),
+        )
+        .unwrap(),
+    );
+    let mut sc = sidecar(ctx, id);
+    sc.phase = Phase::Terminal;
+    sc.terminal = Some(managed::TerminalRecord {
+        kind: TerminalKind::Interrupted,
+        at: ended,
+        detail: None,
+    });
+    managed::write_sidecar(ctx, &sc).unwrap();
+    if in_ledger {
+        // The owner is still there, so nobody reaps the entry meanwhile.
+        return Some(g);
+    }
+    drop(g);
+    let mut l = ledger(ctx);
+    l.remove(id);
+    l.save(&ctx.paths.ledger_file()).unwrap();
+    None
+}
+
+#[test]
+fn gc_removes_old_terminal_receipts_and_stray_temp_files_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let now = chrono::Utc::now();
+    let days = |n| chrono::Duration::days(n);
+    terminal_sidecar(&ctx, "old", now - days(10), false);
+    terminal_sidecar(&ctx, "recent", now - days(1), false);
+    let _owner = terminal_sidecar(&ctx, "in-ledger", now - days(10), true);
+    // Not terminal, however old: never removed.
+    let (_, g) = registered(
+        managed::register(
+            &ctx,
+            &Config::default(),
+            &spec(dir.path(), "live", "d", &["true"]),
+        )
+        .unwrap(),
+    );
+    let mut sc = sidecar(&ctx, "live");
+    sc.registered_at = now - days(30);
+    managed::write_sidecar(&ctx, &sc).unwrap();
+    let mut l = ledger(&ctx);
+    l.remove("live");
+    l.save(&ctx.paths.ledger_file()).unwrap();
+    drop(g);
+    let m = ctx.paths.managed_dir();
+    std::fs::write(m.join("corrupt.json"), b"{").unwrap();
+    for (name, age) in [(".tmpOLD", 10), (".tmpNEW", 0)] {
+        let f = std::fs::File::create(m.join(name)).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(age * 86400 + 5))
+            .unwrap();
+    }
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 2);
+    let mut left: Vec<String> = std::fs::read_dir(&m)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            ".tmpNEW",
+            "corrupt.json",
+            "in-ledger.json",
+            "live.json",
+            "recent.json"
+        ]
+    );
+    assert_eq!(managed::gc_sidecars(&ctx, 7).unwrap(), 0);
+    // Nothing to read at all is nothing to remove.
+    let none = ctx_with_boot(tempfile::tempdir().unwrap().path(), None);
+    assert_eq!(managed::gc_sidecars(&none, 7).unwrap(), 0);
+}
+
+// ---- --force and a reused process group ----
+
+#[test]
+fn force_frees_a_group_held_only_by_strangers_and_never_one_that_is_the_runs() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    // An unrelated process that leads a group of its own: the recorded
+    // group number was reused by it.
+    let mut stranger = Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = stranger.id() as i32;
+    let stranger_ref = ProcRef {
+        pid: stranger.id(),
+        start_time: canirun::process::start_time(stranger.id()),
+    };
+    let set_group = move |sc: &mut managed::Sidecar| {
+        sc.child.as_mut().unwrap().pgid = Some(pgid);
+    };
+    let gone = ctx_with_fixed(dir.path(), clock.clone(), Scan::new(Probe::Gone, vec![]));
+    let marked = ctx_with_fixed(
+        dir.path(),
+        clock.clone(),
+        Scan::new(Probe::Alive, vec![stranger_ref]),
+    );
+    dead_child(dir.path(), &clock, "g1", set_group);
+    dead_child(dir.path(), &clock, "g2", set_group);
+    dead_child(dir.path(), &clock, "g3", move |sc| {
+        set_group(sc);
+        sc.descendants = vec![stranger_ref];
+    });
+    // Without --force the group keeps the entry.
+    let r = managed::resolve_checked_with(&gone, "g1", false).unwrap();
+    assert!(
+        !r.released && r.verdict.contains("DescendantsAlive"),
+        "{r:?}"
+    );
+    // A marked process: this run's, so never forced.
+    let r = managed::resolve_checked_with(&marked, "g2", true).unwrap();
+    assert!(!r.released && !r.forced, "{r:?}");
+    // A recorded descendant that is alive: never forced.
+    let r = managed::resolve_checked_with(&gone, "g3", true).unwrap();
+    assert!(!r.released && !r.forced, "{r:?}");
+    // Nothing marked, nothing recorded, the child gone: forced.
+    let r = managed::resolve_checked_with(&gone, "g1", true).unwrap();
+    assert!(r.released && r.forced, "{r:?}");
+    assert!(r.checked.contains("not this run's"), "{r:?}");
+    assert!(ledger(&gone).find("g1").is_none());
+    assert_eq!(sidecar(&gone, "g1").phase, Phase::Terminal);
+    stranger.kill().unwrap();
+    stranger.wait().unwrap();
 }

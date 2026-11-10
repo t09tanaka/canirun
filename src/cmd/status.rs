@@ -4,12 +4,17 @@ use canirun::display::{
     fmt_bytes, fmt_duration, is_idle, label, running_for, truncate, IDLE_AFTER, IDLE_CORES,
 };
 use canirun::error::Result;
+use canirun::ledger::Ledger;
 use canirun::{exec, lock, managed, Context};
 
 pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     let ledger = lock::load_reaped(ctx)?;
+    let format = Ledger::file_format(&ctx.paths.ledger_file());
     if json {
-        println!("{}", serde_json::to_string_pretty(&ledger)?);
+        // `ledger_format` is additive: what the file on disk is written as.
+        let mut v = serde_json::to_value(&ledger)?;
+        v["ledger_format"] = format.into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(0);
     }
     let now = ctx.clock.now();
@@ -31,6 +36,11 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     };
 
     println!("budget {used}/{} used", cfg.budget);
+    if format > canirun::ledger::SCHEMA_VERSION {
+        println!(
+            "ledger format v{format}: older canirun binaries refuse it until every managed entry is settled (`canirun resolve <id> [--force]`)"
+        );
+    }
     if let Some(s) = ctx.live.snapshot() {
         println!(
             "machine {} available, cpu {:.0}% busy",

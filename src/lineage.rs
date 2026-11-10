@@ -196,6 +196,43 @@ pub fn contains_root(table: &[Row], root: ProcRef) -> bool {
     })
 }
 
+/// Is the process `me` inside a managed run: in the run's process group, or
+/// itself or a descendant (by parent links in `table`) of the run's child or
+/// of a recorded descendant? A process that merely carries the run's
+/// environment (a daemon started inside the run, a server it left behind)
+/// is not, and must not skip the gate. A pid is only matched together with
+/// its start time, and a recorded process without one matches nothing.
+pub fn inside_run(
+    table: &[Row],
+    me: u32,
+    my_pgid: Option<i32>,
+    run_pgid: Option<i32>,
+    child: Option<ProcRef>,
+    descendants: &[ProcRef],
+) -> bool {
+    if my_pgid.is_some() && my_pgid == run_pgid {
+        return true;
+    }
+    let mut at = me;
+    for _ in 0..=table.len() {
+        let Some(row) = table.iter().find(|r| r.proc.pid == at) else {
+            return false;
+        };
+        let known = child.iter().chain(descendants);
+        if known
+            .into_iter()
+            .any(|k| k.start_time.is_some() && *k == row.proc)
+        {
+            return true;
+        }
+        match row.parent {
+            Some(parent) if parent != at => at = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// A look that cannot be believed: the read failed or came back empty, or it
 /// does not list the command although the command is still there
 /// (`root_gone` false). Nothing can be ruled out from it.
@@ -967,5 +1004,65 @@ mod tests {
         };
         let table = [row(10, 1, 300), row(11, 10, 301)];
         assert!(descendants_of(&table, reused, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_process_in_the_runs_group_or_below_its_child_is_inside() {
+        let table = [
+            row(10, 1, 100),
+            row(11, 10, 110),
+            row(12, 11, 120),
+            row(20, 1, 200),
+        ];
+        let child = Some(p(10, 100));
+        // The group alone.
+        assert!(inside_run(&table, 99, Some(7), Some(7), None, &[]));
+        // Itself, a child, and a grandchild of the run's child.
+        assert!(inside_run(&table, 10, Some(1), Some(7), child, &[]));
+        assert!(inside_run(&table, 12, Some(1), Some(7), child, &[]));
+        // Below a recorded descendant.
+        assert!(inside_run(&table, 12, None, None, None, &[p(11, 110)]));
+    }
+
+    #[test]
+    fn a_process_that_only_carries_the_environment_is_outside() {
+        let table = [row(10, 1, 100), row(20, 1, 200), row(21, 20, 210)];
+        let child = Some(p(10, 100));
+        assert!(!inside_run(&table, 21, Some(5), Some(7), child, &[]));
+        // No group on either side is no match.
+        assert!(!inside_run(&table, 21, None, None, child, &[]));
+        // Not in the table at all.
+        assert!(!inside_run(&table, 99, Some(5), Some(7), child, &[]));
+    }
+
+    #[test]
+    fn a_reused_pid_or_an_unknown_start_time_is_not_the_run() {
+        let table = [row(10, 1, 999), row(21, 10, 210)];
+        // Same pid, another start time: another process.
+        assert!(!inside_run(&table, 21, None, None, Some(p(10, 100)), &[]));
+        // A recorded process whose start time was never learned matches nothing.
+        let blind = ProcRef {
+            pid: 10,
+            start_time: None,
+        };
+        assert!(!inside_run(&table, 21, None, None, Some(blind), &[blind]));
+        // Not even when the table cannot tell either.
+        let unreadable = Row {
+            proc: blind,
+            parent: Some(1),
+        };
+        assert!(!inside_run(&[unreadable], 10, None, None, Some(blind), &[]));
+    }
+
+    #[test]
+    fn a_parent_loop_ends_the_walk() {
+        let table = [row(10, 10, 100), row(11, 12, 110), row(12, 11, 120)];
+        assert!(!inside_run(&table, 10, None, None, Some(p(5, 5)), &[]));
+        assert!(!inside_run(&table, 11, None, None, Some(p(5, 5)), &[]));
+        let orphan = Row {
+            proc: p(30, 300),
+            parent: None,
+        };
+        assert!(!inside_run(&[orphan], 30, None, None, Some(p(5, 5)), &[]));
     }
 }

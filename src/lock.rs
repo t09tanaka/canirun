@@ -96,6 +96,7 @@ pub struct Snapshot {
 /// are atomic renames, so it is never half-written) and dead entries are
 /// only left out of the returned copy.
 pub fn snapshot(ctx: &Context) -> Result<Snapshot> {
+    refresh_verdicts(ctx);
     let Some(_guard) = try_ledger(ctx)? else {
         let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
         // Without the lock nothing is reaped: a managed entry is kept
@@ -237,20 +238,96 @@ pub fn is_held(path: &Path) -> bool {
     }
 }
 
+/// One assessment of a ledger entry, kept by the context that made it.
+#[derive(Debug, Clone)]
+pub struct Cached {
+    /// The ledger entry it was made for (a new registration under the same
+    /// id has another sequence number).
+    pub seq: u64,
+    /// When the assessment began.
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub assessment: crate::managed::Assessment,
+}
+
+fn cache_of(ctx: &Context) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Cached>> {
+    ctx.reap_cache.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Assess, outside the ledger lock, every entry whose owner lease is not
+/// held, and remember the answers for [`reap_dead`]. A process scan takes
+/// hundreds of milliseconds, which nobody should wait for holding the
+/// lock, and an entry that is kept is looked at again only every
+/// [`crate::reap::REASSESS_SECS`] (per context), so waiters polling twice a
+/// second do not rescan every process each time. Call it before taking the
+/// lock; it takes none and writes nothing.
+pub fn refresh_verdicts(ctx: &Context) {
+    let Ok(ledger) = Ledger::load(&ctx.paths.ledger_file()) else {
+        return;
+    };
+    cache_of(ctx).retain(|id, _| ledger.find(id).is_some());
+    for e in &ledger.entries {
+        if lease_is_held(ctx, &e.id) {
+            cache_of(ctx).remove(&e.id);
+            continue;
+        }
+        let now = ctx.clock.now();
+        let prev = cache_of(ctx)
+            .get(&e.id)
+            .filter(|c| c.seq == e.seq)
+            .map(|c| {
+                (
+                    c.assessment.verdict.is_release(),
+                    (now - c.at).num_seconds(),
+                )
+            });
+        if !crate::reap::reassess_due(prev, ctx.reassess_secs) {
+            continue;
+        }
+        let assessment = crate::managed::assess(ctx, &e.id);
+        cache_of(ctx).insert(
+            e.id.clone(),
+            Cached {
+                seq: e.seq,
+                at: now,
+                assessment,
+            },
+        );
+    }
+}
+
+/// The assessment to act on for `e` under the lock, when it is a release
+/// reached recently, for this very entry and for the sidecar as it is now.
+/// A kept answer is never returned: the entry is only released on a fresh
+/// assessment that said so.
+fn usable_release(ctx: &Context, e: &crate::ledger::Entry) -> Option<crate::managed::Assessment> {
+    let c = cache_of(ctx).get(&e.id)?.clone();
+    let age = (ctx.clock.now() - c.at).num_seconds();
+    (c.seq == e.seq
+        && c.assessment.verdict.is_release()
+        && crate::reap::release_usable(age)
+        && crate::managed::load_sidecar(ctx, &e.id) == c.assessment.sidecar)
+        .then_some(c.assessment)
+}
+
 /// Remove ledger entries whose owner is gone, and their lease files.
 /// Returns the ids removed. Caller holds the ledger lock.
 ///
 /// A plain entry is gone when its lease is not held. A managed entry (one
 /// with a sidecar, see [`crate::managed`]) also needs its child process
 /// tree to be known stopped, or the machine to have rebooted; until then it
-/// stays, charge and all.
+/// stays, charge and all. That proof needs process scans, which are not made
+/// here: they are made by [`refresh_verdicts`] before the lock is taken, and
+/// a managed entry is released here only on such a recent answer that still
+/// matches the entry and its sidecar. Without one, only what needs no scan
+/// (a plain entry, a finished or never-launched run, a reboot) is decided.
 pub fn reap_dead(ctx: &Context, ledger: &mut Ledger) -> Vec<String> {
     let mut dead: Vec<String> = Vec::new();
     for e in &ledger.entries {
         if lease_is_held(ctx, &e.id) {
             continue;
         }
-        let a = crate::managed::assess(ctx, &e.id);
+        let a =
+            usable_release(ctx, e).unwrap_or_else(|| crate::managed::assess_unscanned(ctx, &e.id));
         if a.verdict.is_release() {
             crate::managed::settle_released(ctx, &a);
             dead.push(e.id.clone());
@@ -258,6 +335,7 @@ pub fn reap_dead(ctx: &Context, ledger: &mut Ledger) -> Vec<String> {
     }
     for id in &dead {
         ledger.remove(id);
+        cache_of(ctx).remove(id);
         let _ = std::fs::remove_file(ctx.paths.lease_file(id));
     }
     dead

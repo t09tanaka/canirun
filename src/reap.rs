@@ -169,6 +169,35 @@ pub fn verdict(i: &Inputs) -> Verdict {
     }
 }
 
+/// How often an entry kept for want of proof is looked at again.
+pub const REASSESS_SECS: i64 = 5;
+
+/// How long a release verdict stays good for acting on. It is acted on
+/// within moments of being reached; one that has waited longer is
+/// assessed again.
+pub const RELEASE_VALID_SECS: i64 = 10;
+
+/// Must the entry be assessed (scanned) again, given its last assessment?
+/// `prev` is `(was a release, age in seconds)`; `None` when it was never
+/// assessed by this process. A kept entry is looked at again once its last
+/// look is `interval_secs` old, so waiters polling twice a second do not
+/// rescan every process each time. A release is looked at again as soon as
+/// it is too old to act on, and an age below zero (the clock went back) is
+/// never trusted.
+pub fn reassess_due(prev: Option<(bool, i64)>, interval_secs: i64) -> bool {
+    match prev {
+        None => true,
+        Some((_, age)) if age < 0 => true,
+        Some((true, age)) => !release_usable(age),
+        Some((false, age)) => age >= interval_secs,
+    }
+}
+
+/// May a release verdict reached `age_secs` ago be acted on?
+pub fn release_usable(age_secs: i64) -> bool {
+    (0..RELEASE_VALID_SECS).contains(&age_secs)
+}
+
 /// What a supervisor taking over an existing registration does with the
 /// boot id the sidecar recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +207,7 @@ pub enum Adopt {
     /// Nothing was launched: stamp the current boot id and take it over.
     RefreshBoot,
     /// The recorded run began on an earlier boot. Whatever it started is
-    /// gone with that boot, so it is settled and the id registered afresh.
+    /// gone with that boot, so it is settled as interrupted (the id stays used up).
     /// Taking it over with the old boot id would have the reaper's reboot
     /// shortcut free the budget of a child that now runs on this boot.
     SettleStale,
@@ -410,5 +439,42 @@ mod tests {
             assert_eq!(adopt(p, Some("b0"), None), Adopt::Keep);
             assert_eq!(adopt(p, None, None), Adopt::Keep);
         }
+    }
+
+    #[test]
+    fn a_kept_entry_is_reassessed_only_once_the_interval_has_passed() {
+        assert!(reassess_due(None, REASSESS_SECS));
+        assert!(!reassess_due(Some((false, 0)), REASSESS_SECS));
+        assert!(!reassess_due(
+            Some((false, REASSESS_SECS - 1)),
+            REASSESS_SECS
+        ));
+        assert!(reassess_due(Some((false, REASSESS_SECS)), REASSESS_SECS));
+        assert!(reassess_due(Some((false, 3600)), REASSESS_SECS));
+        // Interval 0 (tests, tools that want a fresh look) is always due.
+        assert!(reassess_due(Some((false, 0)), 0));
+    }
+
+    #[test]
+    fn a_release_is_reassessed_once_it_is_too_old_to_act_on() {
+        assert!(!reassess_due(Some((true, 0)), REASSESS_SECS));
+        assert!(!reassess_due(
+            Some((true, RELEASE_VALID_SECS - 1)),
+            REASSESS_SECS
+        ));
+        assert!(reassess_due(
+            Some((true, RELEASE_VALID_SECS)),
+            REASSESS_SECS
+        ));
+        assert!(release_usable(0));
+        assert!(release_usable(RELEASE_VALID_SECS - 1));
+        assert!(!release_usable(RELEASE_VALID_SECS));
+        assert!(!release_usable(-1));
+    }
+
+    #[test]
+    fn a_clock_that_went_back_is_never_trusted() {
+        assert!(reassess_due(Some((false, -1)), REASSESS_SECS));
+        assert!(reassess_due(Some((true, -1)), REASSESS_SECS));
     }
 }

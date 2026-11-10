@@ -107,15 +107,32 @@ impl Ledger {
         }
     }
 
+    /// The format version the ledger file on disk is written in: 1 (readable
+    /// by older binaries) or 2 (holds a managed entry). A missing or
+    /// unreadable file is the plain format, which is what the next save
+    /// writes when no managed entry exists.
+    pub fn file_format(path: &Path) -> u32 {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("version")?.as_u64())
+            .map_or(SCHEMA_VERSION, |v| v as u32)
+    }
+
     /// Atomic write: temp file in the same directory, then rename.
     pub fn save(&self, path: &Path) -> Result<()> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dir)?;
         let managed_dir = dir.join("managed");
-        let managed = self
-            .entries
-            .iter()
-            .any(|e| managed_dir.join(format!("{}.json", e.id)).exists());
+        // Fail closed: a sidecar that cannot be looked for (a permission or
+        // I/O error) counts as there, so an older binary is never handed a
+        // v1 ledger that hides a managed entry.
+        let managed = self.entries.iter().any(|e| {
+            managed_dir
+                .join(format!("{}.json", e.id))
+                .try_exists()
+                .unwrap_or(true)
+        });
         let wire = if managed {
             Wire {
                 version: MANAGED_SCHEMA_VERSION,
@@ -274,6 +291,40 @@ mod tests {
         assert_eq!(old.entries.len(), 1);
         let json = save_with_sidecars(&Ledger::default(), d.path(), &[]);
         assert!(serde_json::from_slice::<old::Ledger>(&json).is_ok());
+    }
+
+    #[test]
+    fn the_format_on_disk_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ledger.json");
+        assert_eq!(Ledger::file_format(&path), SCHEMA_VERSION);
+        let mut l = Ledger::default();
+        l.entries.push(entry("m", 1));
+        save_with_sidecars(&l, d.path(), &["m"]);
+        assert_eq!(Ledger::file_format(&path), MANAGED_SCHEMA_VERSION);
+        save_with_sidecars(&l, tempfile::tempdir().unwrap().path(), &[]);
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(Ledger::file_format(&path), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_managed_directory_that_cannot_be_checked_counts_as_managed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut l = Ledger::default();
+        l.entries.push(entry("a", 1));
+        // `managed` is a file, so looking inside it is an error (not "no
+        // such file"): the ledger must be written as v2.
+        std::fs::write(d.path().join("managed"), b"").unwrap();
+        l.save(&d.path().join("ledger.json")).unwrap();
+        let json = std::fs::read(d.path().join("ledger.json")).unwrap();
+        assert!(serde_json::from_slice::<old::Ledger>(&json).is_err());
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["version"], MANAGED_SCHEMA_VERSION);
+        // No managed directory at all is a plain ledger.
+        let e = tempfile::tempdir().unwrap();
+        let json = save_with_sidecars(&l, e.path(), &[]);
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["version"], SCHEMA_VERSION);
     }
 
     #[test]

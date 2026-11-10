@@ -87,10 +87,12 @@ pub fn nested_lease_is_live(ctx: &Context, id: &str) -> Result<bool> {
 /// The id a caller running inside a gated command should run under, if its
 /// environment shows it is nested: the live running lease it names
 /// (`CANIRUN_LEASE`), or a managed run of this state directory whose child
-/// has started (`CANIRUN_MANAGED_ID` and `CANIRUN_MANAGED_SCOPE`). The
-/// second needs no lease: when the supervisor died the tree it left is
-/// still the run's, and gating its own sub-commands would wait for a budget
-/// that tree itself holds.
+/// has started (`CANIRUN_MANAGED_ID` and `CANIRUN_MANAGED_SCOPE`) and the
+/// caller is inside it (its process group, or below its child or a recorded
+/// descendant). The second needs no lease: when the supervisor died the tree
+/// it left is still the run's, and gating its own sub-commands would wait
+/// for a budget that tree itself holds. The environment alone is not
+/// enough, since whatever the run started inherits it.
 pub fn nested_run_id(
     ctx: &Context,
     lease: Option<&str>,
@@ -103,25 +105,47 @@ pub fn nested_run_id(
         }
     }
     if let (Some(id), Some(scope)) = (managed_id, managed_scope) {
-        if scope == crate::marker::scope(ctx.paths.state_dir()) && managed_child_started(ctx, id) {
+        if scope == crate::marker::scope(ctx.paths.state_dir()) && inside_started_run(ctx, id) {
             return Ok(Some(id.to_string()));
         }
     }
     Ok(None)
 }
 
-/// Does the ledger hold `id` with its sidecar at `ChildStarted`?
-fn managed_child_started(ctx: &Context, id: &str) -> bool {
+/// Is the calling process inside the managed run `id`: the ledger holds it,
+/// its sidecar is at `ChildStarted`, and the caller is in the run's process
+/// group or below its child or a recorded descendant? The environment
+/// pair alone is not enough: anything the run started inherits it, a
+/// long-lived server or daemon included.
+fn inside_started_run(ctx: &Context, id: &str) -> bool {
     // A plain read: saves are atomic renames, and a stale copy can only
     // skip the gate for a run that did start.
     let in_ledger = crate::ledger::Ledger::load(&ctx.paths.ledger_file())
         .map(|l| l.find(id).is_some())
         .unwrap_or(false);
-    in_ledger
-        && matches!(
-            crate::managed::load_sidecar(ctx, id),
-            crate::managed::Loaded::Ok(sc) if sc.phase == crate::receipt::Phase::ChildStarted
-        )
+    if !in_ledger {
+        return false;
+    }
+    let crate::managed::Loaded::Ok(sc) = crate::managed::load_sidecar(ctx, id) else {
+        return false;
+    };
+    if sc.phase != crate::receipt::Phase::ChildStarted {
+        return false;
+    }
+    let child = sc.child.as_ref().map(|c| crate::marker::ProcRef {
+        pid: c.pid,
+        start_time: c.start_time,
+    });
+    let table = crate::process::TableReader::new().read();
+    let my_pgid = Some(unsafe { libc::getpgrp() });
+    crate::lineage::inside_run(
+        &table,
+        std::process::id(),
+        my_pgid,
+        sc.child.as_ref().and_then(|c| c.pgid),
+        child,
+        &sc.descendants,
+    )
 }
 
 /// How a gated run ended.

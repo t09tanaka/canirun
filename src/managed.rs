@@ -49,7 +49,12 @@
 //!
 //! A `command_id` is single use: once its terminal outcome is recorded,
 //! registering it again returns [`Registration::AlreadyTerminal`] and never
-//! creates an entry.
+//! creates an entry. That holds for as long as the receipt (the sidecar) is
+//! kept: `canirun gc` removes the receipt of a command that ended more than
+//! `managed_keep_days` (default 7) ago, after which the id is free again.
+//! A run that was past `Registered` when the machine rebooted is settled the
+//! same way whether the reaper or a new registration notices first: as
+//! interrupted, and never run again.
 
 use crate::admit::{self, Decision, Limits, QueueEntry, Reason, State};
 use crate::error::{Error, Result};
@@ -263,11 +268,35 @@ pub struct Assessment {
 /// managed entry with no lease holder, and only as far as the answer can
 /// still change. Writes nothing.
 pub fn assess(ctx: &Context, id: &str) -> Assessment {
-    assess_with(ctx, id, false)
+    assess_with(ctx, id, false, true, false)
+}
+
+/// [`assess`] without any process scan: where a scan would be needed the
+/// answer stays unknown, so it can keep an entry but never release one that
+/// needs the scan. Cheap enough to run under the ledger lock.
+pub(crate) fn assess_unscanned(ctx: &Context, id: &str) -> Assessment {
+    assess_with(ctx, id, false, false, false)
 }
 
 /// [`assess`], for a person settling the entry by hand when `manual`.
-fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
+/// `scan` false skips the (slow) marker scans. `ignore_group` leaves the
+/// recorded process group out of the answer (the group number may have been
+/// reused by unrelated processes): the child, the marker and the recorded
+/// descendants decide alone.
+fn assess_with(
+    ctx: &Context,
+    id: &str,
+    manual: bool,
+    scan: bool,
+    ignore_group: bool,
+) -> Assessment {
+    let settled = |tracked: &Tracked| {
+        if scan {
+            runner::settled_scan(ctx, id, tracked)
+        } else {
+            crate::marker::Scan::new(Probe::Unknown, Vec::new())
+        }
+    };
     let lease_held = lock::lease_is_held(ctx, id);
     let sidecar = load_sidecar(ctx, id);
     let (facts, child) = match &sidecar {
@@ -305,11 +334,15 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
             } => {
                 if let Some(c) = &child {
                     child_probe = process::probe_child(c);
-                    group_probe = process::probe_group(c.pgid);
+                    group_probe = if ignore_group {
+                        Probe::Gone
+                    } else {
+                        process::probe_group(c.pgid)
+                    };
                 }
                 // A live child or group already keeps the entry.
                 if child_probe != Probe::Alive && group_probe != Probe::Alive {
-                    let scan = runner::settled_scan(ctx, id, &tracked);
+                    let scan = settled(&tracked);
                     marker = scan.probe;
                     // Nothing marked or recorded runs (a recorded one alive
                     // would make the scan `Alive`) and the child and its
@@ -336,7 +369,7 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                 launch_age_secs,
                 ..
             } if manual || reap::grace_passed(*launch_age_secs) => {
-                let scan = runner::settled_scan(ctx, id, &tracked);
+                let scan = settled(&tracked);
                 // A clear scan does not show a child whose environment the
                 // OS hides. One that began after the intent and is an
                 // orphan (or the dead supervisor's child) may be it.
@@ -350,9 +383,7 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
                     scan.probe
                 };
             }
-            SidecarFacts::Corrupt if manual => {
-                marker = runner::settled_scan(ctx, id, &Tracked::default()).probe
-            }
+            SidecarFacts::Corrupt if manual => marker = settled(&Tracked::default()).probe,
             _ => {}
         }
     }
@@ -371,9 +402,16 @@ fn assess_with(ctx: &Context, id: &str, manual: bool) -> Assessment {
 /// On release by the reaper, settle a managed sidecar that has no terminal
 /// yet, so the owner's caller can learn how the command ended.
 pub(crate) fn settle_released(ctx: &Context, a: &Assessment) {
-    let Loaded::Ok(sc) = &a.sidecar else { return };
+    let _ = try_settle_released(ctx, a);
+}
+
+/// [`settle_released`], telling whether the outcome could be written.
+fn try_settle_released(ctx: &Context, a: &Assessment) -> Result<()> {
+    let Loaded::Ok(sc) = &a.sidecar else {
+        return Ok(());
+    };
     if sc.phase == Phase::Terminal {
-        return;
+        return Ok(());
     }
     let kind = if sc.phase == Phase::Registered {
         TerminalKind::Abandoned
@@ -381,13 +419,14 @@ pub(crate) fn settle_released(ctx: &Context, a: &Assessment) {
         TerminalKind::Interrupted
     };
     let at = ctx.clock.now();
-    let _ = advance_sidecar(ctx, &sc.command_id, Phase::Terminal, |s| {
+    advance_sidecar(ctx, &sc.command_id, Phase::Terminal, |s| {
         s.terminal = Some(TerminalRecord {
             kind,
             at,
             detail: Some(format!("released by the reaper: {:?}", a.verdict)),
         });
-    });
+    })
+    .map(|_| ())
 }
 
 /// How `inspect` shows a managed entry.
@@ -528,6 +567,7 @@ pub(crate) fn push_entry(
                 return Ok(Pushed::Interrupted(sig));
             }
         }
+        lock::refresh_verdicts(ctx);
         let _guard = match stop {
             Some(_) => match lock::try_ledger(ctx)? {
                 Some(g) => g,
@@ -554,7 +594,11 @@ pub(crate) fn push_entry(
                     )))
                 }
                 (None, Loaded::Ok(sc)) => {
-                    if sc.spec_digest != m.spec_digest {
+                    // A sidecar settled by hand with nothing readable left
+                    // has no digest to compare: it still answers for its id
+                    // (a finished outcome), instead of blocking it.
+                    let unknown_settled = sc.phase == Phase::Terminal && sc.spec_digest.is_empty();
+                    if sc.spec_digest != m.spec_digest && !unknown_settled {
                         return Err(Error::Conflict(format!(
                             "command {id} was used with a different spec digest"
                         )));
@@ -584,21 +628,24 @@ pub(crate) fn push_entry(
             let boot = ctx.boot.boot_id();
             match reap::adopt(sc.phase, sc.boot_id.as_deref(), boot.as_deref()) {
                 reap::Adopt::SettleStale => {
-                    // The old run belongs to an earlier boot: record that,
-                    // drop its entry and fall through to a fresh
-                    // registration under this boot.
-                    let at = ctx.clock.now();
-                    advance_sidecar(ctx, id, Phase::Terminal, |s| {
-                        s.terminal = Some(TerminalRecord {
-                            kind: TerminalKind::Interrupted,
-                            at,
-                            detail: Some(format!(
-                                "released: {}, then registered again",
-                                describe(Verdict::Release(reap::Release::BootChanged))
-                            )),
-                        });
-                    })?;
+                    // The run belongs to an earlier boot and got past
+                    // Registered: its outcome is recorded exactly as the
+                    // reaper records it, and the id stays used up. The
+                    // caller learns it was interrupted; it is never run
+                    // again under the same id.
+                    let a = Assessment {
+                        verdict: Verdict::Release(reap::Release::BootChanged),
+                        sidecar: Loaded::Ok(sc),
+                    };
+                    try_settle_released(ctx, &a)?;
                     ledger.remove(id);
+                    ledger.save(&ctx.paths.ledger_file())?;
+                    return match load_sidecar(ctx, id) {
+                        Loaded::Ok(done) => Ok(Pushed::Terminal(done)),
+                        _ => Err(Error::Ledger(format!(
+                            "sidecar for {id} is missing or unreadable"
+                        ))),
+                    };
                 }
                 adopt => {
                     if adopt == reap::Adopt::RefreshBoot {
@@ -741,6 +788,9 @@ pub enum TryAdmit {
 /// One admission attempt for the registered `id`, as of the latest ledger
 /// state under its lock. `waited_secs` is the queue age to judge with.
 pub fn try_admit(ctx: &Context, limits: Limits, id: &str, waited_secs: f64) -> Result<TryAdmit> {
+    // Process scans for entries kept without a lease holder happen here,
+    // outside the lock (and at most every few seconds per entry).
+    lock::refresh_verdicts(ctx);
     // Phase 1 (under the lock, no OS sampling): queue position and budget.
     // Only a budget-admissible head pays for a live snapshot.
     let (first, queue, est, holders, predicted_rss) = {
@@ -1018,6 +1068,16 @@ pub fn resolve(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> Res
     settle_by_hand(ctx, id, kind, detail)
 }
 
+/// The `spec_digest` of a sidecar that cannot be parsed as a whole, when the
+/// file is still JSON that names one; empty otherwise.
+fn salvaged_digest(ctx: &Context, id: &str) -> String {
+    std::fs::read(ctx.paths.managed_file(id))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("spec_digest")?.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
 /// The body of [`resolve`], with the ledger lock held and the lease known
 /// to be free.
 fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> Result<()> {
@@ -1040,7 +1100,7 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
                 &Sidecar {
                     version: SIDECAR_VERSION,
                     command_id: id.to_string(),
-                    spec_digest: String::new(),
+                    spec_digest: salvaged_digest(ctx, id),
                     phase: Phase::Terminal,
                     boot_id: ctx.boot.boot_id(),
                     registered_at: at,
@@ -1130,8 +1190,10 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
 /// *could not be checked* (an unreadable process, descendants that did not
 /// fit the record, a hidden process that may be the child) is released
 /// anyway, recorded as `Interrupted` with `forced: <reason>`. Nothing known
-/// to be running is ever forced: a held lease, a running child, group,
-/// marked process or recorded descendant keeps the entry.
+/// to be running is ever forced: a held lease, a running child, marked
+/// process or recorded descendant keeps the entry. A live process group
+/// alone does not, when none of its members is the child, carries the
+/// run's id or is a recorded descendant: the group number was reused.
 pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Resolution> {
     check_id("command_id", id)?;
     let _guard = lock::ledger(ctx)?;
@@ -1156,7 +1218,7 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
             checked: "there is no ledger entry with this id".into(),
         });
     }
-    let a = assess_with(ctx, id, true);
+    let a = assess_with(ctx, id, true, true, false);
     let phase = match &a.sidecar {
         Loaded::Ok(sc) => Some(sc.phase),
         _ => None,
@@ -1173,6 +1235,25 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
     };
     if force && a.verdict == Verdict::Keep(reap::Keep::ProbeUnknown) {
         let detail = format!("forced: {}", describe(a.verdict));
+        settle_by_hand(ctx, id, TerminalKind::Interrupted, &detail)?;
+        r.released = true;
+        r.forced = true;
+        r.checked = detail;
+        return Ok(r);
+    }
+    // A group that is only held by processes that are not this run's (a
+    // reused group number): nothing marked, nothing recorded, and the child
+    // itself gone. `--force` frees it; anything else would keep the budget
+    // for as long as the unrelated group lives.
+    if force
+        && a.verdict == Verdict::Keep(reap::Keep::DescendantsAlive)
+        && assess_with(ctx, id, true, true, true).verdict
+            == Verdict::Release(reap::Release::Stopped)
+    {
+        let detail =
+            "forced: the recorded process group is held by processes that are not this run's \
+             (none carries its id, none is a recorded descendant, and the child is gone)"
+                .to_string();
         settle_by_hand(ctx, id, TerminalKind::Interrupted, &detail)?;
         r.released = true;
         r.forced = true;
@@ -1208,24 +1289,76 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
     Ok(r)
 }
 
-/// Remove the oldest `.applied` markers, keeping the newest `keep` (the
-/// history keeps as many records, so a marker older than that guards a
-/// measurement whose record is gone anyway). Returns how many were removed.
-pub fn gc_measurements(ctx: &Context, keep: usize) -> Result<usize> {
+/// Trim the history to `keep` records per key, under the history lock so a
+/// concurrent [`record_measurement`] cannot append between the read and the
+/// rewrite (which would drop the record but leave its `.applied` marker).
+/// Returns the records dropped.
+pub fn trim_history(ctx: &Context, keep: usize) -> Result<usize> {
+    let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
+    history::trim(ctx.paths.history_file(), keep)
+}
+
+/// Remove the `.applied` markers whose measurement no longer has a record in
+/// the history. A marker is kept for as long as its record is: the history
+/// keeps the newest records per key ([`history::trim`]), and what it still
+/// holds is exactly what a replayed measurement could duplicate. Run after
+/// [`trim_history`]. Returns how many were removed.
+pub fn gc_measurements(ctx: &Context) -> Result<usize> {
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
     let Ok(rd) = std::fs::read_dir(ctx.paths.measurements_dir()) else {
         return Ok(0);
     };
-    let mut applied: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "applied"))
-        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+    let recorded: std::collections::HashSet<String> = history::read_all(ctx.paths.history_file())?
+        .into_iter()
+        .filter_map(|r| r.measurement_id)
         .collect();
-    applied.sort_by(|a, b| b.cmp(a));
     let mut removed = 0;
-    for (_, p) in applied.into_iter().skip(keep) {
-        if std::fs::remove_file(&p).is_ok() {
+    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+        let stem = p.file_stem().and_then(|s| s.to_str());
+        let applied = p.extension().is_some_and(|x| x == "applied");
+        if applied
+            && stem.is_some_and(|s| !recorded.contains(s))
+            && std::fs::remove_file(&p).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove the sidecars of managed commands that ended more than `keep_days`
+/// ago and have no ledger entry (the receipt of a finished run is only
+/// needed so a repeated registration finds its outcome), and temporary files
+/// of that age that an interrupted write left behind. A sidecar that is not
+/// terminal, one that cannot be read, and one whose entry is still in the
+/// ledger are never removed. Returns how many files were removed.
+pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
+    // Under the ledger lock, so a registration cannot slip in between the
+    // look at the ledger and the removal.
+    let _guard = lock::ledger(ctx)?;
+    let Ok(rd) = std::fs::read_dir(ctx.paths.managed_dir()) else {
+        return Ok(0);
+    };
+    let ledger = Ledger::load(&ctx.paths.ledger_file())?;
+    let cutoff = ctx.clock.now() - chrono::Duration::days(keep_days as i64);
+    let mut removed = 0;
+    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+        let old = match p.file_stem().and_then(|s| s.to_str()) {
+            Some(id) if p.extension().is_some_and(|x| x == "json") => match load_sidecar(ctx, id) {
+                Loaded::Ok(sc) => {
+                    sc.phase == Phase::Terminal
+                        && ledger.find(id).is_none()
+                        && sc.terminal.as_ref().map_or(sc.registered_at, |t| t.at) < cutoff
+                }
+                _ => false,
+            },
+            // Not a sidecar: what a crashed atomic write leaves.
+            _ => p
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| DateTime::<Utc>::from(t) < cutoff),
+        };
+        if old && std::fs::remove_file(&p).is_ok() {
             removed += 1;
         }
     }

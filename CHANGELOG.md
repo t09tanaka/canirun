@@ -11,8 +11,9 @@ the minor version).
 
 - Adopting a registration after a reboot no longer carries the old boot id
   forward: an unlaunched one is refreshed, one that reached its launch is
-  settled as interrupted and registered afresh (its earlier sidecar record
-  is replaced), and the boot id is stamped again at the launch intent and at
+  settled as interrupted exactly as the reaper settles it (the id stays used
+  up and registering it again answers `AlreadyTerminal`; it is never run
+  again), and the boot id is stamped again at the launch intent and at
   the spawn. Otherwise the reaper's reboot shortcut could free the budget of
   a child that runs on the new boot.
 - `canirun resolve` also settles a sidecar that is not terminal but has no
@@ -20,8 +21,34 @@ the minor version).
 - `canirun exec` run from inside a managed command whose child has started
   (`CANIRUN_MANAGED_ID` and `CANIRUN_MANAGED_SCOPE` of this state directory)
   runs ungated even after the supervisor and its lease are gone, instead of
-  waiting for a budget its own tree holds.
+  waiting for a budget its own tree holds. The caller must be inside the
+  run (its process group, or below its child or a recorded descendant): a
+  process that merely inherited the two variables is gated as usual.
+- The reaper no longer scans processes under the ledger lock: the scans run
+  before the lock is taken, an entry that is kept is assessed again at most
+  every 5 seconds, and only a recent release answer that still matches the
+  entry and its sidecar is acted on.
+- `canirun gc` trims the history under the history lock, removes a
+  measurement marker only once its record is gone, and removes the receipts
+  of managed commands that ended more than `managed_keep_days` (default 7)
+  ago, with no ledger entry. It never removes one that has not ended.
+- `canirun resolve --force` releases an entry whose only sign of life is a
+  process group that was reused by unrelated processes (the child is gone,
+  none carries the run's id, none is a recorded descendant).
+- The ledger is written as version 2 whenever the `managed` directory cannot
+  be checked, instead of as version 1. A sidecar settled by hand with
+  nothing readable left no longer blocks its id with a conflict.
+- To go back to an older binary: settle every managed entry (`canirun
+  resolve <id>`, or `--force`); the next save then writes version 1 and
+  older binaries work again. Until then an older binary exits 2 on every
+  command. `canirun status --json` has an additive `ledger_format` field
+  (and `status` prints the format when it is 2).
 
+- Library, pre-1.0 breaking: `managed::gc_measurements(ctx)` no longer takes
+  a count (a marker lives as long as its record); `managed::trim_history`,
+  `managed::gc_sidecars` and `lock::refresh_verdicts` are new; `Context` gained
+  `reap_cache` and `reassess_secs` (a struct literal built outside the crate no
+  longer compiles; use `Context::new`), and `Config` gained `managed_keep_days`.
 - `runner::Outcome` gained `tracked_to_exit_at`, and `tracker::Record` now
   takes a stamp flag and returns whether it persisted; `Tracker::finish`
   takes whether the command was reaped. Pre-1.0: breaking.

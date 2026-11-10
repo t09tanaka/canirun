@@ -6,6 +6,7 @@
 use crate::admit::LiveSnapshot;
 use crate::paths::Paths;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -221,6 +222,13 @@ pub struct Context {
     pub tmp_roots: Vec<String>,
     /// How long to wait for the ledger lock before giving up.
     pub ledger_lock_timeout: Duration,
+    /// This context's last assessment of each ledger entry that has no
+    /// lease holder (see [`crate::lock::refresh_verdicts`]). Shared between
+    /// clones; never shared between processes, so a process always forms
+    /// its own view before it releases anything.
+    pub reap_cache: Arc<Mutex<HashMap<String, crate::lock::Cached>>>,
+    /// Seconds before a kept entry is assessed again.
+    pub reassess_secs: i64,
 }
 
 impl Context {
@@ -255,6 +263,8 @@ impl Context {
             scan: Arc::new(SystemScan),
             tmp_roots: Vec::new(),
             ledger_lock_timeout: crate::lock::LEDGER_LOCK_TIMEOUT,
+            reap_cache: Arc::default(),
+            reassess_secs: crate::reap::REASSESS_SECS,
         }
     }
 
@@ -285,6 +295,11 @@ impl Context {
 
     pub fn with_tmp_roots(mut self, roots: Vec<String>) -> Self {
         self.tmp_roots = roots;
+        self
+    }
+
+    pub fn with_reassess_secs(mut self, secs: i64) -> Self {
+        self.reassess_secs = secs;
         self
     }
 
