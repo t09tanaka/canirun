@@ -354,8 +354,9 @@ What is not found, and what follows:
   Only a hidden process that started in a window counts: from the child's
   start (the launch intent when that is unknown) to two seconds after the
   last time the recorder wrote (`recorded_at` in the sidecar). That end
-  applies only when the supervisor saw the command exit and took the last
-  look (`tracked_to_exit` in the sidecar); with no record, or when the
+  applies only when the supervisor saw the command exit, took the last
+  look and confirmed everything it left stopped (`tracked_to_exit` in the
+  sidecar, stamped after that stop); with no record, or when the
   supervisor died mid-run (the command may have forked later), the window
   has no end. Such a hold is expected, not a bug,
   and the way out is `canirun resolve <id> --force`, after checking that

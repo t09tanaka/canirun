@@ -20,8 +20,9 @@ the minor version).
 - A failed write of the descendant record is retried every tick until one
   succeeds (it used to be dropped, and the heartbeat clock advanced anyway).
 - The hidden-orphan window ends at `recorded_at` + 2 s only when the
-  supervisor saw the command exit and took the last look (new sidecar field
-  `tracked_to_exit`). If the supervisor died mid-run the window is open
+  supervisor saw the command exit, took the last look and then confirmed
+  the group and anything marked stopped, with nothing left (new sidecar
+  field `tracked_to_exit`, stamped after that stop). If the supervisor died mid-run the window is open
   from the child's start, so a hidden process forked late holds the entry
   (`canirun resolve <id> --force` is the way out).
 - The last look is told the command was reaped (`wait4`) instead of asking
@@ -30,8 +31,8 @@ the minor version).
 - A failed look no longer stamps `recorded_at`.
 - `recorded_at` is a heartbeat, not the time of the last growth: every good
   look stamps it (written at most about once a second), and the spawn writes
-  the first one, so every managed run has an upper bound on the
-  hidden-orphan window.
+  the first one. That first stamp starts the heartbeat; it is not an upper
+  bound on the window (only `tracked_to_exit` ends it).
 - A look at the process table that fails, is empty, or does not list a
   command that still runs is persisted at once as a recorder failure
   (`descendants_truncated`), without dropping what was recorded, so a

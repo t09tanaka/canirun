@@ -302,7 +302,6 @@ pub fn run_with(
         None if spawn.own_process_group && spawn.marker_id.is_some() => (Tracked::unknown(), false),
         None => (Tracked::default(), false),
     };
-    let tracked_to_exit_at = covered.then(|| ctx.clock.now());
     // A recorder that failed left nothing in the sidecar to say so: write
     // the unknown there too, or the reaper would read an empty record as
     // "nothing was running".
@@ -321,6 +320,11 @@ pub fn run_with(
             .is_none_or(|id| stop_marked(ctx, id, &tracked));
         !(group && marked)
     };
+    // Taken only now, after the group and the marked processes are confirmed
+    // stopped, and only if nothing was left: a daemon that outlived the
+    // root could still have forked a hidden child before this point.
+    let tracked_to_exit_at =
+        crate::lineage::closed_at(covered, descendants_left, || ctx.clock.now());
 
     let exit = if libc::WIFEXITED(status) {
         Exit::Code(libc::WEXITSTATUS(status))

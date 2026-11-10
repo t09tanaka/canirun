@@ -331,6 +331,14 @@ pub fn with_recorded(mut scan: Scan, recorded_alive: Vec<ProcRef>, truncated: bo
 /// started and be counted as the command's.
 pub const RECORD_SLACK_SECS: u64 = 2;
 
+/// The time the hidden-orphan window closes, if it may close at all: only
+/// when the tracker covered the command's whole life and nothing was left
+/// to stop afterwards. `now` is read only then, so callers take the stamp
+/// after the stop has confirmed everything gone.
+pub fn closed_at<T>(covered: bool, descendants_left: bool, now: impl FnOnce() -> T) -> Option<T> {
+    (covered && !descendants_left).then(now)
+}
+
 /// The window (`since`, `until`; seconds since the epoch, both inclusive)
 /// in which a hidden process may be a descendant nobody recorded: from the
 /// child's start (the launch intent when that is unknown, else 0) to the
@@ -860,6 +868,22 @@ mod tests {
         assert!(suspicious_hidden(&at(200), 100, Some(200), 7));
         assert!(!suspicious_hidden(&at(99), 100, Some(200), 7));
         assert!(!suspicious_hidden(&at(201), 100, Some(200), 7));
+    }
+
+    #[test]
+    fn the_window_closes_only_when_covered_and_nothing_was_left() {
+        assert_eq!(closed_at(true, false, || 7), Some(7));
+        assert_eq!(closed_at(false, false, || 7), None);
+        assert_eq!(closed_at(true, true, || 7), None);
+        assert_eq!(closed_at(false, true, || 7), None);
+        // The stamp is read only when the window closes.
+        let reads = std::cell::Cell::new(0);
+        let read = || reads.set(reads.get() + 1);
+        closed_at(true, true, read);
+        closed_at(false, false, read);
+        assert_eq!(reads.get(), 0);
+        closed_at(true, false, read);
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]

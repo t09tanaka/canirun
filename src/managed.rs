@@ -853,8 +853,8 @@ pub fn run_command_with_tracker(
         let at = ctx.clock.now();
         let _ = advance_sidecar(ctx, id, Phase::ChildStarted, |s| {
             s.child = Some(identity);
-            // An upper bound on the hidden-orphan window for every run,
-            // even one whose tracker never records.
+            // The start of the heartbeat: with no `tracked_to_exit` the
+            // window is open-ended, so this stamp is not an upper bound.
             s.recorded_at = Some(at);
         });
     };

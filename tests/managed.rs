@@ -1735,7 +1735,8 @@ fn a_clean_run_closes_the_window_and_one_not_tracked_to_the_exit_does_not() {
     assert!(!ran.outcome.tracker_unknown);
     let sc = sidecar(&c, "nr");
     assert!(sc.tracked_to_exit, "{sc:?}");
-    assert_eq!(sc.recorded_at, Some(now), "{sc:?}");
+    // Stamped after the stop (which sleeps on the fake clock), not at `now`.
+    assert!(sc.recorded_at > Some(now), "{sc:?}");
     assert!(sc.descendants.is_empty() && !sc.descendants_truncated);
     // A tracker that never looked, as if it died: the spawn still stamped
     // the sidecar, but nothing says the whole life was seen.
@@ -1757,4 +1758,76 @@ fn a_clean_run_closes_the_window_and_one_not_tracked_to_the_exit_does_not() {
     assert!(reaped(&hidden(start + 3)).find("nr").is_none(), "after");
     // The one nobody followed to its exit is held by the same late process.
     assert!(reaped(&hidden(start + 3)).find("nr2").is_some(), "open");
+}
+
+/// A clock whose `now` moves 10 s on every read, so a stamp taken later is
+/// always later.
+struct Ticking(std::sync::Mutex<chrono::DateTime<chrono::Utc>>);
+
+impl canirun::Clock for Ticking {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        let mut t = self.0.lock().unwrap();
+        *t += chrono::Duration::seconds(10);
+        *t
+    }
+    fn monotonic(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn sleep(&self, _: Duration) {}
+}
+
+#[test]
+fn the_window_closes_at_the_time_after_the_stop_not_at_the_spawn_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Ticking(std::sync::Mutex::new(chrono::Utc::now())));
+    let c = ctx(dir.path()).with_clock(clock);
+    let cfg = Config::default();
+    let s = spec(dir.path(), "tk", "d", &["true"]);
+    let (_, guard) = registered(managed::register(&c, &cfg, &s).unwrap());
+    admit_now(&c, &cfg, "tk");
+    let ran = managed::run_command(&c, &guard, &s.opts, cfg.limits()).unwrap();
+    let sc = sidecar(&c, "tk");
+    assert!(sc.tracked_to_exit, "{sc:?}");
+    let at = ran.outcome.tracked_to_exit_at.expect("closed");
+    assert_eq!(sc.recorded_at, Some(at), "{sc:?}");
+    // Later than the spawn and the run's start: it is the post-stop time.
+    assert!(at > ran.started_at, "{at} vs {}", ran.started_at);
+}
+
+#[test]
+fn a_run_that_left_descendants_does_not_close_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    let start = canirun::Clock::now(&*clock).timestamp() as u64;
+    let hidden = |start: u64, probe: Probe, alive: Vec<ProcRef>| {
+        let mut s = Scan::new(probe, alive);
+        s.hidden.push(HiddenProc {
+            proc: ProcRef {
+                pid: 4242,
+                start_time: Some(start),
+            },
+            parent: Some(1),
+        });
+        ctx_with_fixed(dir.path(), clock.clone(), s)
+    };
+    let cfg = Config::default();
+    // The marked scan keeps answering Alive: the stop never confirms.
+    let stuck = ProcRef {
+        pid: 0x3fff_fff0,
+        start_time: Some(1),
+    };
+    let c = hidden(0, Probe::Alive, vec![stuck]);
+    let s = spec(dir.path(), "dl", "d", &["true"]);
+    let (_, guard) = registered(managed::register(&c, &cfg, &s).unwrap());
+    admit_now(&c, &cfg, "dl");
+    let ran = managed::run_command(&c, &guard, &s.opts, cfg.limits()).unwrap();
+    assert!(ran.outcome.descendants_left);
+    assert!(ran.outcome.tracked_to_exit_at.is_none());
+    let sc = sidecar(&c, "dl");
+    assert!(!sc.tracked_to_exit, "{sc:?}");
+    drop(guard);
+    // The supervisor died holding it; later a hidden process appears long
+    // after the run: with the window open it may be the command's.
+    let late = hidden(start + 3600, Probe::Gone, vec![]);
+    assert!(reaped(&late).find("dl").is_some(), "held");
 }
