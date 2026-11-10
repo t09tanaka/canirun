@@ -206,7 +206,7 @@ fn may_pass(entries: &[QueueEntry], order: &[&QueueEntry], pos: usize, limits: L
 /// may be `None` when the caller could not read the OS; the guards are then
 /// skipped. The starvation rule (skip guards when nothing managed is
 /// running) is applied here so it is covered by unit tests. The CPU guard
-/// is skipped for `--front` entries (a human is waiting, and load canirun
+/// is skipped for `--front` entries (a human is waiting, and load task-traffic-controller
 /// does not manage must not hold them) and once `cpu_guard_max_wait_secs`
 /// has elapsed. A `--front` entry is instead held by the overload guard,
 /// while the load average is at or above `front_overload_load`, for at

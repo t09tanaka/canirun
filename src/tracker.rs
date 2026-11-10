@@ -73,7 +73,7 @@ impl Tracker {
         // Like the usage sampler: never the thread a SIGTERM lands on.
         let old = crate::usage::block_all_signals();
         let handle = std::thread::Builder::new()
-            .name("canirun-track".into())
+            .name("task-traffic-controller-track".into())
             .spawn(move || track_loop(root, &record, &rx));
         crate::usage::restore_signals(&old);
         Tracker {

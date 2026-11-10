@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn cmd(dir: &std::path::Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_canirun"));
+    let mut c = Command::new(env!("CARGO_BIN_EXE_task-traffic-controller"));
     c.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", dir)
@@ -39,7 +39,7 @@ fn submit(dir: &std::path::Path, script: &str) -> String {
 fn two_sigterms_while_queued_still_record_143() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let cfg = dir.join("config/canirun/config.toml");
+    let cfg = dir.join("config/task-traffic-controller/config.toml");
     fs::create_dir_all(cfg.parent().unwrap()).unwrap();
     fs::write(cfg, "budget = 1\n").unwrap();
 

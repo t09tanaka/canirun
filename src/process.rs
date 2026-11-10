@@ -227,8 +227,8 @@ pub fn signal_if_same(p: &ProcRef, sig: libc::c_int) -> bool {
     unsafe { libc::kill(p.pid as libc::pid_t, sig) == 0 }
 }
 
-/// Look for processes of this user carrying `CANIRUN_MANAGED_ID=<id>` and
-/// `CANIRUN_MANAGED_SCOPE=<scope>`.
+/// Look for processes of this user carrying `TASK_TRAFFIC_CONTROLLER_MANAGED_ID=<id>` and
+/// `TASK_TRAFFIC_CONTROLLER_MANAGED_SCOPE=<scope>`.
 pub fn scan_system(id: &str, scope: &str) -> Scan {
     marker::classify(&observe_all(), id, scope, std::process::id())
 }
@@ -588,7 +588,7 @@ mod tests {
     /// binaries (`sleep`) do not show their environment to anyone.
     #[test]
     fn marker_sleeper_entry() {
-        if std::env::var_os("CANIRUN_TEST_SLEEPER").is_some() {
+        if std::env::var_os("TASK_TRAFFIC_CONTROLLER_TEST_SLEEPER").is_some() {
             std::thread::sleep(std::time::Duration::from_secs(30));
         }
     }
@@ -616,7 +616,7 @@ mod tests {
                 "process::tests::marker_sleeper_entry",
                 "--nocapture",
             ])
-            .env("CANIRUN_TEST_SLEEPER", "1")
+            .env("TASK_TRAFFIC_CONTROLLER_TEST_SLEEPER", "1")
             .env(marker::ENV_VAR, &id)
             .env(marker::SCOPE_VAR, scope)
             .stdout(std::process::Stdio::null())

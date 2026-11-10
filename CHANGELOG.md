@@ -1,11 +1,29 @@
 # Changelog
 
-All notable changes to canirun are documented here. The format is based on
+All notable changes to task-traffic-controller (called canirun before 0.5.0) are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
-## [Unreleased]
+## [0.5.0]
+
+### Renamed
+
+- **canirun is now task-traffic-controller.** The crate, the package, the
+  command and the library (`task_traffic_controller`) take the new name, and
+  every line it prints starts with `task-traffic-controller: `. The `canirun`
+  command is gone and nothing in this release is compatible with the old
+  name:
+  - Environment variables are `TASK_TRAFFIC_CONTROLLER_*` (`LEASE`,
+    `LEDGER_LOCK_TIMEOUT_MS`, `MANAGED_ID`, `MANAGED_SCOPE`); the `CANIRUN_*`
+    names are not read.
+  - State lives in `$XDG_STATE_HOME/task-traffic-controller` (default
+    `~/.local/state/task-traffic-controller`) and the config in
+    `$XDG_CONFIG_HOME/task-traffic-controller/config.toml`. Nothing is
+    carried over from the old directories; remove `~/.local/state/canirun` and
+    `~/.config/canirun` by hand when no `canirun` command is still running.
+  - To switch: `cargo uninstall canirun`, then
+    `cargo install task-traffic-controller`.
 
 ### Changed
 

@@ -1,10 +1,10 @@
-use canirun::config::Config;
-use canirun::display::fmt_duration;
-use canirun::error::Result;
-use canirun::exec::Opts;
-use canirun::forecast::{self, Timing};
-use canirun::{estimate, inspect, Context};
 use std::time::Duration;
+use task_traffic_controller::config::Config;
+use task_traffic_controller::display::fmt_duration;
+use task_traffic_controller::error::Result;
+use task_traffic_controller::exec::Opts;
+use task_traffic_controller::forecast::{self, Timing};
+use task_traffic_controller::{estimate, inspect, Context};
 
 pub fn run(ctx: &Context, cfg: &Config, opts: Opts, json: bool) -> Result<i32> {
     let plan = estimate::command_plan(ctx, cfg, &opts)?;

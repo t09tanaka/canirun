@@ -14,18 +14,20 @@ struct TestEnv {
 impl TestEnv {
     fn new(config: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("config/canirun/config.toml");
+        let p = dir
+            .path()
+            .join("config/task-traffic-controller/config.toml");
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, config).unwrap();
         TestEnv { dir }
     }
 
     fn state(&self) -> PathBuf {
-        self.dir.path().join("state/canirun")
+        self.dir.path().join("state/task-traffic-controller")
     }
 
     fn cmd(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_canirun"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_task-traffic-controller"));
         c.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", self.dir.path())
@@ -96,7 +98,7 @@ fn submit_returns_immediately_and_wait_collects_output_and_code() {
     assert_eq!(out.status.code(), Some(5));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains(&format!("=== canirun job {id} exit 5")),
+        text.contains(&format!("=== task-traffic-controller job {id} exit 5")),
         "{text}"
     );
     assert!(text.contains("hello\n") && text.contains("bye\n"), "{text}");
@@ -104,7 +106,10 @@ fn submit_returns_immediately_and_wait_collects_output_and_code() {
     let out = env.run(&["wait", "--no-output", &id]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(text.lines().count(), 1, "{text}");
-    assert!(text.starts_with("=== canirun job"), "{text}");
+    assert!(
+        text.starts_with("=== task-traffic-controller job"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -380,7 +385,7 @@ fn wait_does_not_call_a_job_lost_while_the_ledger_lock_is_busy() {
     lock.lock_exclusive().unwrap();
     let out = env
         .cmd()
-        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .env("TASK_TRAFFIC_CONTROLLER_LEDGER_LOCK_TIMEOUT_MS", "200")
         .args(["submit", "--", "echo", "ran"])
         .output()
         .unwrap();
@@ -390,7 +395,7 @@ fn wait_does_not_call_a_job_lost_while_the_ledger_lock_is_busy() {
     // starting grace with the runner still unregistered.
     let waiter = env
         .cmd()
-        .env("CANIRUN_LEDGER_LOCK_TIMEOUT_MS", "200")
+        .env("TASK_TRAFFIC_CONTROLLER_LEDGER_LOCK_TIMEOUT_MS", "200")
         .args(["wait", &id])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

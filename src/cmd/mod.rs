@@ -1,4 +1,4 @@
-//! The CLI adapter: one module per subcommand, over the `canirun` library.
+//! The CLI adapter: one module per subcommand, over the `task-traffic-controller` library.
 
 pub mod config;
 pub mod estimate;

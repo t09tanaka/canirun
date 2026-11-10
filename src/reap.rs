@@ -2,7 +2,7 @@
 //! caller gathers the facts (lease, sidecar, boot id, process probes) and
 //! this decides.
 //!
-//! An entry without a sidecar is a plain `canirun exec` entry: when its
+//! An entry without a sidecar is a plain `task-traffic-controller exec` entry: when its
 //! lease is gone it is released, as it always was. An entry with a sidecar
 //! is managed: a vanished lease only means the supervisor died, not that
 //! its child process tree stopped using the budget, so it is kept
@@ -10,7 +10,7 @@
 //! machine rebooted.
 //!
 //! Descendants that left the process group (`setsid`, double fork) are found
-//! by the `CANIRUN_MANAGED_ID` marker in their environment ([`crate::marker`]):
+//! by the `TASK_TRAFFIC_CONTROLLER_MANAGED_ID` marker in their environment ([`crate::marker`]):
 //! a started child is only free when the child, its group *and* every marked
 //! process are gone.
 //!
@@ -68,9 +68,9 @@ pub struct Inputs {
     pub child: Probe,
     /// Anyone left in the recorded process group.
     pub group: Probe,
-    /// Any process still carrying the command's `CANIRUN_MANAGED_ID`.
+    /// Any process still carrying the command's `TASK_TRAFFIC_CONTROLLER_MANAGED_ID`.
     pub marker: Probe,
-    /// A person asked to settle this entry (`canirun resolve`): the grace
+    /// A person asked to settle this entry (`task-traffic-controller resolve`): the grace
     /// period is skipped and an unreadable sidecar is judged by the scan.
     pub manual: bool,
 }

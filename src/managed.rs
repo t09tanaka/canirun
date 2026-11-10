@@ -1,9 +1,9 @@
-//! Commands whose lifecycle a caller (another program driving canirun as a
-//! library) owns, as opposed to a plain `canirun exec`.
+//! Commands whose lifecycle a caller (another program driving task-traffic-controller as a
+//! library) owns, as opposed to a plain `task-traffic-controller exec`.
 //!
 //! The caller picks a stable `command_id` and a `spec_digest` before
 //! anything is registered, so its own durable record ("accepted", kept
-//! outside canirun) can name the ledger entry the command will occupy.
+//! outside task-traffic-controller) can name the ledger entry the command will occupy.
 //! From there the stages are (see [`crate::receipt`]):
 //!
 //! 1. [`register`]: takes the lease, writes the sidecar, then pushes the
@@ -24,7 +24,7 @@
 //! `managed/<command_id>.json` next to the ledger holds what the ledger
 //! cannot: the spec digest, the caller's correlation data, the stage, the
 //! boot id, the child's pid, start time and process group. A ledger holding
-//! a managed entry is saved in a shape an older canirun cannot parse (see
+//! a managed entry is saved in a shape an older task-traffic-controller cannot parse (see
 //! [`crate::ledger::Ledger`]), so it neither reaps nor rewrites it. The
 //! sidecar is written *before* the ledger entry, so an entry without a
 //! sidecar is a plain entry, never a managed one whose file went missing.
@@ -35,7 +35,7 @@
 //! managed entry is released only when [`crate::reap::verdict`] says so:
 //! terminal recorded, machine rebooted, never launched, or the recorded
 //! child, its process group and every process carrying the command's
-//! `CANIRUN_MANAGED_ID` are gone. Otherwise it stays in the ledger with its
+//! `TASK_TRAFFIC_CONTROLLER_MANAGED_ID` are gone. Otherwise it stays in the ledger with its
 //! charge (quarantine), and `inspect` reports it. The marker finds
 //! descendants that left the process group (`setsid`, double fork); one that
 //! cleared its environment (`env -i`) is not found. A launch intent (the
@@ -43,14 +43,14 @@
 //! once the lease is gone, 60 seconds have passed and no marked process
 //! exists; an unknown scan or a missing timestamp never releases it. An
 //! unreadable sidecar is never treated as free capacity by the reaper.
-//! [`resolve_checked`] (`canirun resolve <id>`) settles a quarantined entry
+//! [`resolve_checked`] (`task-traffic-controller resolve <id>`) settles a quarantined entry
 //! by hand after the same checks; [`resolve`] is for a recovery process that
 //! has investigated on its own.
 //!
 //! A `command_id` is single use: once its terminal outcome is recorded,
 //! registering it again returns [`Registration::AlreadyTerminal`] and never
 //! creates an entry. That holds for as long as the receipt (the sidecar) is
-//! kept: `canirun gc` removes the receipt of a command that ended more than
+//! kept: `task-traffic-controller gc` removes the receipt of a command that ended more than
 //! `managed_keep_days` (default 7) ago, after which the id is free again.
 //! A run that was past `Registered` when the machine rebooted is settled the
 //! same way whether the reaper or a new registration notices first: as
@@ -474,7 +474,7 @@ pub fn views(ctx: &Context, entries: &[Entry]) -> Vec<ManagedView> {
                     String::new()
                 },
                 hint: if quarantined {
-                    format!("canirun resolve {}", e.id)
+                    format!("task-traffic-controller resolve {}", e.id)
                 } else {
                     String::new()
                 },
@@ -1017,7 +1017,7 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
         {
             return Err(Error::Ledger(format!(
                 "{id}: the descendants of the command could not be recorded, so the entry \
-                 keeps its budget (see `canirun resolve {id}`)"
+                 keeps its budget (see `task-traffic-controller resolve {id}`)"
             )));
         }
         // Budget is only released once the whole process group, and anything
@@ -1047,7 +1047,7 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
                 if sc.phase != Phase::Registered && !runner::stop_marked(ctx, &id, &sc.tracked()) {
                     return Err(Error::Ledger(format!(
                         "{id}: a process carrying {} still runs or could not be checked; \
-                         the entry keeps its budget (see `canirun resolve {id}`)",
+                         the entry keeps its budget (see `task-traffic-controller resolve {id}`)",
                         crate::marker::ENV_VAR
                     )));
                 }
@@ -1140,7 +1140,7 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
     Ok(())
 }
 
-/// What [`resolve_checked`] found and did, for `canirun resolve`.
+/// What [`resolve_checked`] found and did, for `task-traffic-controller resolve`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resolution {
     pub command_id: String,
@@ -1304,7 +1304,10 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
         reap::Release::NeverLaunched => TerminalKind::Abandoned,
         _ => TerminalKind::Interrupted,
     };
-    let detail = format!("settled by `canirun resolve`: {}", describe(a.verdict));
+    let detail = format!(
+        "settled by `task-traffic-controller resolve`: {}",
+        describe(a.verdict)
+    );
     match (&a.sidecar, why) {
         // Nothing to record: a plain entry, or an outcome already written.
         (Loaded::Missing, _) | (_, reap::Release::Terminal) => {

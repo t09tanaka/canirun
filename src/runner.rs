@@ -41,7 +41,7 @@ pub struct Outcome {
     pub cpu_secs: f64,
     pub max_rss_bytes: u64,
     /// A managed command still had descendants after the leader was reaped
-    /// (in its process group, or carrying its `CANIRUN_MANAGED_ID`
+    /// (in its process group, or carrying its `TASK_TRAFFIC_CONTROLLER_MANAGED_ID`
     /// elsewhere) and they were sent SIGTERM, then SIGKILL, but were not
     /// confirmed gone in time or could not be checked. Always false for a
     /// plain run.
@@ -58,7 +58,7 @@ pub struct Outcome {
 }
 
 /// Run `argv` with inherited stdio in our process group, in `cwd`, with
-/// `CANIRUN_LEASE=lease` in its environment. With `measure`, the child's
+/// `TASK_TRAFFIC_CONTROLLER_LEASE=lease` in its environment. With `measure`, the child's
 /// process tree is sampled while it runs and the cores it uses are written
 /// to the ledger entry `lease`.
 pub fn run(
@@ -78,7 +78,7 @@ pub struct Spawn<'a> {
     /// the whole tree can be probed and stopped by group). Off for a plain
     /// `exec`, where terminal signals must keep reaching the child.
     pub own_process_group: bool,
-    /// Put `CANIRUN_MANAGED_ID=<id>` in the child's environment, and after
+    /// Put `TASK_TRAFFIC_CONTROLLER_MANAGED_ID=<id>` in the child's environment, and after
     /// the leader exits also stop any process still carrying it, even one
     /// that left the process group.
     pub marker_id: Option<&'a str>,
@@ -218,7 +218,7 @@ pub(crate) fn settled_scan(ctx: &Context, id: &str, tracked: &Tracked) -> crate:
     }
 }
 
-/// Stop every process still carrying `CANIRUN_MANAGED_ID=<id>` (and this
+/// Stop every process still carrying `TASK_TRAFFIC_CONTROLLER_MANAGED_ID=<id>` (and this
 /// state directory's scope): SIGTERM, a grace, then SIGKILL, signalling
 /// only a pid that is still the process that was seen. True only when
 /// scans then find none, twice in a row, and every process could be read.
@@ -264,7 +264,9 @@ pub fn run_with(
     ctx.supervisor.running();
     let start = ctx.clock.monotonic();
     let mut cmd = Command::new(prog);
-    cmd.args(args).current_dir(cwd).env("CANIRUN_LEASE", lease);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("TASK_TRAFFIC_CONTROLLER_LEASE", lease);
     if spawn.own_process_group {
         // Its own session (so also its own group, with the pid as both ids):
         // a descendant that clears its environment still stays in it.
@@ -400,13 +402,13 @@ pub fn run_with(
     })
 }
 
-/// `canirun exec -- "npm run x"` looks for a program named `npm run x`.
+/// `task-traffic-controller exec -- "npm run x"` looks for a program named `npm run x`.
 /// When that is the likely mistake, say how to write it instead.
 fn spawn_hint(argv: &[String], e: &std::io::Error) -> String {
     match argv {
         [one] if e.kind() == std::io::ErrorKind::NotFound && one.contains(char::is_whitespace) => {
             format!(
-                "\ncanirun: hint: the command after `--` is one quoted argument; \
+                "\ntask-traffic-controller: hint: the command after `--` is one quoted argument; \
                  pass it as separate words: `-- {0}`, not `-- \"{0}\"` \
                  (for shell syntax, `-- sh -c '...'`)",
                 one.trim()

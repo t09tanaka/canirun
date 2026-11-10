@@ -1,5 +1,5 @@
-//! canirun as a library: the single-host resource control behind the
-//! `canirun` command (admission against a shared budget, the ledger and its
+//! task-traffic-controller as a library: the single-host resource control behind the
+//! `task-traffic-controller` command (admission against a shared budget, the ledger and its
 //! leases, ETA estimates, learned weights, live metrics, measurement).
 //!
 //! **This is not a stable API.** The crate is 0.x and the public items

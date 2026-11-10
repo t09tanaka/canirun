@@ -34,7 +34,7 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     /// Cores the running command's process tree was last measured using,
-    /// written by the running `canirun` itself.
+    /// written by the running `task-traffic-controller` itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub using: Option<f64>,
     /// Started ahead of a waiting entry that did not fit the budget.

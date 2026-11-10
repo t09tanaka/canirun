@@ -1,8 +1,8 @@
 //! The stages a managed command goes through, and which moves between them
 //! are legal. Pure: no I/O.
 //!
-//! `accepted` (the caller's own durable record) happens before canirun is
-//! involved and has no stage here. From `Registered` on, canirun holds the
+//! `accepted` (the caller's own durable record) happens before task-traffic-controller is
+//! involved and has no stage here. From `Registered` on, task-traffic-controller holds the
 //! lease and a ledger entry:
 //!
 //! ```text
