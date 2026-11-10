@@ -1712,7 +1712,6 @@ fn a_clean_run_closes_the_window_and_one_not_tracked_to_the_exit_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
     let now = canirun::Clock::now(&*clock);
-    let start = now.timestamp() as u64;
     let hidden = |start: u64| {
         let mut s = Scan::new(Probe::Gone, vec![]);
         s.hidden.push(HiddenProc {
@@ -1749,15 +1748,18 @@ fn a_clean_run_closes_the_window_and_one_not_tracked_to_the_exit_does_not() {
     assert!(!ran.outcome.tracker_unknown);
     let sc = sidecar(&c, "nr2");
     assert!(!sc.tracked_to_exit && sc.recorded_at.is_some(), "{sc:?}");
+    // The window is relative to the stamp taken after the stop, whatever the
+    // fake clock advanced meanwhile.
+    let stamp = sidecar(&c, "nr").recorded_at.unwrap().timestamp() as u64;
     // The supervisor dies; everything is gone.
     drop(guard);
     drop(guard2);
     // Inside the window (the record plus 2 s): it may be the command's.
-    assert!(reaped(&hidden(start + 2)).find("nr").is_some(), "inside");
+    assert!(reaped(&hidden(stamp + 2)).find("nr").is_some(), "inside");
     // After it: an unrelated process, so the entry is settled.
-    assert!(reaped(&hidden(start + 3)).find("nr").is_none(), "after");
+    assert!(reaped(&hidden(stamp + 3)).find("nr").is_none(), "after");
     // The one nobody followed to its exit is held by the same late process.
-    assert!(reaped(&hidden(start + 3)).find("nr2").is_some(), "open");
+    assert!(reaped(&hidden(stamp + 3)).find("nr2").is_some(), "open");
 }
 
 /// A clock whose `now` moves 10 s on every read, so a stamp taken later is
