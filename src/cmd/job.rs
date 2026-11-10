@@ -354,7 +354,10 @@ pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
             }
             JobState::Queued | JobState::Running => {
                 match ledger.find(id).map(|e| e.pid) {
-                    Some(pid) if pid > 0 => {
+                    // pid 1 is init, and a pid above i32::MAX wraps to a negative
+                    // pid_t: u32::MAX would become kill(-1), every process of the
+                    // user. A damaged ledger must never get there.
+                    Some(pid) if pid > 1 && pid <= i32::MAX as u32 => {
                         unsafe {
                             libc::kill(pid as libc::pid_t, libc::SIGTERM);
                         }
