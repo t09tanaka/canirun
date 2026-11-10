@@ -225,9 +225,10 @@ pub fn inside_run(
         {
             return true;
         }
+        // A parent loop ends at the bound of the loop.
         match row.parent {
-            Some(parent) if parent != at => at = parent,
-            _ => return false,
+            Some(parent) => at = parent,
+            None => return false,
         }
     }
     false
