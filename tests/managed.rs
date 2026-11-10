@@ -419,6 +419,7 @@ fn a_changed_boot_id_releases_what_the_old_boot_left() {
         pid: std::process::id(), // alive, would be "kept" on the same boot
         start_time: canirun::process::start_time(std::process::id()),
         pgid: Some(unsafe { libc::getpgid(0) }),
+        sid: None,
     };
     orphan(&ctx1, "c", Phase::ChildStarted, Some(ghost));
     drop(g);
@@ -1514,6 +1515,7 @@ fn dead_child(
         pid: 0x3fff_fff0,
         start_time: Some(1),
         pgid: Some(0x3fff_fff0),
+        sid: None,
     });
     edit(&mut sc);
     managed::write_sidecar(&c, &sc).unwrap();
@@ -2002,6 +2004,7 @@ fn orphan_with_live_child(ctx: &Context, id: &str) {
         pid: std::process::id(),
         start_time: canirun::process::start_time(std::process::id()),
         pgid: Some(unsafe { libc::getpgid(0) }),
+        sid: None,
     };
     orphan(ctx, id, Phase::ChildStarted, Some(ghost));
 }
@@ -2249,6 +2252,7 @@ fn a_process_that_only_inherited_the_managed_variables_is_still_gated() {
         pid: other.id(),
         start_time: canirun::process::start_time(other.id()),
         pgid: Some(other.id() as i32),
+        sid: None,
     };
     orphan(&lib, "c", Phase::ChildStarted, Some(ghost));
     cli_true(dir.path(), &lib, Some(("c", &scope)));
@@ -2552,4 +2556,178 @@ fn force_frees_a_group_held_only_by_strangers_and_never_one_that_is_the_runs() {
     assert_eq!(sidecar(&gone, "g1").phase, Phase::Terminal);
     stranger.kill().unwrap();
     stranger.wait().unwrap();
+}
+
+// ---- the session a managed command leads ----
+
+/// Runs only when re-executed by the tests below, as the supervisor. Its
+/// command forks a helper that, two seconds later (after the supervisor and
+/// the command are dead and nothing records it any more), starts a process
+/// with an empty environment (`env -i`) that first moves itself to a new
+/// process group (`SID_ESCAPE=group`) or a new session (`SID_ESCAPE=session`).
+#[test]
+fn session_supervisor_entry() {
+    let Some(dir) = std::env::var_os("CANIRUN_TEST_SID_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let (ctx, cfg) = (ctx(&dir), Config::default());
+    let script = "( sleep 2; perl -e 'open F, \">$ENV{CANIRUN_TEST_SID_PIDFILE}\"; print F $$; \
+         close F; if ($ENV{CANIRUN_TEST_SID_ESCAPE} eq \"session\") { require POSIX; \
+         POSIX::setsid(); } else { setpgrp(0, 0); } exec q(env), q(-i), q(sleep), q(60)' & ) & wait";
+    let s = spec(&dir, "sid-1", "d", &["sh", "-c", script]);
+    let (_, guard) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    admit_now(&ctx, &cfg, "sid-1");
+    let _ = managed::run_command(&ctx, &guard, &s.opts, cfg.limits());
+}
+
+/// Kills a stray test process when dropped.
+struct Reap(i32);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+}
+
+/// The state once the supervisor and the command are dead and the escaped
+/// `env -i sleep` (a process of the given kind of escape) runs.
+fn orphan_after_escape(escape: &str) -> (tempfile::TempDir, Context, Reap) {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let pidfile = dir.path().join("escaped.pid");
+    let mut sup = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "session_supervisor_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("CANIRUN_TEST_SID_DIR", dir.path())
+        .env("CANIRUN_TEST_SID_PIDFILE", &pidfile)
+        .env("CANIRUN_TEST_SID_ESCAPE", escape)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        until(
+            20,
+            || matches!(managed::load_sidecar(&ctx, "sid-1"), Loaded::Ok(sc) if sc.phase == Phase::ChildStarted)
+        ),
+        "the supervisor never started its child"
+    );
+    let child = sidecar(&ctx, "sid-1").child.unwrap();
+    // The child leads its own session: its id is the child's pid.
+    assert_eq!(child.sid, Some(child.pid as i32));
+    assert_eq!(child.pgid, child.sid);
+    unsafe { libc::kill(sup.id() as libc::pid_t, libc::SIGKILL) };
+    sup.wait().unwrap();
+    unsafe { libc::kill(child.pid as libc::pid_t, libc::SIGKILL) };
+    assert!(
+        until(20, || pidfile.exists()
+            && std::fs::read_to_string(&pidfile)
+                .is_ok_and(|s| !s.is_empty())),
+        "the escaped process never started"
+    );
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let guard = Reap(pid);
+    // The helper that forked it exits at once; give it a moment.
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(pid_alive(pid));
+    (dir, ctx, guard)
+}
+
+#[test]
+fn an_env_i_process_that_left_the_group_keeps_the_run_held_through_the_reaper_and_force() {
+    let (_dir, ctx, escaped) = orphan_after_escape("group");
+    // No marker, not recorded, not in the group: only the session shows it.
+    for _ in 0..3 {
+        assert!(reaped(&ctx).find("sid-1").is_some(), "freed while it runs");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let v = managed::views(&ctx, &ledger(&ctx).entries);
+    assert!(v[0].reason.contains("DescendantsAlive"), "{:?}", v[0]);
+    let r = managed::resolve_checked_with(&ctx, "sid-1", true).unwrap();
+    assert!(!r.released && !r.forced, "{r:?}");
+    assert!(ledger(&ctx).find("sid-1").is_some());
+    // Once it is gone nothing marks, groups or records the run any more.
+    // (A Mac may still report "could not be checked" for unrelated hidden
+    // processes; `--force` is the way out, and it must now succeed.)
+    drop(escaped);
+    assert!(
+        until(20, || {
+            managed::resolve_checked_with(&ctx, "sid-1", true).is_ok_and(|r| r.released)
+        }),
+        "not released after the process stopped: {:?}",
+        managed::views(&ctx, &ledger(&ctx).entries)
+    );
+}
+
+#[test]
+fn a_process_that_left_with_setsid_is_not_a_member() {
+    // The documented limitation: a daemon that starts its own session is
+    // outside the run's. With an empty environment nothing else shows it
+    // either, so `--force` releases the entry (the reaper alone does on a
+    // system that can read every environment).
+    let (_dir, ctx, _escaped) = orphan_after_escape("session");
+    let r = managed::resolve_checked_with(&ctx, "sid-1", true).unwrap();
+    assert!(r.released, "{r:?}");
+    assert!(ledger(&ctx).find("sid-1").is_none());
+}
+
+/// A child identity for a run that is gone, whose session number is `sid`.
+fn gone_run_with_session(dir: &Path, id: &str, sid: i32, start: u64) -> Context {
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_child(dir, &clock, id, |sc| {
+        let c = sc.child.as_mut().unwrap();
+        c.sid = Some(sid);
+        c.start_time = Some(start);
+    });
+    ctx_with_fixed(dir, clock, Scan::new(Probe::Gone, vec![]))
+}
+
+#[test]
+fn a_reused_session_number_is_not_a_false_match() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    // Somebody else leads a session with that number now.
+    let mut other = unsafe {
+        Command::new("sleep")
+            .arg("60")
+            .pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            })
+            .spawn()
+            .unwrap()
+    };
+    let sid = other.id() as i32;
+    let c = gone_run_with_session(dir.path(), "reuse", sid, 1);
+    let v = managed::resolve_checked(&c, "reuse").unwrap();
+    assert!(v.released, "a different session held the run: {v:?}");
+
+    // The same leader, recorded with its true start time, is a member.
+    let dir2 = tempfile::tempdir().unwrap();
+    let start = canirun::process::start_time(other.id()).unwrap();
+    let c = gone_run_with_session(dir2.path(), "same", sid, start);
+    let held = managed::resolve_checked_with(&c, "same", true).unwrap();
+    assert!(!held.released && !held.forced, "{held:?}");
+    other.kill().unwrap();
+    other.wait().unwrap();
+}
+
+#[test]
+fn a_sidecar_without_a_session_keeps_the_old_rules() {
+    let json = r#"{"pid": 7, "start_time": 3, "pgid": 7}"#;
+    let c: canirun::process::ChildIdentity = serde_json::from_str(json).unwrap();
+    assert_eq!(c.sid, None);
+    assert_eq!(canirun::process::probe_session(&c), Probe::Gone);
+    assert!(!serde_json::to_string(&c).unwrap().contains("sid"));
 }

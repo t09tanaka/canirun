@@ -203,6 +203,43 @@ pub fn group_reused(leader_start: Option<u64>, child_start: Option<u64>) -> bool
     matches!((leader_start, child_start), (Some(l), Some(c)) if l != c)
 }
 
+/// Does a process that has the recorded session id belong to this run's
+/// session, or to a *different* session that reused the number? A session id
+/// is the pid of its leader, and the kernel hands a pid out again only once
+/// the session is empty. So a process with that id is a member of the run's
+/// session unless a process now leads it that started at a different time
+/// than the recorded child, which led the original session. Counts: the
+/// leader alive with the child's start time, and no leader at all (it
+/// exited; nobody new has taken the session). A start time missing on either
+/// side cannot show reuse, so the answer is yes (the entry stays held).
+pub fn session_member(leader_start: Option<u64>, child_start: Option<u64>) -> bool {
+    !group_reused(leader_start, child_start)
+}
+
+/// What the members of the run's session say: `found` processes carry the
+/// recorded session id; `failed` when some process's session could not be
+/// read (EPERM and the like), which is treated like an unreadable
+/// environment: nothing can be ruled out.
+pub fn session_probe(found: usize, failed: bool) -> Probe {
+    if found > 0 {
+        Probe::Alive
+    } else if failed {
+        Probe::Unknown
+    } else {
+        Probe::Gone
+    }
+}
+
+/// Two probes of the same run's processes taken together: alive if either
+/// is, else unknown if either is, else gone.
+pub fn merge_probes(a: Probe, b: Probe) -> Probe {
+    match (a, b) {
+        (Probe::Alive, _) | (_, Probe::Alive) => Probe::Alive,
+        (Probe::Unknown, _) | (_, Probe::Unknown) => Probe::Unknown,
+        _ => Probe::Gone,
+    }
+}
+
 /// May a release verdict reached `age_secs` ago be acted on?
 pub fn release_usable(age_secs: i64) -> bool {
     (0..RELEASE_VALID_SECS).contains(&age_secs)
@@ -499,5 +536,42 @@ mod tests {
         // Start time unknown on the record: cannot tell.
         assert!(!group_reused(Some(200), None));
         assert!(!group_reused(None, None));
+    }
+
+    #[test]
+    fn a_session_id_is_ours_unless_a_newer_leader_took_the_number() {
+        // The recorded child still leads it, or nobody does.
+        assert!(session_member(Some(100), Some(100)));
+        assert!(session_member(None, Some(100)));
+        // A different process leads the number: reused.
+        assert!(!session_member(Some(200), Some(100)));
+        // A start time we cannot compare is no proof of reuse.
+        assert!(session_member(Some(200), None));
+        assert!(session_member(None, None));
+    }
+
+    #[test]
+    fn the_session_probe_reads_members_before_failures() {
+        assert_eq!(session_probe(1, false), Probe::Alive);
+        assert_eq!(session_probe(3, true), Probe::Alive);
+        assert_eq!(session_probe(0, true), Probe::Unknown);
+        assert_eq!(session_probe(0, false), Probe::Gone);
+    }
+
+    #[test]
+    fn merged_probes_keep_the_stronger_answer() {
+        use Probe::*;
+        for (a, b, want) in [
+            (Alive, Gone, Alive),
+            (Gone, Alive, Alive),
+            (Alive, Unknown, Alive),
+            (Unknown, Alive, Alive),
+            (Unknown, Gone, Unknown),
+            (Gone, Unknown, Unknown),
+            (Gone, Gone, Gone),
+            (Unknown, Unknown, Unknown),
+        ] {
+            assert_eq!(merge_probes(a, b), want, "{a:?} {b:?}");
+        }
     }
 }

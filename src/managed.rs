@@ -339,6 +339,11 @@ fn assess_with(
                     } else {
                         process::probe_group(c.pgid)
                     };
+                    // Whatever left the group but not the session (and
+                    // whatever cleared its environment) still belongs to it.
+                    if child_probe != Probe::Alive && group_probe != Probe::Alive {
+                        group_probe = reap::merge_probes(group_probe, process::probe_session(c));
+                    }
                 }
                 // A live child or group already keeps the entry.
                 if child_probe != Probe::Alive && group_probe != Probe::Alive {
@@ -1026,6 +1031,14 @@ pub fn finish(ctx: &Context, guard: OwnerGuard, kind: TerminalKind) -> Result<()
                     if process::probe_group(Some(pgid)) == Probe::Alive {
                         return Err(Error::Ledger(format!(
                             "{id}: process group {pgid} still has members; the entry keeps \
+                             its budget until they stop"
+                        )));
+                    }
+                }
+                if let Some(c) = &sc.child {
+                    if process::probe_session(c) == Probe::Alive {
+                        return Err(Error::Ledger(format!(
+                            "{id}: the command's session still has members; the entry keeps \
                              its budget until they stop"
                         )));
                     }

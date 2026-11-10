@@ -4,7 +4,7 @@
 
 use crate::lineage::{self, Row};
 use crate::marker::{self, Marker, ProcRef, Scan, Seen};
-use crate::reap::Probe;
+use crate::reap::{self, Probe};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
@@ -91,6 +91,11 @@ pub struct ChildIdentity {
     pub start_time: Option<u64>,
     /// The child's own process group (a managed child leads one).
     pub pgid: Option<i32>,
+    /// The child's own session (a managed child leads one, started with
+    /// `setsid`), so its id is the child's pid. `env -i` cannot leave a
+    /// session; only a deliberate `setsid` can. Absent in older sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<i32>,
 }
 
 impl ChildIdentity {
@@ -101,8 +106,60 @@ impl ChildIdentity {
             pid,
             start_time: start_time(pid),
             pgid: (pgid > 0).then_some(pgid),
+            sid: session_of(pid).filter(|s| *s > 0),
         }
     }
+}
+
+/// The session id of `pid`, or `None` when the kernel will not say.
+fn session_of(pid: u32) -> Option<i32> {
+    session_lookup(pid).ok()
+}
+
+/// `getsid(pid)`: `Err(true)` when the process is gone, `Err(false)` for any
+/// other failure (`EPERM`, ...).
+fn session_lookup(pid: u32) -> Result<i32, bool> {
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    if sid >= 0 {
+        return Ok(sid);
+    }
+    Err(std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
+/// Every live, non-zombie process (other than this one) whose session is
+/// `sid`, and whether some process's session could not be read.
+pub fn session_members(sid: i32) -> (Vec<ProcRef>, bool) {
+    let me = std::process::id();
+    let mut found = Vec::new();
+    let mut failed = false;
+    for row in TableReader::new().read() {
+        if row.proc.pid == me {
+            continue;
+        }
+        match session_lookup(row.proc.pid) {
+            Ok(s) if s == sid => found.push(row.proc),
+            Ok(_) => {}
+            Err(true) => {}
+            Err(false) => failed = true,
+        }
+    }
+    (found, failed)
+}
+
+/// Does anyone still belong to the run's session? A session id is a pid, so
+/// it only counts while it is still the child's session (see
+/// [`reap::session_member`]). A child recorded without a session (an older
+/// sidecar) has none to look at: gone.
+pub fn probe_session(c: &ChildIdentity) -> Probe {
+    let Some(sid) = c.sid else {
+        return Probe::Gone;
+    };
+    let leader = u32::try_from(sid).ok().and_then(start_time);
+    if !reap::session_member(leader, c.start_time) {
+        return Probe::Gone;
+    }
+    let (found, failed) = session_members(sid);
+    reap::session_probe(found.len(), failed)
 }
 
 /// Is the recorded child itself still running? A pid that now has a
@@ -456,6 +513,7 @@ mod tests {
             pid: 0x3fff_fff0,
             start_time: Some(1),
             pgid: None,
+            sid: None,
         };
         assert_eq!(probe_child(&gone), Probe::Gone);
     }

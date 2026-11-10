@@ -9,6 +9,16 @@ the minor version).
 
 ### Changed
 
+- A managed command now runs in its own session (`setsid`) and the session id
+  is recorded in the sidecar. The reaper, `resolve --force` and `finish`
+  count any process of that session as a member, so a process that cleared
+  its environment (`env -i`) and was born after the supervisor died or
+  between two tracker samples no longer lets the run be freed while it runs.
+  The supervisor also stops such leftovers on a normal exit. A session id is
+  a pid: it counts only while the recorded child's start time matches the
+  leader, or nobody leads it (`reap::session_member`). An unreadable session
+  is "could not be checked". Sidecars without a `sid` keep the old rules. A
+  daemon that calls `setsid` itself still escapes (documented).
 - Adopting a registration after a reboot no longer carries the old boot id
   forward: an unlaunched one is refreshed, one that reached its launch is
   settled as interrupted exactly as the reaper settles it (the id stays used
