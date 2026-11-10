@@ -8,6 +8,14 @@ pub enum Error {
     /// The ledger lock stayed busy for the whole timeout.
     LockTimeout(String),
     Spawn(String),
+    /// A workload plan that cannot be simulated (duplicate or unknown node
+    /// ids, a dependency cycle).
+    Plan(String),
+    /// The same command id was registered with a different spec digest, or
+    /// an id clashes with an entry that is not managed.
+    Conflict(String),
+    /// Another process holds the lease for this command id.
+    AlreadyOwned(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -19,6 +27,9 @@ impl fmt::Display for Error {
             Error::Config(m) => write!(f, "config: {m}"),
             Error::Ledger(m) | Error::LockTimeout(m) => write!(f, "ledger: {m}"),
             Error::Spawn(m) => write!(f, "{m}"),
+            Error::Plan(m) => write!(f, "plan: {m}"),
+            Error::Conflict(m) => write!(f, "conflict: {m}"),
+            Error::AlreadyOwned(m) => write!(f, "already owned: {m}"),
         }
     }
 }

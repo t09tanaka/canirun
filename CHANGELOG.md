@@ -7,6 +7,193 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- Adopting a registration after a reboot no longer carries the old boot id
+  forward: an unlaunched one is refreshed, one that reached its launch is
+  settled as interrupted exactly as the reaper settles it (the id stays used
+  up and registering it again answers `AlreadyTerminal`; it is never run
+  again), and the boot id is stamped again at the launch intent and at
+  the spawn. Otherwise the reaper's reboot shortcut could free the budget of
+  a child that runs on the new boot.
+- `canirun resolve` also settles a sidecar that is not terminal but has no
+  ledger entry (it answered `NoEntry` and left the id blocked).
+- `canirun exec` run from inside a managed command whose child has started
+  (`CANIRUN_MANAGED_ID` and `CANIRUN_MANAGED_SCOPE` of this state directory)
+  runs ungated even after the supervisor and its lease are gone, instead of
+  waiting for a budget its own tree holds. The caller must be inside the
+  run (its process group, or below its child or a recorded descendant): a
+  process that merely inherited the two variables is gated as usual.
+- The reaper no longer scans processes under the ledger lock: the scans run
+  before the lock is taken, an entry that is kept is assessed again at most
+  every 5 seconds, and only a recent release answer that still matches the
+  entry and its sidecar is acted on.
+- `canirun gc` trims the history under the history lock, removes a
+  measurement marker only once its record is gone, and removes the receipts
+  of managed commands that ended more than `managed_keep_days` (default 7)
+  ago, with no ledger entry. It never removes one that has not ended.
+- `canirun resolve --force` releases an entry whose only sign of life is a
+  process group that was reused by unrelated processes (the child is gone,
+  none carries the run's id, none is a recorded descendant).
+- The ledger is written as version 2 whenever the `managed` directory cannot
+  be checked, instead of as version 1. A sidecar settled by hand with
+  nothing readable left no longer blocks its id with a conflict.
+- To go back to an older binary: settle every managed entry (`canirun
+  resolve <id>`, or `--force`); the next save then writes version 1 and
+  older binaries work again. Until then an older binary exits 2 on every
+  command. `canirun status --json` has an additive `ledger_format` field
+  (and `status` prints the format when it is 2).
+
+- Library, pre-1.0 breaking: `managed::gc_measurements(ctx)` no longer takes
+  a count (a marker lives as long as its record); `managed::trim_history`,
+  `managed::gc_sidecars` and `lock::refresh_verdicts` are new; `Context` gained
+  `reap_cache` and `reassess_secs` (a struct literal built outside the crate no
+  longer compiles; use `Context::new`), and `Config` gained `managed_keep_days`.
+- `runner::Outcome` gained `tracked_to_exit_at`, and `tracker::Record` now
+  takes a stamp flag and returns whether it persisted; `Tracker::finish`
+  takes whether the command was reaped. Pre-1.0: breaking.
+- `runner::Spawn` gained a field, `start_tracker`, so a struct literal built
+  outside the crate no longer compiles. Pre-1.0: this is a breaking change.
+
+### Fixed
+
+- A failed write of the descendant record is retried every tick until one
+  succeeds (it used to be dropped, and the heartbeat clock advanced anyway).
+- The hidden-orphan window ends at `recorded_at` + 2 s only when the
+  supervisor saw the command exit, took the last look and then confirmed
+  the group and anything marked stopped, with nothing left (new sidecar
+  field `tracked_to_exit`, stamped after that stop). If the supervisor died mid-run the window is open
+  from the child's start, so a hidden process forked late holds the entry
+  (`canirun resolve <id> --force` is the way out).
+- The last look is told the command was reaped (`wait4`) instead of asking
+  the kernel about its pid, which may have been reused and made a normal run
+  look failed. A single failed look stays sticky (fail closed).
+- A failed look no longer stamps `recorded_at`.
+- `recorded_at` is a heartbeat, not the time of the last growth: every good
+  look stamps it (written at most about once a second), and the spawn writes
+  the first one. That first stamp starts the heartbeat; it is not an upper
+  bound on the window (only `tracked_to_exit` ends it).
+- A look at the process table that fails, is empty, or does not list a
+  command that still runs is persisted at once as a recorder failure
+  (`descendants_truncated`), without dropping what was recorded, so a
+  supervisor that dies mid-run leaves a hold, not a release.
+- More than 4096 live descendants keep the entry held by design (the rest
+  are unknown); `canirun resolve <id> --force` is the way out.
+- A failed descendant recorder (a panicked or unstarted thread, an
+  unreadable running command) is "could not be checked", not "nothing
+  recorded". A recorded descendant is dropped only after two looks in a row
+  did not find it.
+- macOS: a refused `KERN_PROCARGS2` is hidden only for `EINVAL`/`EPERM` on a
+  process the kernel confirmed is ours; other errors make the scan unknown.
+- A recorder failure is persisted to the sidecar and also stops the
+  supervisor that saw it from releasing (`finish` keeps the entry); the
+  reaper reads it as "could not be checked" until `resolve --force`.
+- A hidden orphan only keeps an entry when it started from the child's start
+  (the launch intent when unknown) to two seconds after the last recorder
+  write (`recorded_at`), so processes `launchd` starts later no longer hold
+  it. A hold that remains is expected; `resolve --force` is the way out.
+- A command that ended unreaped (no readable start time) now has its live
+  children recorded (the walk is seeded by pid).
+- macOS: the command's start time is also read with `proc_pidinfo` when the
+  process table does not list it (the short form has no start time, so only
+  the full one is used); the retry stays for other platforms.
+- macOS: if the kernel cannot tell the owner of a process of yours, a hidden
+  process of yours is unreadable, the scan is unknown and the entry is held
+  until `resolve --force`.
+- A started entry whose child and group are gone is also kept when a hidden
+  orphan began after the child (as for a launch intent).
+- On macOS an entry can stay held (`ProbeUnknown`) because of a hidden
+  process `launchd` started (an Apple binary); `canirun resolve <id> --force`
+  releases it.
+
+### Added
+
+- Library: managed commands (`canirun::managed`). `register` takes a
+  caller-chosen command id and spec digest (idempotent; a different digest
+  is a conflict) and returns a registered receipt only once the ledger
+  entry exists. `try_admit`, `run_command`, `finish` and `record_measurement`
+  split the admission path into stages. Ownership lives in a sidecar
+  (`managed/<id>.json`). A ledger that holds a managed entry is written as
+  version 2, with its entries under `entries_v2` and no `entries` key, so an
+  older binary refuses to load it instead of reaping the managed entries it
+  cannot recognise. Every binary sharing a state directory must be upgraded
+  before managed commands are used; a ledger without managed entries keeps
+  the old shape and stays readable by older binaries.
+- The reaper no longer frees a managed entry just because its owner's lease
+  is gone: it keeps the charge until the recorded child and its process
+  group are gone, or the boot id changed. An unreadable sidecar is never
+  treated as free. `inspect` lists such entries under `managed`. Plain
+  `exec` entries are reaped as before.
+- Managed commands carry `CANIRUN_MANAGED_ID=<id>` in their environment.
+  After the leader exits, and before a managed entry is released, every
+  process of the user still carrying the id is stopped (SIGTERM, then
+  SIGKILL, only when pid and start time still match) and the entry is kept
+  until none is left. This covers descendants that left the process group
+  (`setsid`, double fork); one that cleared its environment is not found.
+  A scan that cannot read every process never releases anything.
+- A launch intent no longer blocks the shared budget forever: with the
+  owner's lease gone, 60 seconds since the intent and no marked process, the
+  reaper settles it as `Interrupted`. A missing timestamp or an unknown scan
+  keeps it.
+- `canirun resolve <id> [--json] [--force]` releases an entry whose owner is
+  gone after the same checks, and says what it checked. `--force` also
+  releases an entry kept only because something could not be checked
+  (recorded as `interrupted`, `forced: <reason>`); never one known to be
+  running. `status` lists held
+  entries and `inspect` adds a `hint` to them.
+- `history.jsonl` records written by `managed::record_measurement` carry a
+  `measurement_id` (optional; older history still reads). A repeated
+  measurement is a duplicate only when its id is in the history, never
+  because another record has the same content.
+- `canirun inspect --json`: a read-only, versioned snapshot of the ledger,
+  limits, live metrics and referenced history, with snapshot and policy
+  digests. It never reaps or writes; entries without a held lease are
+  flagged `suspect_dead` and still counted.
+- `canirun estimate --json -- <command>`: when would this command start and
+  finish if queued now? Replays the ledger through `admit` with the same
+  limits and queue rules. Unknown values are `null` with a reason, a fallback
+  runtime is only ever a `ranking`, and overrunning entries have unknown
+  remaining time.
+- Library: `inspect`, `forecast` (WorkloadPlan with dependencies, external
+  delays, shared setup, an overlay of future demand with de-duplication
+  against the ledger, and `coverage`), `estimate::command_plan` and
+  `lock::snapshot_read_only`. `Limits` and `LiveSnapshot` are now
+  serializable. `error::Error` gained a `Plan` variant.
+
+### Fixed
+
+- Managed commands, hidden environments: on macOS the kernel withholds the
+  environment of Apple's own binaries and hardened-runtime apps (about two
+  thirds of one measured user's processes), and these were read as "no
+  marker", so a `sh -c` command whose child left the process group went
+  unseen and its budget was freed while it ran. Such a process is now
+  *hidden*, kept apart from absent (and never makes a scan unknown). The
+  runner also records the descendants of a running command (pid plus start
+  time, read from the process table every 250 ms, at most 4096) in the
+  sidecar; a recorded process that still runs keeps the budget and is
+  stopped with the marked ones, and a record that overflowed keeps the entry
+  as "could not be checked". A launch intent is now also kept while a hidden
+  process that began after it is an orphan or the dead supervisor's child.
+  Another user's processes are told apart by the kernel's owner (macOS:
+  `proc_pidinfo`), not skipped by guesswork.
+- Managed commands, review fixes: on macOS the arguments of a process were
+  searched for the marker as well as its environment, so an argument could
+  hide or fake it; only the environment is read now. The marker also
+  carries `CANIRUN_MANAGED_SCOPE` (a hash of the state directory), and only
+  a process with the same id and scope is waited for or signalled, so the
+  same id in another state directory is left alone. A clear scan has to be
+  repeated before it is believed, and an unknown one is retried after the
+  signals too. A process whose owner cannot be read is read anyway
+  instead of being skipped. Nested managed commands track the innermost one.
+- `canirun resolve` on an id the ledger does not have says `no such entry`
+  (exit 3, `"found": false` in `--json`) instead of "kept, still charged".
+- `canirun gc` removes old `measurements/*.applied` markers (it keeps the
+  newest `history_keep`); they used to pile up.
+- A job that received SIGTERM twice in a row while queued could die before
+  its exit file was written and show as lost. The library no longer restores
+  default signal handling on its own; the CLI does it just before it
+  re-raises.
+
 ## [0.4.2] - 2026-11-05
 
 ### Fixed

@@ -4,12 +4,17 @@ use canirun::display::{
     fmt_bytes, fmt_duration, is_idle, label, running_for, truncate, IDLE_AFTER, IDLE_CORES,
 };
 use canirun::error::Result;
-use canirun::{exec, lock, Context};
+use canirun::ledger::Ledger;
+use canirun::{exec, lock, managed, Context};
 
 pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     let ledger = lock::load_reaped(ctx)?;
+    let format = Ledger::file_format(&ctx.paths.ledger_file());
     if json {
-        println!("{}", serde_json::to_string_pretty(&ledger)?);
+        // `ledger_format` is additive: what the file on disk is written as.
+        let mut v = serde_json::to_value(&ledger)?;
+        v["ledger_format"] = format.into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(0);
     }
     let now = ctx.clock.now();
@@ -31,6 +36,11 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
     };
 
     println!("budget {used}/{} used", cfg.budget);
+    if format > canirun::ledger::SCHEMA_VERSION {
+        println!(
+            "ledger format v{format}: older canirun binaries refuse it until every managed entry is settled (`canirun resolve <id> [--force]`)"
+        );
+    }
     if let Some(s) = ctx.live.snapshot() {
         println!(
             "machine {} available, cpu {:.0}% busy",
@@ -81,6 +91,18 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
             truncate(&label(&e.repo, &e.subdir, &e.argv), 70),
             eta_of(&e.id)
         );
+    }
+    let held: Vec<_> = managed::views(ctx, &ledger.entries)
+        .into_iter()
+        .filter(|v| v.quarantined)
+        .collect();
+    if !held.is_empty() {
+        println!();
+        println!("held, owner gone ({})", held.len());
+        for v in &held {
+            println!("  {}  {}  -> {}", v.command_id, v.reason, v.hint);
+        }
+        println!("  (still charged until their processes stop; `resolve` checks and releases)");
     }
     if let Some(head) = order.first() {
         let decision = admit::admit(&queue, &head.id, 0, head.waited_secs, limits, None);

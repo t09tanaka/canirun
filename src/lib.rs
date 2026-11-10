@@ -32,22 +32,32 @@ pub mod config;
 pub mod context;
 pub mod display;
 pub mod error;
+pub mod estimate;
 pub mod eta;
 pub mod exec;
+pub mod forecast;
 pub mod gitctx;
 pub mod history;
+pub mod inspect;
 pub mod jobs;
 pub mod key;
 pub mod ledger;
+pub mod lineage;
 pub mod live;
 pub mod lock;
+pub mod managed;
+pub mod marker;
 pub mod paths;
+pub mod process;
+pub mod reap;
+pub mod receipt;
 pub mod runner;
+pub mod tracker;
 pub mod usage;
 pub mod weight;
 
 pub use context::{
-    Clock, Context, FakeClock, FixedLive, LiveProvider, NoSupervisor, Supervisor, SystemClock,
-    SystemLive,
+    BootIdProvider, Clock, Context, FakeClock, FixedBoot, FixedLive, FixedScan, LiveProvider,
+    NoSupervisor, ProcessScan, Supervisor, SystemBoot, SystemClock, SystemLive, SystemScan,
 };
 pub use paths::Paths;

@@ -235,12 +235,200 @@ The runner is the same admission path as `exec`: weights, guards, history
 and liveness all apply. Job files live in `jobs/` under the state
 directory; `gc` removes those finished more than `jobs_keep_days` ago.
 
+### `canirun inspect --json` and `canirun estimate --json -- <command>`
+
+Both only read; they never register an entry, take a lease, reap a dead
+entry or write history (`status` reaps, `inspect` does not).
+
+`inspect` prints the ledger (a `suspect_dead` flag on entries whose lease is
+not held, which are kept and counted as busy), the limits, the live
+machine metrics and the history the ledger entries refer to, with a
+`snapshot_digest` and a `policy_digest`.
+
+`estimate` predicts when the command would start and finish if it were
+queued now, by replaying the ledger through the same admission function
+`exec` uses. Times are milliseconds from now; a value that cannot be
+computed is `null` with the reason in `null_reasons`. With no usable history
+`runtime_source` is `fallback`: the finish time is `null` and only
+`ranking` carries a number (a 60 s default, good for ordering candidate
+machines, not an ETA). A running entry past its recorded runtime has an
+unknown remaining time, not zero. Live memory and CPU guards are read once;
+what depends on them is marked `conditional`.
+
+The same machinery is available to Rust callers as `canirun::inspect` and
+`canirun::forecast` (a multi-node `WorkloadPlan` with dependencies, external
+delays and shared setup, plus an overlay of demands the ledger does not
+show yet). The crate is 0.x and that API is not stable.
+
+### `canirun resolve <id> [--json] [--force]`
+
+A managed command (one driven through `canirun::managed` by another
+program) needs every `canirun` that shares the state directory to be
+upgraded: a ledger that holds a managed entry is written in a new shape
+(`entries_v2`), and an older binary refuses to load it rather than reap
+entries it cannot recognise (every command then exits 2). To go back to an
+older binary, settle every managed entry (`canirun resolve <id>`, or
+`--force`); the next save writes the old shape (`version` 1) and older
+binaries work again. `canirun status` shows the format (`ledger_format` in
+`--json`). It keeps its budget while its supervisor is gone, until nothing it
+started is still running. `status` lists such entries as `held, owner gone`,
+and `inspect` marks them `quarantined` with a `hint`. Most are released by
+themselves once their processes stop. Two kinds are not: an entry whose
+sidecar cannot be read, and a launch intent whose timestamp is missing. For
+those, `canirun resolve <id>` runs the same checks on demand: the owner's
+lease must be gone, and the child, its process group, every process of
+yours carrying `CANIRUN_MANAGED_ID=<id>` (and this state directory's
+`CANIRUN_MANAGED_SCOPE`) and every recorded descendant must be gone. It prints the entry's state, what was checked and the result, and
+records the outcome as `interrupted`. An id whose sidecar is not terminal
+but has no ledger entry (stranded, for example by an older binary) is settled
+the same way. Exit 0 means released, 1 means kept
+(still charged), 2 an error, 3 that the ledger has no entry with that id
+(it prints `no such entry`, and `--json` has `"found": false` and
+`"verdict": "NoEntry"`). It never kills anything.
+
+A launch intent (the supervisor died around the spawn, so it is unknown
+whether a child exists) is released by the reaper itself once the lease is
+gone, at least 60 seconds have passed since the intent and no process
+carries the id. An unknown scan, or no timestamp, keeps it: time alone never
+releases it. `resolve` skips the 60 seconds.
+
+`resolve --force` is for an entry kept only because something **could not be
+checked**: a process that could not be read, a launch intent that a hidden
+process may belong to, or a record of descendants that did not fit. It
+releases the entry anyway and records `interrupted` with `forced: <reason>`
+(`--json` has `"forced": true`). It never releases what is known to be
+running: a held lease, a running child, a marked process or a recorded
+descendant keeps the entry (exit 1), with or without `--force`. A live
+process group alone does not count as running when the group number was
+reused, and only positive evidence shows that: a process whose pid is the
+recorded group number is alive and started at a different time than the
+recorded child (a new leader), the child is gone, and no process carries
+the run's id or is a recorded descendant. Then `--force` releases the entry
+(`forced: the recorded process group number now belongs to a different
+process group`). A live group with no such leader, or one whose start time
+cannot be compared, may be the original group (members without the marker)
+and stays held. Exit codes
+are the same (0 released, 1 kept, 2 error, 3 no such entry).
+
+How descendants are found, and what this cannot see:
+
+- **Marker.** A managed command carries `CANIRUN_MANAGED_ID` and
+  `CANIRUN_MANAGED_SCOPE` (the first 16 hex digits of the SHA-256 of the
+  state directory's canonical path), which its descendants inherit. Two
+  state directories that use the same command id do not see, hold or stop
+  each other's processes. Only the innermost managed command is tracked:
+  one started inside another overwrites the outer id and scope.
+- **Hidden environments.** On macOS the kernel withholds the environment of
+  Apple's own binaries (`/bin/sh`, `/bin/bash`, `/usr/bin/env`, `perl`,
+  `sleep`, ...) and of hardened-runtime apps. Such a process is *hidden*:
+  neither marked nor proven unmarked. A hidden process alone never makes a
+  scan "unknown" (on one measured Mac about two thirds of the user's
+  processes are hidden; that would block every release), and an empty
+  environment cannot be told from a hidden one, so it counts as hidden too.
+  Processes of other users are not scanned. On Linux every process of the
+  user is readable, except one that made itself non-dumpable (an agent or
+  sandboxed helper), which is read as unmarked.
+- **Descendants are recorded while the command runs.** The runner reads the
+  process table every 250 ms and records every process below the command
+  (pid plus start time, following parent links) in the sidecar's
+  `descendants` (at most 4096; more are not recorded and
+  `descendants_truncated` is set; processes that exited are dropped from the
+  record). A recorded process that still runs keeps the budget, however it
+  left the process group (`setsid`, double fork), whatever its environment
+  hides, and it is stopped like a marked one (SIGTERM, then SIGKILL, after
+  checking pid and start time again). If descendants were dropped, a clear
+  scan cannot be believed and the entry is kept as "could not be checked".
+- **A launch intent and hidden processes.** A launch intent (the supervisor
+  died around the spawn) is released by the reaper once the lease is gone,
+  60 seconds have passed, no marked or recorded process runs, *and* no
+  hidden process that started after the intent has `launchd`/`init` or the
+  dead supervisor as its parent. Any such process keeps the entry (it may be
+  the child); `resolve --force` overrides that. No timestamp keeps it.
+  `resolve` skips the 60 seconds.
+- A scan that finds nothing is repeated once and believed only if it finds
+  nothing again; an unknown one is repeated a few times first.
+- On macOS a process of yours whose environment cannot be read at all is
+  hidden. The owner of a process comes from the kernel (`proc_pidinfo`).
+
+What is not found, and what follows:
+
+- A descendant that forks and loses its parent within one sampling interval
+  (250 ms), before it was recorded, and whose environment is hidden or
+  cleared: not found. The marker finds it if its environment is readable.
+- A hidden descendant whose parent was never recorded and which is an orphan
+  of something other than `launchd` (for example reparented to a user
+  subreaper): not found once the command's own record is gone.
+- A descendant that cleared its environment (`env -i ...`) loses the
+  marker; it is still found if it was recorded while its parent lived.
+- The process group check does not compare start times, so a group number
+  that was reused by an unrelated group keeps an entry held for as long as
+  that group lives. That errs on the side of keeping the budget; the way out
+  is `canirun resolve <id> --force`, which releases it only when a new
+  leader (the process whose pid is the group number, started at a different
+  time than the recorded child) proves the number was reused, nothing in the
+  group carries the run's id or is a recorded descendant, and the child is
+  gone. Without that proof the group may be the original one (a member that
+  cleared its environment, or was born after tracking stopped) and stays.
+- A scan that could not read some process of the user is unknown and
+  releases nothing, until `resolve --force`.
+- **A Mac entry that stays held.** On macOS a process that `launchd`
+  started (an Apple binary whose environment is hidden) can be mistaken for
+  the child of a launch intent or a started command: the reaper then
+  answers "could not be checked" (`ProbeUnknown`) and the entry stays held.
+  Only a hidden process that started in a window counts: from the child's
+  start (the launch intent when that is unknown) to two seconds after the
+  last time the recorder wrote (`recorded_at` in the sidecar). That end
+  applies only when the supervisor saw the command exit, took the last
+  look and confirmed everything it left stopped (`tracked_to_exit` in the
+  sidecar, stamped after that stop); with no record, or when the
+  supervisor died mid-run (the command may have forked later), the window
+  has no end. Such a hold is expected, not a bug,
+  and the way out is `canirun resolve <id> --force`, after checking that
+  nothing of the command still runs.
+- Recording the descendants that fails is written to the sidecar too
+  (`descendants_truncated`), and the supervisor that saw it fail does not
+  release either: the entry stays held until `resolve --force`.
+- If the kernel cannot tell the owner of a process of yours (macOS
+  `proc_pidinfo` refused both ways), a process whose environment is hidden
+  is unreadable, the scan is unknown, and the entry is held. The way out
+  is the same: `canirun resolve <id> --force`.
+- Recording the descendants that fails (the thread panics or cannot start,
+  or the command cannot be read while it runs) counts as "could not be
+  checked", never as "no descendants". A recorded descendant is dropped only
+  after two looks in a row did not find it.
+  A look at the process table that fails, comes back empty, or does not list
+  a command that still runs is a recorder failure too: it is written to the
+  sidecar at once, during the run, so a supervisor that dies mid-run leaves
+  a hold, not a release. A write that fails is retried every tick until one
+  succeeds. `recorded_at` is a heartbeat: every good look stamps it (written
+  about once a second; a failed look never stamps it), and the spawn writes
+  the first.
+- A single failed look is sticky on purpose: even a transient read failure
+  of the process table marks the record truncated, and the run is held until
+  `canirun resolve <id> --force`. The last look is told the command was
+  reaped, so it does not ask the kernel about a pid that may be reused.
+- **More than 4096 live descendants.** Only 4096 are recorded; past that the
+  rest are unknown, so the record is marked truncated and the entry stays
+  held after the command ends, by design. The way out is
+  `canirun resolve <id> --force`, after checking that nothing of the command
+  still runs.
+- On macOS a process whose environment the kernel refuses with anything but
+  `EINVAL`/`EPERM`, or whose owner the kernel did not confirm, is
+  unreadable and makes the scan unknown.
+
 ### `canirun config [--path]` and `canirun gc`
 
 `config` prints the effective configuration (defaults merged with the
 file). `gc` reaps dead entries and trims history to `history_keep`
-records per key; both also happen on the fly, so `gc` is only for
-tidiness.
+records per key (under the history lock), removes the
+`measurements/*.applied` markers that `managed::record_measurement` leaves
+once their record is trimmed away (a marker is kept as long as its
+record), and removes the receipts of managed commands (`managed/<id>.json`)
+that ended more than `managed_keep_days` (default 7; 1 to 3650, anything else
+is a configuration error) ago and have no ledger
+entry, together with leftover temporary files of that age. A command that
+has not ended is never removed. Reaping also happens on the fly, so `gc` is
+only for tidiness.
 
 ## Configuration
 
@@ -264,6 +452,7 @@ backfill_max_job_secs = 300 # a command learned to take at most this may pass a 
 backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has waited this long
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
+managed_keep_days = 7       # ...and receipts of managed commands that ended longer ago (1..3650)
 
 [[pattern]]                 # glob over the full argv string, first match wins
 match = "*stryker*"
@@ -423,15 +612,15 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ./scripts/coverage-gate.sh      # 100% lines on admit / weight / key / eta
 cargo install cargo-schemata --locked --version 0.1.0   # once
-cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs -- --lib
+cargo schemata --file src/admit.rs --file src/weight.rs --file src/key.rs --file src/eta.rs --file src/forecast.rs --file src/reap.rs --file src/receipt.rs --file src/marker.rs --file src/lineage.rs -- --lib
 ```
 
 On a Homebrew Rust toolchain (no `llvm-tools-preview`), point `cargo llvm-cov`
 at Homebrew's LLVM: `LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata
 LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov ./scripts/coverage-gate.sh`.
 
-The admission decision, weight derivation, command key and estimate are
-pure modules with 100% line coverage and a zero-survivor mutation gate in CI.
+The admission decision, weight derivation, command key, estimate and
+forecast simulation are pure modules with 100% line coverage and a zero-survivor mutation gate in CI.
 `tests/cli.rs` drives the binary end-to-end with isolated XDG directories.
 
 ## License

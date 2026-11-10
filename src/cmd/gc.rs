@@ -1,9 +1,10 @@
 use canirun::config::Config;
 use canirun::error::Result;
 use canirun::ledger::Ledger;
-use canirun::{history, lock, Context};
+use canirun::{lock, managed, Context};
 
 pub fn run(ctx: &Context, cfg: &Config) -> Result<i32> {
+    lock::refresh_verdicts(ctx);
     let reaped = {
         let _guard = lock::ledger(ctx)?;
         let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
@@ -14,10 +15,13 @@ pub fn run(ctx: &Context, cfg: &Config) -> Result<i32> {
         }
         dead.len()
     };
-    let dropped = history::trim(ctx.paths.history_file(), cfg.history_keep)?;
+    let dropped = managed::trim_history(ctx, cfg.history_keep)?;
     let jobs = crate::cmd::job::gc(ctx, cfg.jobs_keep_days)?;
+    let markers = managed::gc_measurements(ctx)?;
+    let sidecars = managed::gc_sidecars(ctx, cfg.managed_keep_days)?;
     println!(
-        "reaped {reaped} dead entries, trimmed {dropped} history records, removed {jobs} old jobs"
+        "reaped {reaped} dead entries, trimmed {dropped} history records, removed {jobs} old jobs, \
+         removed {markers} old measurement markers, removed {sidecars} old managed receipts"
     );
     Ok(0)
 }

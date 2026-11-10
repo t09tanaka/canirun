@@ -35,7 +35,7 @@ pub struct QueueEntry {
 }
 
 /// What the machine looks like right now.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LiveSnapshot {
     pub available_memory: u64,
     /// Global CPU busy fraction, 0.0..=1.0, sampled just now.
@@ -44,7 +44,7 @@ pub struct LiveSnapshot {
     pub load_avg: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
     pub budget: u32,
     pub memory_reserve: u64,
