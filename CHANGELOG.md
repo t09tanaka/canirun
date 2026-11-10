@@ -5,7 +5,14 @@ All notable changes to task-traffic-controller (called canirun before 0.5.0) are
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-10
+
+### Changed
+
+- **Library breaking change:** `exec::Opts` and `runner::Spawn` gained the
+  `env` and `stdout_log` fields. They are not `#[non_exhaustive]`, so code that
+  builds them with a struct literal must add the fields (or start from
+  `Opts::default()`). The CLI is unaffected.
 
 ### Added
 
