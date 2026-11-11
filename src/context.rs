@@ -151,6 +151,18 @@ pub trait ProcessScan: Send + Sync {
     fn probe_session(&self, c: &crate::process::ChildIdentity) -> crate::reap::Probe {
         crate::process::probe_session(c)
     }
+    /// What is known about the session of the hidden process `p` (see
+    /// [`crate::lineage::standing`]). The answer can release an entry, so
+    /// the default is "nothing known", which never clears a process: an
+    /// implementation whose `scan` reports made-up pids must not have the
+    /// kernel asked about whatever really runs under those numbers. Only an
+    /// implementation whose hidden processes are this machine's real ones
+    /// should override it, with [`crate::process::session_evidence`], as
+    /// [`SystemScan`] does; without that, hidden orphans are judged by time
+    /// and parent alone.
+    fn session_evidence(&self, _p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
+        crate::lineage::SessionEvidence::default()
+    }
 }
 
 /// This machine's processes of the current user.
@@ -160,6 +172,10 @@ pub struct SystemScan;
 impl ProcessScan for SystemScan {
     fn scan(&self, id: &str, scope: &str) -> crate::marker::Scan {
         crate::process::scan_system(id, scope)
+    }
+    /// The scanned processes are real: the kernel is asked.
+    fn session_evidence(&self, p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
+        crate::process::session_evidence(p)
     }
 }
 
@@ -316,6 +332,33 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_real_scan_asks_the_kernel_about_a_session() {
+        let me = std::process::id();
+        let mine = crate::marker::ProcRef {
+            pid: me,
+            start_time: crate::process::start_time(me),
+        };
+        let nothing = crate::lineage::SessionEvidence::default();
+        // What a context uses unless told otherwise: the real scan.
+        let paths = Paths::new("state", "config.toml");
+        let real = Context::new(paths).scan.session_evidence(&mine);
+        assert_eq!(real, crate::process::session_evidence(&mine));
+        assert!(real.sid.is_some(), "{real:?}");
+        assert_eq!(SystemScan.session_evidence(&mine), real);
+        // A fixed scan, and any implementation that does not say otherwise,
+        // know nothing, even about a process that exists.
+        let fixed = FixedScan::probe(crate::reap::Probe::Gone);
+        assert_eq!(fixed.session_evidence(&mine), nothing);
+        struct Bare;
+        impl ProcessScan for Bare {
+            fn scan(&self, _id: &str, _scope: &str) -> crate::marker::Scan {
+                crate::marker::Scan::new(crate::reap::Probe::Gone, Vec::new())
+            }
+        }
+        assert_eq!(Bare.session_evidence(&mine), nothing);
+    }
 
     #[test]
     fn fake_clock_moves_only_when_told() {

@@ -53,6 +53,62 @@ fn kernel_start_time(_pid: u32) -> Option<u64> {
     None
 }
 
+/// When `pid` started, on a clock that setting the wall clock does not
+/// move, with the boot the count belongs to (see [`lineage::StartMark`]).
+/// `None` when the process or the boot id cannot be read, when the count is
+/// zero, and where the OS has no such clock. The caller makes sure `pid` is
+/// the process it means (its own unreaped child, or a pid checked before
+/// and after). Only reads.
+pub fn start_mark(pid: u32) -> Option<lineage::StartMark> {
+    // Pid 0 is not a process, and a pid above `i32::MAX` is not a pid.
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return None;
+    }
+    // The boot id is the machine's own, never an injected one: the count
+    // means something only together with the boot it was read in.
+    let boot = system_boot_id()?;
+    let ticks = kernel_start_ticks(pid).filter(|t| *t != 0)?;
+    Some(lineage::StartMark::new(boot, ticks))
+}
+
+/// macOS: the Mach absolute time at which `pid` was forked
+/// (`ri_proc_start_abstime`). It is set once, at the fork, is kept across
+/// `exec`, stands still while the machine sleeps and starts again at boot.
+#[cfg(target_os = "macos")]
+fn kernel_start_ticks(pid: u32) -> Option<u64> {
+    let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V0,
+            (&mut info as *mut libc::rusage_info_v0).cast(),
+        )
+    };
+    (rc == 0).then_some(info.ri_proc_start_abstime)
+}
+
+/// Linux: the start of `pid` in clock ticks since boot, from
+/// `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn kernel_start_ticks(pid: u32) -> Option<u64> {
+    stat_start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn kernel_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Field 22 (`starttime`) of a `/proc/<pid>/stat` line. The second field,
+/// the command name in parentheses, may itself contain spaces and
+/// parentheses, so the fields are counted from the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn stat_start_ticks(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    // `rest` begins at field 3 (the state).
+    rest.split_ascii_whitespace().nth(19)?.parse().ok()
+}
+
 /// Has our child `pid` ended without being reaped yet (a zombie)? Asked of
 /// the kernel without reaping it: the process table may not list a zombie.
 pub fn has_ended(pid: u32) -> bool {
@@ -96,6 +152,12 @@ pub struct ChildIdentity {
     /// session; only a deliberate `setsid` can. Absent in older sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<i32>,
+    /// When the child started, on a clock the wall clock does not move
+    /// ([`start_mark`]). Absent in older sidecars, where the OS has no such
+    /// clock, and when it could not be read; a hidden orphan is then never
+    /// cleared by the age of its session's leader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_mark: Option<lineage::StartMark>,
 }
 
 impl ChildIdentity {
@@ -107,6 +169,7 @@ impl ChildIdentity {
             start_time: start_time(pid),
             pgid: (pgid > 0).then_some(pgid),
             sid: session_of(pid).filter(|s| *s > 0),
+            start_mark: start_mark(pid),
         }
     }
 }
@@ -124,6 +187,7 @@ impl ChildIdentity {
             start_time: start_time(pid),
             pgid: Some(id),
             sid: Some(id),
+            start_mark: start_mark(pid),
         }
     }
 }
@@ -180,6 +244,52 @@ pub fn probe_session(c: &ChildIdentity) -> Probe {
     reap::session_probe(found.len(), failed)
 }
 
+/// What the kernel says about the session of `p`, for
+/// [`lineage::standing`]. Nothing is reported unless `p` is the same process
+/// (pid and start time) both before and after its session is read, so the
+/// session id is one `p` was a member of throughout. The leader is the live
+/// process whose pid is that id and whose own session is that id; while `p`
+/// is a member the id cannot have been handed to a new process. Its
+/// [`start_mark`] is read as well. Only reads: no process is signalled.
+pub fn session_evidence(p: &ProcRef) -> lineage::SessionEvidence {
+    let unknown = lineage::SessionEvidence::default();
+    let Some(start) = p.start_time else {
+        return unknown;
+    };
+    // `getsid(0)` is the caller's own session, and a pid above `i32::MAX`
+    // is not a pid.
+    if p.pid == 0 || i32::try_from(p.pid).is_err() || start_time(p.pid) != Some(start) {
+        return unknown;
+    }
+    let Some(sid) = session_of(p.pid).and_then(|s| u32::try_from(s).ok()) else {
+        return unknown;
+    };
+    if sid == 0 {
+        return unknown;
+    }
+    let leader_start = if sid == p.pid {
+        Some(start)
+    } else {
+        leader_start_time(sid)
+    };
+    // Read between the two checks of `p`, like the leader's start time: it
+    // is the mark of the process that leads `p`'s session.
+    let leader_mark = leader_start.and_then(|_| start_mark(sid));
+    let same = start_time(p.pid) == Some(start)
+        && session_of(p.pid).and_then(|s| u32::try_from(s).ok()) == Some(sid);
+    if !same {
+        return unknown;
+    }
+    lineage::SessionEvidence::new(Some(sid), leader_start).with_leader_mark(leader_mark)
+}
+
+/// The start time of the live process at pid `sid`, if it leads the session
+/// `sid` (its own session id is its pid). A process that merely has that
+/// pid is not the leader.
+fn leader_start_time(sid: u32) -> Option<u64> {
+    start_time(sid).filter(|_| session_of(sid).and_then(|s| u32::try_from(s).ok()) == Some(sid))
+}
+
 /// Is the recorded child itself still running? A pid that now has a
 /// different start time is a different process.
 pub fn probe_child(c: &ChildIdentity) -> Probe {
@@ -216,12 +326,14 @@ pub fn probe_group(pgid: Option<i32>) -> Probe {
 
 /// Send `sig` to `p` only if the pid still belongs to the process that was
 /// seen (same start time): a reused pid is somebody else. A process whose
-/// start time was never learned is not signalled.
+/// start time was never learned is not signalled, nor is pid 0 or 1, nor a
+/// number above `i32::MAX` (as a `pid_t` it would be negative, which names
+/// a process group or every process).
 pub fn signal_if_same(p: &ProcRef, sig: libc::c_int) -> bool {
     let Some(then) = p.start_time else {
         return false;
     };
-    if p.pid <= 1 || start_time(p.pid) != Some(then) {
+    if p.pid <= 1 || i32::try_from(p.pid).is_err() || start_time(p.pid) != Some(then) {
         return false;
     }
     unsafe { libc::kill(p.pid as libc::pid_t, sig) == 0 }
@@ -532,6 +644,7 @@ mod tests {
             start_time: Some(1),
             pgid: None,
             sid: None,
+            start_mark: None,
         };
         assert_eq!(probe_child(&gone), Probe::Gone);
     }
@@ -555,6 +668,250 @@ mod tests {
         assert_eq!(id.sid, Some(c.id() as i32));
         assert_eq!(id.pgid, Some(c.id() as i32));
         c.wait().unwrap();
+    }
+
+    #[test]
+    fn session_evidence_is_given_only_for_a_process_that_is_still_the_same() {
+        let me = std::process::id();
+        let mine = ProcRef {
+            pid: me,
+            start_time: start_time(me),
+        };
+        let ev = session_evidence(&mine);
+        let sid = u32::try_from(unsafe { libc::getsid(0) }).unwrap();
+        assert_eq!(ev.sid, Some(sid));
+        // The leader, when it still runs, did not start after us.
+        if sid == me {
+            assert_eq!(ev.leader_start, mine.start_time);
+        } else if let Some(l) = ev.leader_start {
+            assert!(l <= mine.start_time.unwrap(), "{ev:?}");
+        }
+        let unknown = lineage::SessionEvidence::default();
+        // Another start time (the pid was reused), no start time, pid 0
+        // (which `getsid` reads as the caller) and a pid that is not one.
+        for p in [
+            ProcRef {
+                pid: me,
+                start_time: mine.start_time.map(|t| t + 1),
+            },
+            ProcRef {
+                pid: me,
+                start_time: None,
+            },
+            ProcRef {
+                pid: 0,
+                start_time: mine.start_time,
+            },
+            ProcRef {
+                pid: u32::MAX,
+                start_time: mine.start_time,
+            },
+        ] {
+            assert_eq!(session_evidence(&p), unknown, "{p:?}");
+        }
+    }
+
+    /// A shell that leads a session of its own and has started one
+    /// `/bin/sleep` in it; with `leave`, the shell then exits. The sleep's
+    /// pid comes from the shell, so it is trusted only once the kernel says
+    /// its session is the shell's, asked while the shell (running, or an
+    /// unreaped zombie) still pins that id. It ends by itself after 20 s.
+    fn session_with_member(leave: bool) -> (std::process::Child, ProcRef) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let script = if leave {
+            "/bin/sleep 20 </dev/null >/dev/null 2>&1 & echo $!"
+        } else {
+            "/bin/sleep 20 </dev/null >/dev/null 2>&1 & echo $!; wait"
+        };
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            c.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut leader = c.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let pid: u32 = line.trim().parse().expect("the member's pid");
+        assert!(pid > 1 && i32::try_from(pid).is_ok(), "{pid}");
+        let member = ProcRef {
+            pid,
+            start_time: start_time(pid),
+        };
+        assert!(member.start_time.is_some(), "the member is not running");
+        // Ours: in the session only our own, unreaped child can lead.
+        assert_eq!(session_of(pid), Some(leader.id() as i32));
+        assert_eq!(start_time(pid), member.start_time);
+        (leader, member)
+    }
+
+    /// Stop a member that [`session_with_member`] proved to be ours: by pid
+    /// and start time, never pid 0 or 1.
+    fn stop_member(member: &ProcRef) {
+        assert!(member.pid > 1 && member.start_time.is_some());
+        signal_if_same(member, libc::SIGKILL);
+        for _ in 0..400 {
+            if start_time(member.pid) != member.start_time {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the member did not end: {member:?}");
+    }
+
+    #[test]
+    fn session_evidence_names_a_leader_that_is_another_process() {
+        let (mut leader, member) = session_with_member(false);
+        let ev = session_evidence(&member);
+        let leader_pid = leader.id();
+        let (leader_start, leader_mark) = (start_time(leader_pid), start_mark(leader_pid));
+        stop_member(&member);
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        assert!(leader_start.is_some());
+        assert_eq!(ev.sid, Some(leader_pid));
+        assert_eq!(ev.leader_start, leader_start);
+        assert_eq!(ev.leader_mark, leader_mark);
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(ev.leader_mark.is_some(), "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn session_evidence_has_no_leader_once_the_leader_is_dead() {
+        let (mut leader, member) = session_with_member(true);
+        let leader_pid = leader.id();
+        // Reaped: nothing has that pid as a session leader any more. (The
+        // number is not handed out again while the member is in it.)
+        leader.wait().unwrap();
+        let ev = session_evidence(&member);
+        stop_member(&member);
+        assert_eq!(ev.sid, Some(leader_pid));
+        assert_eq!(ev.leader_start, None, "{ev:?}");
+        assert_eq!(ev.leader_mark, None, "{ev:?}");
+    }
+
+    #[test]
+    fn a_process_that_does_not_lead_the_session_of_its_pid_is_not_a_leader() {
+        // The kernel never hands a live session's id to a new process, so
+        // "the process at pid == sid is not that session's leader" cannot be
+        // staged from end to end. What can be checked is the lookup itself:
+        // asked about the pid of a live process that leads no session, it
+        // names no leader; asked about one that does, it names it.
+        let mut plain = Command::new("/bin/sleep").arg("20").spawn().unwrap();
+        let pid = plain.id();
+        let (alive, session) = (start_time(pid), session_of(pid));
+        let found = leader_start_time(pid);
+        plain.kill().unwrap();
+        plain.wait().unwrap();
+        assert!(alive.is_some());
+        assert!(session.is_some_and(|s| s > 0 && s as u32 != pid));
+        assert_eq!(found, None);
+
+        let (mut leader, member) = session_with_member(false);
+        let found = leader_start_time(leader.id());
+        let want = start_time(leader.id());
+        stop_member(&member);
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        assert!(want.is_some());
+        assert_eq!(found, want);
+        // And a pid nobody has.
+        assert_eq!(leader_start_time(0x3fff_fff0), None);
+    }
+
+    #[test]
+    fn a_start_mark_orders_processes_without_the_wall_clock() {
+        let me = std::process::id();
+        let mine = start_mark(me);
+        // Not a process at all, and one that does not exist.
+        assert_eq!(start_mark(0), None);
+        assert_eq!(start_mark(u32::MAX), None);
+        assert_eq!(start_mark(0x3fff_fff0), None);
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert_eq!(mine, None);
+            return;
+        }
+        let mine = mine.expect("our own start mark");
+        assert_eq!(Some(&mine.boot), system_boot_id().as_ref());
+        assert!(mine.ticks > 0);
+        // The same answer every time.
+        assert_eq!(start_mark(me), Some(mine.clone()));
+        let mut child = Command::new("/bin/sleep").arg("20").spawn().unwrap();
+        let first = start_mark(child.id());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let again = start_mark(child.id());
+        let recorded = ChildIdentity::capture_leader(child.id()).start_mark;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let first = first.expect("the child's start mark");
+        assert_eq!(again, Some(first.clone()));
+        assert_eq!(recorded, Some(first.clone()));
+        assert_eq!(first.boot, mine.boot);
+        // Later than us (the test has run for a while before it forks; on
+        // Linux a tick is 10 ms, so equal is allowed there).
+        assert!(first.ticks >= mine.ticks, "{first:?} {mine:?}");
+        if cfg!(target_os = "macos") {
+            assert!(first.ticks > mine.ticks, "{first:?} {mine:?}");
+        }
+        // Reaped: gone.
+        assert_eq!(start_mark(child.id()), None);
+    }
+
+    #[test]
+    fn a_sidecar_child_without_a_start_mark_loads_and_stays_without_one() {
+        // What a version before start marks wrote.
+        let old = r#"{"pid":77,"start_time":5,"pgid":77,"sid":77}"#;
+        let c: ChildIdentity = serde_json::from_str(old).unwrap();
+        assert_eq!(c.start_mark, None);
+        assert_eq!((c.pid, c.start_time, c.sid), (77, Some(5), Some(77)));
+        // Nothing is invented for it when it is written again.
+        assert_eq!(serde_json::to_string(&c).unwrap(), old);
+        // With a mark, it is kept.
+        let marked = ChildIdentity {
+            start_mark: Some(lineage::StartMark::new("b", 9)),
+            ..c
+        };
+        let json = serde_json::to_string(&marked).unwrap();
+        assert!(
+            json.contains(r#""start_mark":{"boot":"b","ticks":9}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ChildIdentity>(&json).unwrap(),
+            marked
+        );
+    }
+
+    #[test]
+    fn the_start_ticks_are_read_after_the_command_name() {
+        let tail = "S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 20 21";
+        for comm in ["sleep", "a b", "a) (b c", ")", "x) R 1 2 3 4 5 6 7 8 9"] {
+            let line = format!("77 ({comm}) {tail}");
+            assert_eq!(stat_start_ticks(&line), Some(4242), "{comm}");
+        }
+        // Too short, not a number, no command name.
+        assert_eq!(stat_start_ticks("77 (sleep) S 1 2 3"), None);
+        assert_eq!(
+            stat_start_ticks("77 (sleep) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 x 20"),
+            None
+        );
+        assert_eq!(
+            stat_start_ticks("77 (sleep) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 -5 20"),
+            None
+        );
+        assert_eq!(stat_start_ticks(tail), None);
+        assert_eq!(stat_start_ticks(""), None);
     }
 
     #[test]

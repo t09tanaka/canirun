@@ -10,9 +10,117 @@
 //! runs. A descendant that is recorded and still running keeps the budget,
 //! however it left the process group. One that forks and loses its parent
 //! between two samples is missed.
+//!
+//! # Hidden orphans
+//!
+//! What both the marker and the record miss is a descendant that is hidden,
+//! left the command's session, and was never recorded (it lost its parent
+//! between two samples, or was born after the supervisor, and so the
+//! tracker, died). All that is left of it is a hidden process whose parent
+//! is `init` / `launchd`. So an entry whose child, group, session, marked
+//! and recorded processes are all gone is still kept while such a process
+//! exists ([`standing`]); releasing it would let the caller start a second
+//! copy of a command that still runs, which is the worse failure.
+//!
+//! Unrelated processes look the same: every job `launchd` starts has parent
+//! 1, and so does every orphan of another shell. Two rules tell them apart;
+//! each is a proof, not a guess.
+//!
+//! 1. **Time.** A descendant starts after the command's child, so a hidden
+//!    process that started before it is unrelated. The other end closes only
+//!    when the tracker covered the child's whole life ([`suspicion_window`]).
+//!    It must not close at the moment the last *known* member was seen
+//!    alive: an unrecorded escapee that outlives every known member can fork
+//!    an hour later, and that child is a descendant too. With a dead
+//!    supervisor the window therefore stays open.
+//! 2. **Session.** A managed child is started with `setsid`, so it leads a
+//!    session of its own, and nothing can join an existing session: a
+//!    process is in a session because it created it (`setsid`, the session
+//!    id is then its own pid) or because the process that forked it was in
+//!    it. Every member of a session therefore descends from its leader, and
+//!    every descendant of the child is in the child's session or in one
+//!    created by another descendant. So a hidden process is unrelated when
+//!    - (a) its session is `init`'s (id 1: on macOS many `launchd` jobs,
+//!      Spotlight workers among them), or
+//!    - (b) the session's leader is still running and started before the
+//!      command's child (an orphan of a terminal or of a test runner that
+//!      was there before the command).
+//!
+//!    The leader cannot be confused with a later process: a pid is not
+//!    handed out again while it is the id of a session that has members.
+//!    This rule needs the child to be recorded as its own session leader
+//!    ([`standing`]'s `own_session`); for a launch intent, where no child
+//!    was recorded, it is not used.
+//!
+//! # Which clock rule 2 (b) trusts
+//!
+//! "Started before the child" is not decided by wall-clock start times: the
+//! wall clock can be set back between the two starts, and a leader that is
+//! itself a descendant would then look older than the command. It is
+//! decided by a [`StartMark`]: a count on a clock that only the kernel
+//! moves, with the id of the boot it belongs to. The child's mark is
+//! recorded in the sidecar at the spawn; the leader's is read when the
+//! entry is judged.
+//!
+//! - Linux: the process's start in clock ticks since boot (field 22 of
+//!   `/proc/<pid>/stat`), with `/proc/sys/kernel/random/boot_id`. The kernel
+//!   reports it relative to the reader's time namespace, so both reads are
+//!   assumed to come from the same one.
+//! - macOS: the process's start in Mach absolute time
+//!   (`ri_proc_start_abstime` of `proc_pid_rusage`), with
+//!   `kern.bootsessionuuid`. Mach absolute time stands still while the
+//!   machine sleeps, which keeps the order of two starts, and begins again
+//!   at every boot, which is why marks of different boots are never
+//!   compared.
+//! - Elsewhere there is no mark, and (b) clears nothing.
+//!
+//! (b) clears a process only when both marks were read, both are of the
+//! same boot, and the leader's count is strictly smaller. A sidecar written
+//! before marks existed has none, so (b) is off for it. An unreadable mark,
+//! another boot, or an equal count keeps the process. The wall-clock start
+//! times are still compared as well, and can only add reasons to keep: a
+//! leader that started at or after the window's start by the wall clock, or
+//! a member that claims to be older than its own leader, is kept.
+//!
+//! What a wall clock that stepped back can still do, and is **not**
+//! detected: rule 1 compares the hidden process's own wall-clock start with
+//! the child's. A descendant that starts after the clock was set back to
+//! before the child's start looks older than the command and is treated as
+//! outside the window. That comparison is older than the session rule and
+//! is not changed by it. (a) uses no clock at all.
+//!
+//! # What these rules do not cover
+//!
+//! - **Another user.** The scan lists only this user's processes. That is
+//!   not a proof of anything: a descendant that runs a setuid program
+//!   changes user and leaves the scan, hidden or not. Such a process is not
+//!   found by the marker, by the record once its parent is gone, or by this
+//!   module.
+//! - **Work handed to `init` / `launchd`.** (a) draws a line: a process is
+//!   a descendant only if it was forked below the command. Work that the
+//!   command *asks* `launchd`, or a daemon that already runs, to start
+//!   (`open`, `launchctl submit` or `bootstrap`, an XPC or D-Bus request, a
+//!   `systemd-run` unit) is forked by that service, sits in its session,
+//!   and is not counted, although the command caused it.
+//!
+//! What stays a possible descendant, because nothing readable tells it from
+//! a real one: a hidden orphan that leads its own session (a `launchd` job
+//! started that way, a real `setsid` escapee, or the child of *another*
+//! managed command whose supervisor died: it leads its own session by
+//! construction), one whose session leader is gone (what another managed
+//! command left behind looks like this), and one whose leader started
+//! inside the window. So commands whose supervisors die at the same time
+//! can still hold each other while their hidden processes run. On macOS the
+//! coalition id (inherited, and not changeable without privilege) would
+//! separate the `launchd` jobs among these, but it has to be recorded at
+//! spawn, which the sidecar does not do yet. Until then such an entry is
+//! held until the process ends or a person settles it with
+//! `resolve --force`; [`crate::managed::hidden_suspects`] names the
+//! processes.
 
 use crate::marker::{HiddenProc, ProcRef, Scan};
 use crate::reap::Probe;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -405,19 +513,200 @@ pub fn suspicion_window(
 /// outcome is unknown? One that started within the window (`since`, `until`
 /// as in [`suspicion_window`]; an unknown start time counts) and whose
 /// parent is `init` / `launchd` (pid 1: it was orphaned) or the supervisor
-/// that died.
+/// that died. This is the test by time and parent alone; [`standing`] also
+/// uses the session.
 pub fn suspicious_hidden(
     hidden: &[HiddenProc],
     since: u64,
     until: Option<u64>,
     supervisor: u32,
 ) -> bool {
-    hidden.iter().any(|h| {
-        h.proc
-            .start_time
-            .is_none_or(|t| t >= since && until.is_none_or(|u| t <= u))
-            && h.parent.is_some_and(|p| p == 1 || p == supervisor)
-    })
+    hidden
+        .iter()
+        .any(|h| orphan_in_window(h, since, until, supervisor))
+}
+
+/// Is `h` inside the window and an orphan (or the dead supervisor's
+/// child)? The test [`suspicious_hidden`] applies to each process.
+pub fn orphan_in_window(h: &HiddenProc, since: u64, until: Option<u64>, supervisor: u32) -> bool {
+    h.proc
+        .start_time
+        .is_none_or(|t| t >= since && until.is_none_or(|u| t <= u))
+        && h.parent.is_some_and(|p| p == 1 || p == supervisor)
+}
+
+/// When a process started, on a clock the wall clock does not move: a
+/// count that only grows while one boot lasts, and the id of that boot.
+/// Linux: clock ticks since boot. macOS: Mach absolute time. Two marks say
+/// which process started first only when their boots are the same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct StartMark {
+    /// The boot the count belongs to.
+    pub boot: String,
+    /// The count at the process's start.
+    pub ticks: u64,
+}
+
+impl StartMark {
+    pub fn new(boot: impl Into<String>, ticks: u64) -> Self {
+        StartMark {
+            boot: boot.into(),
+            ticks,
+        }
+    }
+}
+
+/// What the OS says about the session of a process. The default is
+/// "nothing known", which never clears a process.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct SessionEvidence {
+    /// Its session id, read while pid and start time still matched.
+    pub sid: Option<u32>,
+    /// The start time of the session's leader: the live process whose pid
+    /// is the session id and whose own session is that id. `None` when
+    /// there is no such process or it could not be read.
+    pub leader_start: Option<u64>,
+    /// That leader's [`StartMark`], read now. `None` when there is no
+    /// leader, it could not be read, or this OS has no such clock.
+    pub leader_mark: Option<StartMark>,
+}
+
+impl SessionEvidence {
+    /// A session id and its leader's wall-clock start time; no mark.
+    pub fn new(sid: Option<u32>, leader_start: Option<u64>) -> Self {
+        SessionEvidence {
+            sid,
+            leader_start,
+            leader_mark: None,
+        }
+    }
+
+    /// The same, with the leader's mark.
+    pub fn with_leader_mark(mut self, mark: Option<StartMark>) -> Self {
+        self.leader_mark = mark;
+        self
+    }
+}
+
+/// Where a hidden process stands for a command whose child and everything
+/// known below it are gone (see the module documentation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Standing {
+    /// It started outside the window: unrelated.
+    OutsideWindow,
+    /// Its parent is neither `init` nor the dead supervisor: unrelated (a
+    /// descendant with a living parent is found through that parent).
+    HasParent,
+    /// It is in `init`'s session, which no descendant can be in: unrelated.
+    InitSession,
+    /// Its session's leader runs and started before the command's child,
+    /// by marks of the same boot: unrelated.
+    OlderSession,
+    /// The command's child was not recorded as the leader of its own
+    /// session, so sessions prove nothing: kept.
+    NoOwnSession,
+    /// Its start time or its session could not be read: kept.
+    SessionUnknown,
+    /// It leads its own session, as a `setsid` escapee does: kept.
+    OwnSession,
+    /// Its session's leader is gone, so the session's origin is unknown:
+    /// kept.
+    LeaderGone,
+    /// Its session's leader started inside the window and may be a
+    /// descendant itself: kept.
+    LeaderInWindow,
+    /// It claims to be older than its session's leader: the clock stepped
+    /// back, start times prove nothing: kept.
+    ClockDisorder,
+    /// The command's child has no recorded [`StartMark`] (an older sidecar,
+    /// or it could not be read at the spawn), so nothing but the wall clock
+    /// says the leader is older: kept.
+    NoChildMark,
+    /// The leader's [`StartMark`] could not be read: kept.
+    LeaderMarkUnknown,
+    /// The child's mark and the leader's are of different boots and cannot
+    /// be compared: kept.
+    OtherBoot,
+    /// By the marks the leader did not start before the child, although
+    /// the wall clock says it did (it was set back, or the two starts fall
+    /// on the same count): kept.
+    LeaderNotOlder,
+}
+
+impl Standing {
+    /// May it be a descendant nobody recorded?
+    pub fn suspicious(self) -> bool {
+        !matches!(
+            self,
+            Standing::OutsideWindow
+                | Standing::HasParent
+                | Standing::InitSession
+                | Standing::OlderSession
+        )
+    }
+}
+
+/// Where the hidden process `h` stands. `since`, `until` and `supervisor`
+/// are as in [`suspicious_hidden`]. `own_session`: the command's child is
+/// recorded as the leader of its own session. `child_mark`: the child's
+/// [`StartMark`] recorded at the spawn. `session` is what the OS says about
+/// `h`'s session now. Only proof clears a process; anything unknown keeps
+/// it.
+pub fn standing(
+    h: &HiddenProc,
+    since: u64,
+    until: Option<u64>,
+    supervisor: u32,
+    own_session: bool,
+    child_mark: Option<&StartMark>,
+    session: &SessionEvidence,
+) -> Standing {
+    let in_window = h
+        .proc
+        .start_time
+        .is_none_or(|t| t >= since && until.is_none_or(|u| t <= u));
+    if !in_window {
+        return Standing::OutsideWindow;
+    }
+    if !h.parent.is_some_and(|p| p == 1 || p == supervisor) {
+        return Standing::HasParent;
+    }
+    if !own_session {
+        return Standing::NoOwnSession;
+    }
+    let (Some(start), Some(sid)) = (h.proc.start_time, session.sid) else {
+        return Standing::SessionUnknown;
+    };
+    if sid == 1 {
+        return Standing::InitSession;
+    }
+    if sid == h.proc.pid {
+        return Standing::OwnSession;
+    }
+    // The wall clock first: it can only keep.
+    match session.leader_start {
+        None => return Standing::LeaderGone,
+        Some(leader) if leader > start => return Standing::ClockDisorder,
+        Some(leader) if leader >= since => return Standing::LeaderInWindow,
+        Some(_) => {}
+    }
+    // Then the proof, on a clock that cannot be set.
+    let Some(child) = child_mark else {
+        return Standing::NoChildMark;
+    };
+    let Some(leader) = &session.leader_mark else {
+        return Standing::LeaderMarkUnknown;
+    };
+    if leader.boot != child.boot {
+        return Standing::OtherBoot;
+    }
+    if leader.ticks >= child.ticks {
+        return Standing::LeaderNotOlder;
+    }
+    Standing::OlderSession
 }
 
 #[cfg(test)]
@@ -896,6 +1185,356 @@ mod tests {
             None,
             7
         ));
+    }
+
+    /// The child's mark in these tests: boot "b", count 1000.
+    fn child_mark() -> StartMark {
+        StartMark::new("b", 1000)
+    }
+
+    /// Evidence whose leader, when one is read, has an older mark of the
+    /// same boot: the wall clock alone then decides.
+    fn ev(sid: Option<u32>, leader_start: Option<u64>) -> SessionEvidence {
+        SessionEvidence::new(sid, leader_start).with_leader_mark(Some(StartMark::new("b", 999)))
+    }
+
+    #[test]
+    fn a_hidden_orphan_is_cleared_only_by_proof() {
+        // The command: child started at 100, supervisor pid 7, window open.
+        // The hidden process: pid 50, started at 150, orphaned.
+        let orphan = hidden(50, Some(1), Some(150));
+        let mark = child_mark();
+        let at = |h: &HiddenProc, own: bool, e: SessionEvidence| {
+            standing(h, 100, None, 7, own, Some(&mark), &e)
+        };
+        use Standing::*;
+        let cases: [(&str, HiddenProc, bool, SessionEvidence, Standing); 22] = [
+            ("init session", orphan, true, ev(Some(1), None), InitSession),
+            (
+                "init session, leader read",
+                orphan,
+                true,
+                ev(Some(1), Some(1)),
+                InitSession,
+            ),
+            (
+                "older live leader",
+                orphan,
+                true,
+                ev(Some(40), Some(99)),
+                OlderSession,
+            ),
+            (
+                "much older leader",
+                orphan,
+                true,
+                ev(Some(40), Some(0)),
+                OlderSession,
+            ),
+            // A leader in the same second as the child may be a descendant.
+            (
+                "leader at window start",
+                orphan,
+                true,
+                ev(Some(40), Some(100)),
+                LeaderInWindow,
+            ),
+            (
+                "leader in window",
+                orphan,
+                true,
+                ev(Some(40), Some(120)),
+                LeaderInWindow,
+            ),
+            (
+                "leader as old as it",
+                orphan,
+                true,
+                ev(Some(40), Some(150)),
+                LeaderInWindow,
+            ),
+            // The clock stepped back: a member older than its leader.
+            (
+                "older than its leader",
+                orphan,
+                true,
+                ev(Some(40), Some(151)),
+                ClockDisorder,
+            ),
+            // A real setsid escapee: it leads its own session.
+            (
+                "setsid escapee",
+                orphan,
+                true,
+                ev(Some(50), Some(150)),
+                OwnSession,
+            ),
+            (
+                "escapee, old leader claim",
+                orphan,
+                true,
+                ev(Some(50), Some(1)),
+                OwnSession,
+            ),
+            // The leader died (or its pid is now somebody else, not a leader).
+            ("leader gone", orphan, true, ev(Some(40), None), LeaderGone),
+            (
+                "no session read",
+                orphan,
+                true,
+                ev(None, None),
+                SessionUnknown,
+            ),
+            (
+                "no session, leader claim",
+                orphan,
+                true,
+                ev(None, Some(1)),
+                SessionUnknown,
+            ),
+            (
+                "no start time",
+                hidden(50, Some(1), None),
+                true,
+                ev(Some(1), None),
+                SessionUnknown,
+            ),
+            // An older sidecar, or a launch intent: sessions prove nothing.
+            (
+                "child not a leader",
+                orphan,
+                false,
+                ev(Some(1), None),
+                NoOwnSession,
+            ),
+            (
+                "child not a leader 2",
+                orphan,
+                false,
+                ev(Some(40), Some(1)),
+                NoOwnSession,
+            ),
+            // The dead supervisor's child is judged like an orphan.
+            (
+                "supervisor child",
+                hidden(50, Some(7), Some(150)),
+                true,
+                ev(Some(40), Some(99)),
+                OlderSession,
+            ),
+            (
+                "supervisor child, own",
+                hidden(50, Some(7), Some(150)),
+                true,
+                ev(Some(50), None),
+                OwnSession,
+            ),
+            // Not candidates at all, whatever the session says.
+            (
+                "before the window",
+                hidden(50, Some(1), Some(99)),
+                true,
+                ev(Some(50), None),
+                OutsideWindow,
+            ),
+            (
+                "living parent",
+                hidden(50, Some(8), Some(150)),
+                true,
+                ev(Some(50), None),
+                HasParent,
+            ),
+            (
+                "no parent",
+                hidden(50, None, Some(150)),
+                true,
+                ev(Some(50), None),
+                HasParent,
+            ),
+            (
+                "at the window start",
+                hidden(50, Some(1), Some(100)),
+                true,
+                ev(Some(40), Some(99)),
+                OlderSession,
+            ),
+        ];
+        for (name, h, own, e, want) in cases {
+            assert_eq!(at(&h, own, e), want, "{name}");
+        }
+        // A bounded window: both ends inclusive, an unknown start inside.
+        let bounded = |t| {
+            standing(
+                &hidden(50, Some(1), t),
+                100,
+                Some(200),
+                7,
+                true,
+                Some(&mark),
+                &ev(Some(50), None),
+            )
+        };
+        assert_eq!(bounded(Some(200)), OwnSession);
+        assert_eq!(bounded(Some(201)), OutsideWindow);
+        assert_eq!(bounded(Some(100)), OwnSession);
+        assert_eq!(bounded(None), SessionUnknown);
+        // No window start known (0): no leader is older, only init clears.
+        let open = |e: SessionEvidence| {
+            standing(
+                &hidden(50, Some(1), Some(150)),
+                0,
+                None,
+                7,
+                true,
+                Some(&mark),
+                &e,
+            )
+        };
+        assert_eq!(open(ev(Some(40), Some(0))), LeaderInWindow);
+        assert_eq!(open(ev(Some(1), None)), InitSession);
+        // Nothing known is the default, and what `new` gives has no mark.
+        assert_eq!(SessionEvidence::default(), SessionEvidence::new(None, None));
+        assert_eq!(SessionEvidence::new(Some(3), Some(4)).leader_mark, None);
+        assert_eq!(
+            ev(Some(3), Some(4)),
+            SessionEvidence {
+                sid: Some(3),
+                leader_start: Some(4),
+                leader_mark: Some(StartMark {
+                    boot: "b".into(),
+                    ticks: 999
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn an_older_session_is_proven_by_marks_of_one_boot_and_never_by_the_wall_clock() {
+        use Standing::*;
+        // By the wall clock the leader (99) is older than the child (100)
+        // in every case: the orphan would be cleared if that were believed.
+        let orphan = hidden(50, Some(1), Some(150));
+        let wall = || SessionEvidence::new(Some(40), Some(99));
+        let m = |boot: &str, ticks| Some(StartMark::new(boot, ticks));
+        let cases: [(&str, Option<StartMark>, Option<StartMark>, Standing); 11] = [
+            (
+                "older on the same boot",
+                m("b", 1000),
+                m("b", 999),
+                OlderSession,
+            ),
+            ("much older", m("b", 1000), m("b", 0), OlderSession),
+            // The wall clock was set back after the child started: the
+            // leader is in fact younger, and may be a descendant.
+            (
+                "clock stepped back",
+                m("b", 1000),
+                m("b", 1001),
+                LeaderNotOlder,
+            ),
+            (
+                "far younger",
+                m("b", 1000),
+                m("b", u64::MAX),
+                LeaderNotOlder,
+            ),
+            // The same count proves nothing.
+            ("equal counts", m("b", 1000), m("b", 1000), LeaderNotOlder),
+            // Counts of two boots are not on one clock, whatever they say.
+            ("another boot, smaller", m("b", 1000), m("c", 1), OtherBoot),
+            (
+                "another boot, larger",
+                m("b", 1000),
+                m("c", 2000),
+                OtherBoot,
+            ),
+            ("another boot, equal", m("b", 1000), m("c", 1000), OtherBoot),
+            // A sidecar from before marks were recorded.
+            ("no child mark", None, m("b", 1), NoChildMark),
+            ("no marks at all", None, None, NoChildMark),
+            // The leader's mark could not be read.
+            ("no leader mark", m("b", 1000), None, LeaderMarkUnknown),
+        ];
+        for (name, child, leader, want) in cases {
+            let e = wall().with_leader_mark(leader);
+            let got = standing(&orphan, 100, None, 7, true, child.as_ref(), &e);
+            assert_eq!(got, want, "{name}");
+            assert_eq!(got.suspicious(), want != OlderSession, "{name}");
+        }
+        // The marks never override what the wall clock keeps, and are not
+        // needed for what does not depend on a leader's age.
+        let older = m("b", 1);
+        let mark = child_mark();
+        let with = |sid, leader_start| {
+            let e = SessionEvidence::new(sid, leader_start).with_leader_mark(older.clone());
+            standing(&orphan, 100, None, 7, true, Some(&mark), &e)
+        };
+        assert_eq!(with(Some(40), Some(100)), LeaderInWindow);
+        assert_eq!(with(Some(40), Some(151)), ClockDisorder);
+        assert_eq!(with(Some(40), None), LeaderGone);
+        assert_eq!(with(Some(50), Some(99)), OwnSession);
+        let bare = |sid| {
+            standing(
+                &orphan,
+                100,
+                None,
+                7,
+                true,
+                None,
+                &SessionEvidence::new(sid, None),
+            )
+        };
+        assert_eq!(bare(Some(1)), InitSession);
+        assert_eq!(bare(Some(50)), OwnSession);
+        assert_eq!(bare(Some(40)), LeaderGone);
+    }
+
+    #[test]
+    fn a_start_mark_survives_the_sidecar_and_is_optional_in_it() {
+        let m = StartMark::new("boot-x", 42);
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"boot":"boot-x","ticks":42}"#);
+        assert_eq!(serde_json::from_str::<StartMark>(&json).unwrap(), m);
+    }
+
+    #[test]
+    fn only_the_four_proofs_clear_a_process() {
+        use Standing::*;
+        for s in [OutsideWindow, HasParent, InitSession, OlderSession] {
+            assert!(!s.suspicious(), "{s:?}");
+        }
+        for s in [
+            NoOwnSession,
+            SessionUnknown,
+            OwnSession,
+            LeaderGone,
+            LeaderInWindow,
+            ClockDisorder,
+            NoChildMark,
+            LeaderMarkUnknown,
+            OtherBoot,
+            LeaderNotOlder,
+        ] {
+            assert!(s.suspicious(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn the_orphan_test_agrees_with_the_standing() {
+        let own = SessionEvidence::new(Some(50), Some(150));
+        for (h, until) in [
+            (hidden(50, Some(1), Some(150)), None),
+            (hidden(50, Some(7), Some(150)), None),
+            (hidden(50, Some(1), None), Some(200)),
+            (hidden(50, Some(1), Some(99)), None),
+            (hidden(50, Some(1), Some(201)), Some(200)),
+            (hidden(50, Some(8), Some(150)), None),
+            (hidden(50, None, Some(150)), None),
+        ] {
+            let s = standing(&h, 100, until, 7, true, None, &own);
+            let candidate = !matches!(s, Standing::OutsideWindow | Standing::HasParent);
+            assert_eq!(orphan_in_window(&h, 100, until, 7), candidate, "{h:?}");
+        }
     }
 
     #[test]

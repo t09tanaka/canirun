@@ -64,7 +64,7 @@ use crate::history::{self, Record};
 use crate::ledger::{Entry, Ledger};
 use crate::lineage::{self, Tracked};
 use crate::lock::{self, Lock};
-use crate::marker::ProcRef;
+use crate::marker::{HiddenProc, ProcRef};
 use crate::process::{self, ChildIdentity};
 use crate::reap::{self, Probe, SidecarFacts, Verdict};
 use crate::receipt::{self, Phase};
@@ -154,7 +154,9 @@ pub struct Sidecar {
     /// is that look. Only then does the hidden-orphan window end at
     /// `recorded_at`; without it (the supervisor died mid-run) a hidden
     /// process that started at any time after the child may be its
-    /// descendant, so the entry stays held until `resolve --force`.
+    /// descendant, so the entry stays held while one runs that its session
+    /// does not prove unrelated ([`lineage::standing`]), or until
+    /// `resolve --force`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tracked_to_exit: bool,
 }
@@ -290,6 +292,131 @@ fn assess_with(
     scan: bool,
     ignore_group: bool,
 ) -> Assessment {
+    assess_detailed(ctx, id, manual, scan, ignore_group).0
+}
+
+/// A hidden process that keeps an entry unresolved: it may be a descendant
+/// of the command that nobody recorded (see [`crate::lineage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HiddenSuspect {
+    pub proc: ProcRef,
+    pub parent: Option<u32>,
+    /// Its session id, when it could be read.
+    pub sid: Option<u32>,
+    pub standing: lineage::Standing,
+}
+
+impl HiddenSuspect {
+    pub fn new(
+        proc: ProcRef,
+        parent: Option<u32>,
+        sid: Option<u32>,
+        standing: lineage::Standing,
+    ) -> Self {
+        HiddenSuspect {
+            proc,
+            parent,
+            sid,
+            standing,
+        }
+    }
+
+    /// Why it cannot be ruled out, in words.
+    pub fn reason(&self) -> &'static str {
+        use lineage::Standing;
+        match self.standing {
+            Standing::NoOwnSession => {
+                "the command's child is not recorded as the leader of its own session"
+            }
+            Standing::SessionUnknown => "its start time or session could not be read",
+            Standing::OwnSession => "it leads its own session, as a setsid escapee does",
+            Standing::LeaderGone => "its session's leader is gone",
+            Standing::LeaderInWindow => "its session's leader started after the command",
+            Standing::ClockDisorder => "it is older than its session's leader (the clock moved)",
+            Standing::NoChildMark => {
+                "the command's child has no recorded start mark, so its session's leader cannot be proven older"
+            }
+            Standing::LeaderMarkUnknown => "its session leader's start mark could not be read",
+            Standing::OtherBoot => {
+                "its session leader's start mark and the command's are of different boots"
+            }
+            Standing::LeaderNotOlder => {
+                "its session's leader did not start before the command (the clock moved)"
+            }
+            _ => "it is not a possible descendant",
+        }
+    }
+}
+
+impl std::fmt::Display for HiddenSuspect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid {}", self.proc.pid)?;
+        if let Some(t) = self.proc.start_time {
+            write!(f, " started {t}")?;
+        }
+        if let Some(s) = self.sid {
+            write!(f, " session {s}")?;
+        }
+        write!(f, ": {}", self.reason())
+    }
+}
+
+/// The hidden processes in `hidden` that may be unrecorded descendants.
+fn suspects(
+    ctx: &Context,
+    hidden: &[HiddenProc],
+    (since, until): (u64, Option<u64>),
+    supervisor: u32,
+    own_session: bool,
+    child_mark: Option<&lineage::StartMark>,
+) -> Vec<HiddenSuspect> {
+    hidden
+        .iter()
+        .filter(|h| lineage::orphan_in_window(h, since, until, supervisor))
+        .filter_map(|h| {
+            // The machine is asked only where the answer can clear it.
+            let session = if own_session {
+                ctx.scan.session_evidence(&h.proc)
+            } else {
+                lineage::SessionEvidence::default()
+            };
+            let standing = lineage::standing(
+                h,
+                since,
+                until,
+                supervisor,
+                own_session,
+                child_mark,
+                &session,
+            );
+            standing
+                .suspicious()
+                .then(|| HiddenSuspect::new(h.proc, h.parent, session.sid, standing))
+        })
+        .collect()
+}
+
+/// The hidden processes that keep `id` from being resolved right now: each
+/// may be a descendant of the command that nobody recorded, and
+/// [`HiddenSuspect::reason`] says why it cannot be ruled out. Empty when the
+/// entry is not kept for that reason (it is released, its owner or a known
+/// process still runs, or a scan could not read every process). Judged as
+/// [`resolve_checked`] does; writes nothing.
+pub fn hidden_suspects(ctx: &Context, id: &str) -> Vec<HiddenSuspect> {
+    assess_detailed(ctx, id, true, true, false).1
+}
+
+/// [`assess_with`], also naming the hidden processes that made the scan
+/// unknown.
+fn assess_detailed(
+    ctx: &Context,
+    id: &str,
+    manual: bool,
+    scan: bool,
+    ignore_group: bool,
+) -> (Assessment, Vec<HiddenSuspect>) {
+    let mut held_by: Vec<HiddenSuspect> = Vec::new();
     let settled = |tracked: &Tracked| {
         if scan {
             runner::settled_scan(ctx, id, tracked)
@@ -363,7 +490,25 @@ fn assess_with(
                             recorded.map(secs),
                             to_exit,
                         );
-                        if lineage::suspicious_hidden(&scan.hidden, since, until, supervisor) {
+                        // The child leads its own session (`setsid` at the
+                        // spawn), so a session that is provably older is
+                        // not the command's.
+                        let own_session = child.as_ref().is_some_and(|c| {
+                            c.sid.and_then(|s| u32::try_from(s).ok()) == Some(c.pid)
+                        });
+                        // Whether it is older is decided by the child's
+                        // start mark, not by the wall clock; a sidecar
+                        // without one clears nothing that way.
+                        let child_mark = child.as_ref().and_then(|c| c.start_mark.as_ref());
+                        held_by = suspects(
+                            ctx,
+                            &scan.hidden,
+                            (since, until),
+                            supervisor,
+                            own_session,
+                            child_mark,
+                        );
+                        if !held_by.is_empty() {
                             marker = Probe::Unknown;
                         }
                     }
@@ -378,14 +523,18 @@ fn assess_with(
                 // A clear scan does not show a child whose environment the
                 // OS hides. One that began after the intent and is an
                 // orphan (or the dead supervisor's child) may be it.
-                let (since, until) =
+                // No child was recorded, so nothing says it leads a session
+                // of its own (a fork may not have reached its `setsid`):
+                // sessions clear nothing here.
+                let window =
                     lineage::suspicion_window(None, intent.map(secs), recorded.map(secs), to_exit);
-                marker = if scan.probe == Probe::Gone
-                    && lineage::suspicious_hidden(&scan.hidden, since, until, supervisor)
-                {
-                    Probe::Unknown
-                } else {
+                if scan.probe == Probe::Gone {
+                    held_by = suspects(ctx, &scan.hidden, window, supervisor, false, None);
+                }
+                marker = if held_by.is_empty() {
                     scan.probe
+                } else {
+                    Probe::Unknown
                 };
             }
             SidecarFacts::Corrupt if manual => marker = settled(&Tracked::default()).probe,
@@ -401,7 +550,27 @@ fn assess_with(
         marker,
         manual,
     });
-    Assessment { verdict, sidecar }
+    if verdict != Verdict::Keep(reap::Keep::ProbeUnknown) {
+        held_by.clear();
+    }
+    (Assessment { verdict, sidecar }, held_by)
+}
+
+/// `what`, plus the hidden processes that hold the entry (the first few).
+fn with_suspects(what: &str, held_by: &[HiddenSuspect]) -> String {
+    const SHOWN: usize = 3;
+    if held_by.is_empty() {
+        return what.to_string();
+    }
+    let named: Vec<String> = held_by.iter().take(SHOWN).map(|h| h.to_string()).collect();
+    let more = match held_by.len().saturating_sub(SHOWN) {
+        0 => String::new(),
+        n => format!("; and {n} more"),
+    };
+    format!(
+        "{what}; held by hidden process {}{more}",
+        named.join("; hidden process ")
+    )
 }
 
 /// On release by the reaper, settle a managed sidecar that has no terminal
@@ -1239,7 +1408,7 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
             checked: "there is no ledger entry with this id".into(),
         });
     }
-    let a = assess_with(ctx, id, true, true, false);
+    let (a, held_by) = assess_detailed(ctx, id, true, true, false);
     let phase = match &a.sidecar {
         Loaded::Ok(sc) => Some(sc.phase),
         _ => None,
@@ -1252,10 +1421,10 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
         released: false,
         forced: false,
         verdict: format!("{:?}", a.verdict),
-        checked: describe(a.verdict).to_string(),
+        checked: with_suspects(describe(a.verdict), &held_by),
     };
     if force && a.verdict == Verdict::Keep(reap::Keep::ProbeUnknown) {
-        let detail = format!("forced: {}", describe(a.verdict));
+        let detail = format!("forced: {}", r.checked);
         settle_by_hand(ctx, id, TerminalKind::Interrupted, &detail)?;
         r.released = true;
         r.forced = true;
