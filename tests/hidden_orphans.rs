@@ -306,7 +306,8 @@ fn an_unrelated_orphan_of_an_older_session_does_not_hold_the_entry() {
     }));
     let leader_start = leader_start.unwrap();
     assert!(
-        until(5, || chrono::Utc::now().timestamp() as u64 > leader_start),
+        until(5, || chrono::Utc::now().timestamp() as u64
+            > leader_start + 1),
         "the clock did not advance"
     );
 

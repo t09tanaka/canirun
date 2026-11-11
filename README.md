@@ -362,6 +362,12 @@ What is not found, and what follows:
 - A hidden descendant whose parent was never recorded and which is an orphan
   of something other than `launchd` (for example reparented to a user
   subreaper): not found once the command's own record is gone.
+- A hidden orphan that is *not* a descendant is ruled out when its session
+  proves it: the session is `launchd`'s own (id 1), or its leader still runs
+  and started before the command (a managed command leads its own session,
+  and a session cannot be joined). One that leads its own session, or whose
+  session leader is gone or started after the command, cannot be told from
+  a real escapee and keeps the entry; `resolve` names it in `checked`.
 - A descendant that cleared its environment (`env -i ...`) loses the
   marker; it is still found if it was recorded while its parent lived, and
   in any case while it stays in the run's **session**.

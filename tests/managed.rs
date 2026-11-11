@@ -1452,11 +1452,11 @@ impl Drop for Cleanup {
 
 /// The real process scan, minus the hidden processes it reports. The
 /// supervisor in this test is killed, so the window in which a hidden
-/// orphan counts as a possible descendant stays open, and any unrelated
-/// process the OS starts meanwhile and keeps running (Spotlight's
-/// `mdworker_shared` appears while a build writes files) would hold the
-/// entry as `ProbeUnknown`. That rule has its own tests with fixed scans;
-/// here only the recorded descendant decides.
+/// orphan counts as a possible descendant stays open, and an unrelated
+/// process that starts meanwhile, keeps running and is not proven unrelated
+/// by its session (one that leads its own session, such as the child of a
+/// test running next to this one) would hold the entry as `ProbeUnknown`.
+/// That rule has its own tests; here only the recorded descendant decides.
 struct NoAmbientHidden;
 
 impl task_traffic_controller::ProcessScan for NoAmbientHidden {

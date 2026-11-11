@@ -154,7 +154,9 @@ pub struct Sidecar {
     /// is that look. Only then does the hidden-orphan window end at
     /// `recorded_at`; without it (the supervisor died mid-run) a hidden
     /// process that started at any time after the child may be its
-    /// descendant, so the entry stays held until `resolve --force`.
+    /// descendant, so the entry stays held while one runs that its session
+    /// does not prove unrelated ([`lineage::standing`]), or until
+    /// `resolve --force`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tracked_to_exit: bool,
 }

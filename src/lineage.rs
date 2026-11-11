@@ -41,7 +41,7 @@
 //!    it. Every member of a session therefore descends from its leader, and
 //!    every descendant of the child is in the child's session or in one
 //!    created by another descendant. So a hidden process is unrelated when
-//!    its session is `init`'s (id 1: on macOS most `launchd` jobs, Spotlight
+//!    its session is `init`'s (id 1: on macOS many `launchd` jobs, Spotlight
 //!    workers among them), or when the session's leader is still running and
 //!    started before the window opened (an orphan of a terminal or of a test
 //!    runner that was there before the command). The leader cannot be
@@ -56,9 +56,12 @@
 //!
 //! What stays a possible descendant, because nothing readable tells it from
 //! a real one: a hidden orphan that leads its own session (a `launchd` job
-//! started that way, or a real `setsid` escapee), one whose session leader
-//! is gone (what another managed command left behind looks like this), and
-//! one whose leader started inside the window. On macOS the coalition id
+//! started that way, a real `setsid` escapee, or the child of *another*
+//! managed command whose supervisor died: it leads its own session by
+//! construction), one whose session leader is gone (what another managed
+//! command left behind looks like this), and one whose leader started
+//! inside the window. So commands whose supervisors die at the same time
+//! can still hold each other while their hidden processes run. On macOS the coalition id
 //! (inherited, and not changeable without privilege) would separate the
 //! `launchd` jobs among these, but it has to be recorded at spawn, which
 //! the sidecar does not do yet. Until then such an entry is held until the
