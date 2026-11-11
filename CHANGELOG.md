@@ -5,6 +5,35 @@ All notable changes to task-traffic-controller (called canirun before 0.5.0) are
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+### Fixed
+
+- A managed entry whose supervisor was killed is no longer kept as
+  `ProbeUnknown` by unrelated processes. With the supervisor dead, any hidden
+  process (on macOS: every Apple binary) that started after the command and
+  has `launchd` as its parent counted as a possible unrecorded descendant, for
+  as long as it lived, and new ones kept arriving: Spotlight workers, other
+  `launchd` jobs, orphans of other shells. Such a process is now ruled out when
+  its session proves it unrelated: the session is the one of `launchd` itself
+  (id 1), or its leader is still running and started before the command. A
+  managed child leads its own session and a session cannot be joined, so no
+  descendant can be in either. Everything else is kept as before: a hidden
+  orphan that leads its own session (as a real `setsid` escapee does), one
+  whose session leader is gone or started after the command, and every hidden
+  orphan of an entry that stopped at its launch intent or whose child was
+  recorded without a session.
+
+### Added
+
+- `managed::hidden_suspects` names the hidden processes that keep an entry
+  unresolved (pid, start time, parent, session, and why each cannot be ruled
+  out), and `resolve` prints them in `checked`.
+- `lineage::standing`, `lineage::Standing`, `lineage::SessionEvidence`,
+  `lineage::orphan_in_window`, `process::session_evidence`, and a provided
+  method `ProcessScan::session_evidence` (the default asks the kernel;
+  `FixedScan` knows nothing, which never clears a process).
+
 ## [0.6.0] - 2026-11-10
 
 ### Changed
