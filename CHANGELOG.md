@@ -7,6 +7,10 @@ the minor version).
 
 ## [Unreleased]
 
+This will ship as a minor version, not a patch: it changes when an entry is
+released (see Fixed), and it adds a field to `process::ChildIdentity`, which
+breaks code that builds that struct with a literal.
+
 ### Fixed
 
 - A managed entry whose supervisor was killed is no longer kept as
@@ -18,11 +22,22 @@ the minor version).
   its session proves it unrelated: the session is the one of `launchd` itself
   (id 1), or its leader is still running and started before the command. A
   managed child leads its own session and a session cannot be joined, so no
-  descendant can be in either. Everything else is kept as before: a hidden
-  orphan that leads its own session (as a real `setsid` escapee does), one
+  descendant can be in either. Whether the leader started before the command
+  is decided on a clock the wall clock does not move (Linux: clock ticks
+  since boot from `/proc/<pid>/stat`; macOS: Mach absolute time from
+  `proc_pid_rusage`), recorded for the child at the spawn together with the
+  boot id: only a strictly smaller count on the same boot counts. A sidecar
+  written by an earlier version has no such record and is kept as before, as
+  is everything on a system without such a clock. Everything else is kept as
+  before too: a hidden orphan that leads its own session (as a real `setsid` escapee does), one
   whose session leader is gone or started after the command, and every hidden
   orphan of an entry that stopped at its launch intent or whose child was
-  recorded without a session.
+  recorded without a session. The rule draws one line on purpose: work that a
+  command asks `launchd` or an already-running daemon to start (`open`,
+  `launchctl submit`, XPC) sits in that service's session and is not counted
+  as a descendant.
+- `process::signal_if_same` refuses a pid above `i32::MAX` (as a `pid_t` it
+  would be negative) before it looks anything up.
 
 ### Added
 
@@ -30,9 +45,17 @@ the minor version).
   unresolved (pid, start time, parent, session, and why each cannot be ruled
   out), and `resolve` prints them in `checked`.
 - `lineage::standing`, `lineage::Standing`, `lineage::SessionEvidence`,
-  `lineage::orphan_in_window`, `process::session_evidence`, and a provided
-  method `ProcessScan::session_evidence` (the default asks the kernel;
-  `FixedScan` knows nothing, which never clears a process).
+  `lineage::StartMark`, `lineage::orphan_in_window`,
+  `process::session_evidence`, `process::start_mark`, and a provided method
+  `ProcessScan::session_evidence`. Its default is "nothing known", which
+  never clears a process; only `SystemScan` asks the kernel. An
+  implementation whose scan reports this machine's real processes overrides
+  it with `process::session_evidence`; one that reports made-up pids must
+  not.
+- `process::ChildIdentity::start_mark` (optional in the sidecar; absent in
+  older ones). `SessionEvidence`, `StartMark`, `Standing` and
+  `managed::HiddenSuspect` are `#[non_exhaustive]`; the first two have
+  constructors.
 
 ## [0.6.0] - 2026-11-10
 

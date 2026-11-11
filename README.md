@@ -368,6 +368,21 @@ What is not found, and what follows:
   and a session cannot be joined). One that leads its own session, or whose
   session leader is gone or started after the command, cannot be told from
   a real escapee and keeps the entry; `resolve` names it in `checked`.
+  "Started before the command" is not read off the wall clock, which can be
+  set back: the command's start is recorded as clock ticks since boot (Linux)
+  or Mach absolute time (macOS) together with the boot id, and compared with
+  the leader's. A leader is older only on the same boot and with a strictly
+  smaller count; an entry recorded by an earlier version has no such count
+  and is never released this way.
+- The session rule draws a line at `launchd` / `init`: a process counts as a
+  descendant only if it was forked below the command. Work the command
+  *asks* `launchd` or an already-running daemon to start (`open`,
+  `launchctl submit`, an XPC request; on Linux `systemd-run`, D-Bus
+  activation) is not counted, and does not keep the entry.
+- A descendant that runs as another user (it ran a setuid program) is not in
+  the scan at all, hidden or not: not found once its parent is gone.
+- A hidden descendant that starts after the wall clock was set back to
+  before the command's start looks older than the command: not found.
 - A descendant that cleared its environment (`env -i ...`) loses the
   marker; it is still found if it was recorded while its parent lived, and
   in any case while it stays in the run's **session**.
