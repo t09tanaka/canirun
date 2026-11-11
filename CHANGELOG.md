@@ -7,9 +7,10 @@ the minor version).
 
 ## [Unreleased]
 
-This will ship as a minor version, not a patch: it changes when an entry is
-released (see Fixed), and it adds a field to `process::ChildIdentity`, which
-breaks code that builds that struct with a literal.
+## [0.7.0] - 2026-11-11
+
+This adds a field to `process::ChildIdentity`, which breaks code that builds
+that struct with a literal.
 
 ### Fixed
 
