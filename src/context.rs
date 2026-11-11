@@ -151,6 +151,12 @@ pub trait ProcessScan: Send + Sync {
     fn probe_session(&self, c: &crate::process::ChildIdentity) -> crate::reap::Probe {
         crate::process::probe_session(c)
     }
+    /// What is known about the session of the hidden process `p` (see
+    /// [`crate::lineage::standing`]). An implementation that does not know
+    /// returns the default, which never clears a process.
+    fn session_evidence(&self, p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
+        crate::process::session_evidence(p)
+    }
 }
 
 /// This machine's processes of the current user.
@@ -176,6 +182,11 @@ impl FixedScan {
 impl ProcessScan for FixedScan {
     fn scan(&self, _id: &str, _scope: &str) -> crate::marker::Scan {
         self.0.clone()
+    }
+    /// The processes of a fixed scan are made up: nothing is known about
+    /// their sessions, and the machine is not asked.
+    fn session_evidence(&self, _p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
+        crate::lineage::SessionEvidence::default()
     }
 }
 

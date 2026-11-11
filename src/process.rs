@@ -180,6 +180,45 @@ pub fn probe_session(c: &ChildIdentity) -> Probe {
     reap::session_probe(found.len(), failed)
 }
 
+/// What the kernel says about the session of `p`, for
+/// [`lineage::standing`]. Nothing is reported unless `p` is the same process
+/// (pid and start time) both before and after its session is read, so the
+/// session id is one `p` was a member of throughout. The leader is the live
+/// process whose pid is that id and whose own session is that id; while `p`
+/// is a member the id cannot have been handed to a new process. Only reads:
+/// no process is signalled.
+pub fn session_evidence(p: &ProcRef) -> lineage::SessionEvidence {
+    let unknown = lineage::SessionEvidence::default();
+    let Some(start) = p.start_time else {
+        return unknown;
+    };
+    // `getsid(0)` is the caller's own session, and a pid above `i32::MAX`
+    // is not a pid.
+    if p.pid == 0 || i32::try_from(p.pid).is_err() || start_time(p.pid) != Some(start) {
+        return unknown;
+    }
+    let Some(sid) = session_of(p.pid).and_then(|s| u32::try_from(s).ok()) else {
+        return unknown;
+    };
+    if sid == 0 {
+        return unknown;
+    }
+    let leader_start = if sid == p.pid {
+        Some(start)
+    } else {
+        start_time(sid).filter(|_| session_of(sid).and_then(|s| u32::try_from(s).ok()) == Some(sid))
+    };
+    let same = start_time(p.pid) == Some(start)
+        && session_of(p.pid).and_then(|s| u32::try_from(s).ok()) == Some(sid);
+    if !same {
+        return unknown;
+    }
+    lineage::SessionEvidence {
+        sid: Some(sid),
+        leader_start,
+    }
+}
+
 /// Is the recorded child itself still running? A pid that now has a
 /// different start time is a different process.
 pub fn probe_child(c: &ChildIdentity) -> Probe {
@@ -555,6 +594,47 @@ mod tests {
         assert_eq!(id.sid, Some(c.id() as i32));
         assert_eq!(id.pgid, Some(c.id() as i32));
         c.wait().unwrap();
+    }
+
+    #[test]
+    fn session_evidence_is_given_only_for_a_process_that_is_still_the_same() {
+        let me = std::process::id();
+        let mine = ProcRef {
+            pid: me,
+            start_time: start_time(me),
+        };
+        let ev = session_evidence(&mine);
+        let sid = u32::try_from(unsafe { libc::getsid(0) }).unwrap();
+        assert_eq!(ev.sid, Some(sid));
+        // The leader, when it still runs, did not start after us.
+        if sid == me {
+            assert_eq!(ev.leader_start, mine.start_time);
+        } else if let Some(l) = ev.leader_start {
+            assert!(l <= mine.start_time.unwrap(), "{ev:?}");
+        }
+        let unknown = lineage::SessionEvidence::default();
+        // Another start time (the pid was reused), no start time, pid 0
+        // (which `getsid` reads as the caller) and a pid that is not one.
+        for p in [
+            ProcRef {
+                pid: me,
+                start_time: mine.start_time.map(|t| t + 1),
+            },
+            ProcRef {
+                pid: me,
+                start_time: None,
+            },
+            ProcRef {
+                pid: 0,
+                start_time: mine.start_time,
+            },
+            ProcRef {
+                pid: u32::MAX,
+                start_time: mine.start_time,
+            },
+        ] {
+            assert_eq!(session_evidence(&p), unknown, "{p:?}");
+        }
     }
 
     #[test]
