@@ -152,10 +152,16 @@ pub trait ProcessScan: Send + Sync {
         crate::process::probe_session(c)
     }
     /// What is known about the session of the hidden process `p` (see
-    /// [`crate::lineage::standing`]). An implementation that does not know
-    /// returns the default, which never clears a process.
-    fn session_evidence(&self, p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
-        crate::process::session_evidence(p)
+    /// [`crate::lineage::standing`]). The answer can release an entry, so
+    /// the default is "nothing known", which never clears a process: an
+    /// implementation whose `scan` reports made-up pids must not have the
+    /// kernel asked about whatever really runs under those numbers. Only an
+    /// implementation whose hidden processes are this machine's real ones
+    /// should override it, with [`crate::process::session_evidence`], as
+    /// [`SystemScan`] does; without that, hidden orphans are judged by time
+    /// and parent alone.
+    fn session_evidence(&self, _p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
+        crate::lineage::SessionEvidence::default()
     }
 }
 
@@ -166,6 +172,10 @@ pub struct SystemScan;
 impl ProcessScan for SystemScan {
     fn scan(&self, id: &str, scope: &str) -> crate::marker::Scan {
         crate::process::scan_system(id, scope)
+    }
+    /// The scanned processes are real: the kernel is asked.
+    fn session_evidence(&self, p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
+        crate::process::session_evidence(p)
     }
 }
 
@@ -182,11 +192,6 @@ impl FixedScan {
 impl ProcessScan for FixedScan {
     fn scan(&self, _id: &str, _scope: &str) -> crate::marker::Scan {
         self.0.clone()
-    }
-    /// The processes of a fixed scan are made up: nothing is known about
-    /// their sessions, and the machine is not asked.
-    fn session_evidence(&self, _p: &crate::marker::ProcRef) -> crate::lineage::SessionEvidence {
-        crate::lineage::SessionEvidence::default()
     }
 }
 

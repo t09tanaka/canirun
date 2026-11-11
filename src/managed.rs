@@ -320,6 +320,16 @@ impl HiddenSuspect {
             Standing::LeaderGone => "its session's leader is gone",
             Standing::LeaderInWindow => "its session's leader started after the command",
             Standing::ClockDisorder => "it is older than its session's leader (the clock moved)",
+            Standing::NoChildMark => {
+                "the command's child has no recorded start mark, so its session's leader cannot be proven older"
+            }
+            Standing::LeaderMarkUnknown => "its session leader's start mark could not be read",
+            Standing::OtherBoot => {
+                "its session leader's start mark and the command's are of different boots"
+            }
+            Standing::LeaderNotOlder => {
+                "its session's leader did not start before the command (the clock moved)"
+            }
             _ => "it is not a possible descendant",
         }
     }
@@ -345,6 +355,7 @@ fn suspects(
     (since, until): (u64, Option<u64>),
     supervisor: u32,
     own_session: bool,
+    child_mark: Option<&lineage::StartMark>,
 ) -> Vec<HiddenSuspect> {
     hidden
         .iter()
@@ -356,7 +367,15 @@ fn suspects(
             } else {
                 lineage::SessionEvidence::default()
             };
-            let standing = lineage::standing(h, since, until, supervisor, own_session, session);
+            let standing = lineage::standing(
+                h,
+                since,
+                until,
+                supervisor,
+                own_session,
+                child_mark,
+                &session,
+            );
             standing.suspicious().then_some(HiddenSuspect {
                 proc: h.proc,
                 parent: h.parent,
@@ -466,8 +485,18 @@ fn assess_detailed(
                         let own_session = child.as_ref().is_some_and(|c| {
                             c.sid.and_then(|s| u32::try_from(s).ok()) == Some(c.pid)
                         });
-                        held_by =
-                            suspects(ctx, &scan.hidden, (since, until), supervisor, own_session);
+                        // Whether it is older is decided by the child's
+                        // start mark, not by the wall clock; a sidecar
+                        // without one clears nothing that way.
+                        let child_mark = child.as_ref().and_then(|c| c.start_mark.as_ref());
+                        held_by = suspects(
+                            ctx,
+                            &scan.hidden,
+                            (since, until),
+                            supervisor,
+                            own_session,
+                            child_mark,
+                        );
                         if !held_by.is_empty() {
                             marker = Probe::Unknown;
                         }
@@ -489,7 +518,7 @@ fn assess_detailed(
                 let window =
                     lineage::suspicion_window(None, intent.map(secs), recorded.map(secs), to_exit);
                 if scan.probe == Probe::Gone {
-                    held_by = suspects(ctx, &scan.hidden, window, supervisor, false);
+                    held_by = suspects(ctx, &scan.hidden, window, supervisor, false, None);
                 }
                 marker = if held_by.is_empty() {
                     scan.probe

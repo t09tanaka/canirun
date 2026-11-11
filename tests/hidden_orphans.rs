@@ -5,7 +5,11 @@
 //!
 //! Every process here is started by the test, ends by itself within a
 //! minute, and is only ever signalled through its own `Child` handle or
-//! through `process::signal_if_same` (pid and start time checked).
+//! through `process::signal_if_same` (pid and start time checked). An
+//! orphan's pid and start time are written down by the process that forked
+//! it, while that process still holds it unreaped (so the pid cannot have
+//! gone to anybody else); the test signals nothing it cannot match to that
+//! note.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use task_traffic_controller::config::Config;
 use task_traffic_controller::exec::Opts;
+use task_traffic_controller::lineage::{SessionEvidence, Standing, StartMark};
 use task_traffic_controller::managed::{self, CommandSpec, Loaded, Registration, TryAdmit};
 use task_traffic_controller::marker::{ProcRef, Scan};
 use task_traffic_controller::process;
@@ -62,6 +67,10 @@ impl ProcessScan for OnlyOurHidden {
         let ours = self.0.lock().unwrap();
         s.hidden.retain(|h| ours.contains(&h.proc.pid));
         s
+    }
+    /// The hidden processes are real ones: the kernel is asked.
+    fn session_evidence(&self, p: &ProcRef) -> SessionEvidence {
+        process::session_evidence(p)
     }
 }
 
@@ -148,13 +157,51 @@ fn wait_for_go(dir: &Path) -> bool {
     until(30, || go_file(dir).exists())
 }
 
+/// Start `/bin/sleep 40` and write its pid and start time to the pid file,
+/// both taken while this process holds it as an unreaped child: until then
+/// the pid cannot belong to anything else. With `own_session` it leads a
+/// session of its own. It is not waited for; the caller leaves, which
+/// orphans it (so it is deliberately never `wait`ed for).
+#[allow(clippy::zombie_processes)]
+fn start_orphan(dir: &Path, own_session: bool) {
+    let mut c = Command::new("/bin/sleep");
+    c.arg("40")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if own_session {
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut c, || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = c.spawn().unwrap();
+    let pid = child.id();
+    let mut start = None;
+    until(10, || {
+        start = process::start_time(pid);
+        start.is_some()
+    });
+    // Without a start time nothing is written, and the test never learns
+    // the pid: the sleep ends by itself.
+    if let Some(start) = start {
+        let tmp = dir.join("orphan.pid.tmp");
+        std::fs::write(&tmp, format!("{pid} {start}")).unwrap();
+        std::fs::rename(&tmp, pid_file(dir)).unwrap();
+    }
+}
+
 /// The helpers. Does nothing in a normal test run.
 ///
 /// `escape` is the managed command itself: on the go file it starts
 /// `/bin/sleep` in a session of its own and leaves, as a daemon would.
 /// `bystander` is unrelated to the command: it leads a session of its own,
-/// and on the go file has a shell start `/bin/sleep` in the background and
-/// exit, which orphans the sleep inside the bystander's session.
+/// and on the go file has a `middle` start `/bin/sleep` and exit, which
+/// orphans the sleep inside the bystander's session.
 #[test]
 fn ho_helper_entry() {
     let (Some(dir), Ok(role)) = (std::env::var_os(DIR), std::env::var(ROLE)) else {
@@ -164,38 +211,15 @@ fn ho_helper_entry() {
     if !wait_for_go(&dir) {
         return;
     }
-    if role == "escape" {
-        let mut c = Command::new("/bin/sleep");
-        c.arg("40")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut c, || {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    match role.as_str() {
+        "escape" => start_orphan(&dir, true),
+        "middle" => start_orphan(&dir, false),
+        _ => {
+            let mut middle = spawn_entry(&dir, "ho_helper_entry", &[(ROLE, "middle")], false);
+            let _ = middle.wait();
+            // Stay: the session keeps its leader.
+            std::thread::sleep(Duration::from_secs(50));
         }
-        // Not waited for: this process leaves, which orphans it.
-        let pid = c.spawn().unwrap().id();
-        let tmp = dir.join("orphan.pid.tmp");
-        std::fs::write(&tmp, pid.to_string()).unwrap();
-        std::fs::rename(&tmp, pid_file(&dir)).unwrap();
-    } else {
-        let _ = Command::new("/bin/sh")
-            .args([
-                "-c",
-                "/bin/sleep 40 </dev/null >/dev/null 2>&1 & echo $! > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"",
-            ])
-            .arg(pid_file(&dir))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        // Stay: the session keeps its leader.
-        std::thread::sleep(Duration::from_secs(50));
     }
 }
 
@@ -249,25 +273,39 @@ fn run_and_kill_supervisor(
     child.expect("a started child is recorded")
 }
 
-/// The orphan the helper started, once its pid file is there: checked to be
-/// a live process started at or after `not_before`.
+/// What the pid file says: the orphan's pid and its start time.
+fn noted_orphan(dir: &Path) -> Option<ProcRef> {
+    let text = std::fs::read_to_string(pid_file(dir)).ok()?;
+    let mut words = text.split_ascii_whitespace();
+    let pid = words.next()?.parse::<u32>().ok()?;
+    let start = words.next()?.parse::<u64>().ok()?;
+    Some(ProcRef {
+        pid,
+        start_time: Some(start),
+    })
+}
+
+/// The orphan the helper started, as the helper noted it (pid and start
+/// time, taken while it held the process). The test takes it as its own
+/// only if that very process runs now and started at or after
+/// `not_before`; on any mismatch it fails here, before the process could be
+/// handed to [`Started`] and signalled.
 fn orphan(dir: &Path, not_before: u64) -> ProcRef {
     let mut found = None;
     let seen = until(30, || {
-        let pid = std::fs::read_to_string(pid_file(dir))
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        found = pid.and_then(|pid| {
-            process::start_time(pid).map(|t| ProcRef {
-                pid,
-                start_time: Some(t),
-            })
-        });
+        found = noted_orphan(dir);
         found.is_some()
     });
     assert!(seen, "the helper never started its orphan");
     let p = found.unwrap();
-    assert!(p.pid > 1 && p.start_time.unwrap() >= not_before, "{p:?}");
+    assert!(p.pid > 1 && i32::try_from(p.pid).is_ok(), "{p:?}");
+    assert_eq!(
+        process::start_time(p.pid),
+        p.start_time,
+        "pid {} is not the process the helper started",
+        p.pid
+    );
+    assert!(p.start_time.unwrap() >= not_before, "{p:?}");
     p
 }
 
@@ -285,11 +323,45 @@ fn is_hidden_orphan(ctx: &Context, p: &ProcRef) -> bool {
             .any(|h| h.proc == *p && h.parent == Some(1))
     });
     if !hidden {
-        eprintln!("{p:?} is not hidden here: the session rule is not exercised");
+        eprintln!(
+            "skipped: {p:?} is not hidden on this system, so the session rule is not exercised"
+        );
     }
     hidden
 }
 
+/// Put `mark` in the place of the recorded child's start mark.
+fn set_child_mark(ctx: &Context, mark: Option<StartMark>) {
+    let Loaded::Ok(mut sc) = managed::load_sidecar(ctx, ID) else {
+        panic!("no sidecar");
+    };
+    sc.child.as_mut().expect("a recorded child").start_mark = mark;
+    managed::write_sidecar(ctx, &sc).unwrap();
+}
+
+/// The one hidden process that holds the entry, and why.
+fn held_for(ctx: &Context, orphan: &ProcRef) -> Standing {
+    let r = managed::resolve_checked(ctx, ID).unwrap();
+    assert!(!r.released, "released: {r:?}");
+    let held_by = managed::hidden_suspects(ctx, ID);
+    assert_eq!(held_by.len(), 1, "{held_by:?}");
+    assert_eq!(held_by[0].proc, *orphan);
+    assert!(
+        r.checked.contains(&format!("pid {}", orphan.pid))
+            && r.checked.contains(held_by[0].reason()),
+        "{r:?}"
+    );
+    held_by[0].standing
+}
+
+/// Where the orphan is hidden (macOS with system integrity protection)
+/// this is the session rule itself: the orphan would hold the entry by time
+/// and parent, and only the proof that its session is older releases it;
+/// without that proof (no start mark, a mark of another boot, a leader that
+/// is not older by the marks) it holds. Where the orphan is not hidden the
+/// rule is not reached and the test says so (`skipped: ...`); it then only
+/// checks the weaker property that an unmarked, unrelated process does not
+/// hold the entry.
 #[test]
 fn an_unrelated_orphan_of_an_older_session_does_not_hold_the_entry() {
     let dir = tempfile::tempdir().unwrap();
@@ -316,24 +388,50 @@ fn an_unrelated_orphan_of_an_older_session_does_not_hold_the_entry() {
     let child = run_and_kill_supervisor(&ctx, dir.path(), "plain", &mut started);
     let child_start = child.start_time.expect("the child's start time");
     assert!(child_start > leader_start);
+    let marks = cfg!(any(target_os = "linux", target_os = "macos"));
+    assert_eq!(child.start_mark.is_some(), marks, "{child:?}");
 
     // Now, inside the command's window, the bystander orphans a hidden
     // process. It is not the command's: its session is the bystander's.
     std::fs::write(go_file(dir.path()), b"").unwrap();
     let orphan = orphan(dir.path(), child_start);
     started.orphans.push(orphan);
+    let evidence = process::session_evidence(&orphan);
     assert_eq!(
-        process::session_evidence(&orphan),
-        task_traffic_controller::lineage::SessionEvidence {
-            sid: Some(bystander_pid),
-            leader_start: Some(leader_start),
-        }
+        (evidence.sid, evidence.leader_start),
+        (Some(bystander_pid), Some(leader_start))
     );
-    is_hidden_orphan(&ctx, &orphan);
+    assert_eq!(evidence.leader_mark, process::start_mark(bystander_pid));
+    if let (Some(leader), Some(child)) = (&evidence.leader_mark, &child.start_mark) {
+        // The bystander began a second before the child, on the same boot.
+        assert_eq!(leader.boot, child.boot);
+        assert!(leader.ticks < child.ticks, "{leader:?} {child:?}");
+    }
+    let hidden = is_hidden_orphan(&ctx, &orphan);
     ours.0.lock().unwrap().push(orphan.pid);
 
     // The command ends by itself; with the supervisor dead the window in
     // which a hidden orphan counts never closes.
+    assert!(
+        until(30, || process::probe_child(&child) == Probe::Gone),
+        "the command never ended"
+    );
+    if hidden && marks {
+        let recorded = child.start_mark.clone().unwrap();
+        // A sidecar from before start marks: the wall clock alone says the
+        // leader is older, and that is not believed.
+        set_child_mark(&ctx, None);
+        assert_eq!(held_for(&ctx, &orphan), Standing::NoChildMark);
+        // A mark of another boot is not comparable, whatever its count.
+        set_child_mark(&ctx, Some(StartMark::new("another-boot", u64::MAX)));
+        assert_eq!(held_for(&ctx, &orphan), Standing::OtherBoot);
+        // The wall clock stepped back: by it the leader looks older, by the
+        // marks it started after the child (count 1) and may descend from
+        // it.
+        set_child_mark(&ctx, Some(StartMark::new(recorded.boot.clone(), 1)));
+        assert_eq!(held_for(&ctx, &orphan), Standing::LeaderNotOlder);
+        set_child_mark(&ctx, Some(recorded));
+    }
     let mut last = None;
     let released = until(30, || {
         let r = managed::resolve_checked(&ctx, ID).unwrap();
@@ -406,10 +504,7 @@ fn a_descendant_that_left_the_session_after_the_supervisor_died_holds_the_entry(
                 (held_by[0].proc, held_by[0].parent, held_by[0].sid),
                 (orphan, Some(1), Some(orphan.pid))
             );
-            assert_eq!(
-                held_by[0].standing,
-                task_traffic_controller::lineage::Standing::OwnSession
-            );
+            assert_eq!(held_by[0].standing, Standing::OwnSession);
         }
         std::thread::sleep(Duration::from_millis(100));
     }

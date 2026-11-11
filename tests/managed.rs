@@ -430,6 +430,7 @@ fn a_changed_boot_id_releases_what_the_old_boot_left() {
         start_time: task_traffic_controller::process::start_time(std::process::id()),
         pgid: Some(unsafe { libc::getpgid(0) }),
         sid: None,
+        start_mark: None,
     };
     orphan(&ctx1, "c", Phase::ChildStarted, Some(ghost));
     drop(g);
@@ -1553,6 +1554,7 @@ fn dead_child(
         start_time: Some(1),
         pgid: Some(0x3fff_fff0),
         sid: None,
+        start_mark: None,
     });
     edit(&mut sc);
     managed::write_sidecar(&c, &sc).unwrap();
@@ -2048,6 +2050,7 @@ fn orphan_with_live_child(ctx: &Context, id: &str) {
         start_time: task_traffic_controller::process::start_time(std::process::id()),
         pgid: Some(unsafe { libc::getpgid(0) }),
         sid: None,
+        start_mark: None,
     };
     orphan(ctx, id, Phase::ChildStarted, Some(ghost));
 }
@@ -2296,6 +2299,7 @@ fn a_process_that_only_inherited_the_managed_variables_is_still_gated() {
         start_time: task_traffic_controller::process::start_time(other.id()),
         pgid: Some(other.id() as i32),
         sid: None,
+        start_mark: None,
     };
     orphan(&lib, "c", Phase::ChildStarted, Some(ghost));
     cli_true(dir.path(), &lib, Some(("c", &scope)));
