@@ -845,8 +845,7 @@ mod tests {
         let mine = mine.expect("our own start mark");
         assert_eq!(Some(&mine.boot), system_boot_id().as_ref());
         assert!(mine.ticks > 0);
-        // The same answer every time, and `exec` does not change it: the
-        // child below was forked from us and then became `/bin/sleep`.
+        // The same answer every time.
         assert_eq!(start_mark(me), Some(mine.clone()));
         let mut child = Command::new("/bin/sleep").arg("20").spawn().unwrap();
         let first = start_mark(child.id());
@@ -867,6 +866,31 @@ mod tests {
         }
         // Reaped: gone.
         assert_eq!(start_mark(child.id()), None);
+    }
+
+    #[test]
+    fn a_sidecar_child_without_a_start_mark_loads_and_stays_without_one() {
+        // What a version before start marks wrote.
+        let old = r#"{"pid":77,"start_time":5,"pgid":77,"sid":77}"#;
+        let c: ChildIdentity = serde_json::from_str(old).unwrap();
+        assert_eq!(c.start_mark, None);
+        assert_eq!((c.pid, c.start_time, c.sid), (77, Some(5), Some(77)));
+        // Nothing is invented for it when it is written again.
+        assert_eq!(serde_json::to_string(&c).unwrap(), old);
+        // With a mark, it is kept.
+        let marked = ChildIdentity {
+            start_mark: Some(lineage::StartMark::new("b", 9)),
+            ..c
+        };
+        let json = serde_json::to_string(&marked).unwrap();
+        assert!(
+            json.contains(r#""start_mark":{"boot":"b","ticks":9}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ChildIdentity>(&json).unwrap(),
+            marked
+        );
     }
 
     #[test]

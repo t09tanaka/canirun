@@ -54,7 +54,7 @@ breaks code that builds that struct with a literal.
   not.
 - `process::ChildIdentity::start_mark` (optional in the sidecar; absent in
   older ones). `SessionEvidence`, `StartMark`, `Standing` and
-  `managed::HiddenSuspect` are `#[non_exhaustive]`; the first two have
+  `managed::HiddenSuspect` are `#[non_exhaustive]`; the structs have
   constructors.
 
 ## [0.6.0] - 2026-11-10

@@ -308,6 +308,20 @@ pub struct HiddenSuspect {
 }
 
 impl HiddenSuspect {
+    pub fn new(
+        proc: ProcRef,
+        parent: Option<u32>,
+        sid: Option<u32>,
+        standing: lineage::Standing,
+    ) -> Self {
+        HiddenSuspect {
+            proc,
+            parent,
+            sid,
+            standing,
+        }
+    }
+
     /// Why it cannot be ruled out, in words.
     pub fn reason(&self) -> &'static str {
         use lineage::Standing;
@@ -376,12 +390,9 @@ fn suspects(
                 child_mark,
                 &session,
             );
-            standing.suspicious().then_some(HiddenSuspect {
-                proc: h.proc,
-                parent: h.parent,
-                sid: session.sid,
-                standing,
-            })
+            standing
+                .suspicious()
+                .then(|| HiddenSuspect::new(h.proc, h.parent, session.sid, standing))
         })
         .collect()
 }
