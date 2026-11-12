@@ -374,7 +374,7 @@ fn draw_budget(f: &mut Frame, area: Rect, v: &View) {
 /// One cell group per slot; each running entry's slots in its own color with
 /// its letter first, free slots dim.
 fn bar_line(v: &View, width: u16) -> Line<'static> {
-    let w = (width as u32 / v.budget.max(1)).clamp(1, 4) as usize;
+    let w = (width as u32 / v.budget.max(1)).max(1) as usize;
     let mut spans = Vec::new();
     for s in &v.slots {
         if s.slots == 0 {
@@ -401,6 +401,16 @@ fn bar_line(v: &View, width: u16) -> Line<'static> {
 fn gauge(pct: u8, width: usize) -> String {
     let filled = (pct as usize * width / 100).min(width);
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// Wide enough for the longest project name (and the header), at most 40.
+fn project_width<'a>(names: impl Iterator<Item = &'a str>) -> u16 {
+    names
+        .map(|n| n.chars().count())
+        .chain(["project".len()])
+        .max()
+        .unwrap_or(0)
+        .min(40) as u16
 }
 
 fn is_over(r: &RunRow) -> bool {
@@ -463,7 +473,7 @@ fn draw_running(f: &mut Frame, area: Rect, v: &View) {
         rows,
         [
             Constraint::Length(1),
-            Constraint::Length(18),
+            Constraint::Length(project_width(v.running.iter().map(|r| r.project.as_str()))),
             Constraint::Fill(1),
             Constraint::Length(15),
             Constraint::Length(9),
@@ -513,7 +523,7 @@ fn draw_waiting(f: &mut Frame, area: Rect, v: &View) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(18),
+            Constraint::Length(project_width(v.waiting.iter().map(|r| r.project.as_str()))),
             Constraint::Fill(1),
             Constraint::Length(4),
             Constraint::Length(8),
