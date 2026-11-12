@@ -289,7 +289,7 @@ const PALETTE: [Color; 8] = [
     Color::Yellow,
     Color::Magenta,
     Color::Blue,
-    Color::Red,
+    Color::LightMagenta,
     Color::LightCyan,
     Color::LightGreen,
 ];
@@ -403,6 +403,10 @@ fn gauge(pct: u8, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
+fn is_over(r: &RunRow) -> bool {
+    matches!(r.progress, Progress::Known { over: true, .. })
+}
+
 fn progress_cell(r: &RunRow) -> String {
     match &r.progress {
         Progress::Unknown => format!("{}  ? ran {}", gauge(0, 10), fmt_duration(r.elapsed)),
@@ -447,6 +451,12 @@ fn draw_running(f: &mut Frame, area: Rect, v: &View) {
                 Cell::from(cpu_cell(r)),
                 Cell::from(progress_cell(r)),
             ])
+            .style(if is_over(r) {
+                // Past its expected time: the whole row in red.
+                Style::new().fg(Color::Red)
+            } else {
+                Style::new()
+            })
         })
         .collect();
     let table = Table::new(
@@ -874,5 +884,40 @@ mod tests {
         assert!(out.contains("idle") && out.contains("[backfill]"));
         // A tiny terminal must not panic.
         let _ = frame(&v, 20, 5);
+    }
+
+    #[test]
+    fn a_run_past_its_expected_time_is_drawn_red() {
+        let now = Utc::now();
+        let mut v = View::from_parts(&sample(now), vec![], limits(12), None, now);
+        v.running[0].progress = Progress::Known {
+            pct: 99,
+            left: Duration::from_secs(60),
+            over: true,
+        };
+        v.running[1].progress = Progress::Known {
+            pct: 50,
+            left: Duration::from_secs(60),
+            over: false,
+        };
+        let mut t = Terminal::new(TestBackend::new(100, 26)).unwrap();
+        t.draw(|f| draw(f, &v, Duration::from_secs(1), None))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let fg_of = |needle: &str| {
+            (0..26u16)
+                .find_map(|y| {
+                    let line: String = (0..100u16)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect();
+                    line.find(needle).map(|_| {
+                        let x = (0..100u16).find(|&x| buf[(x, y)].symbol() == "%").unwrap();
+                        buf[(x, y)].fg
+                    })
+                })
+                .unwrap()
+        };
+        assert_eq!(fg_of("over 1:00"), Color::Red);
+        assert_ne!(fg_of("left 1:00"), Color::Red);
     }
 }
