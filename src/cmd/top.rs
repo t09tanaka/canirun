@@ -405,11 +405,11 @@ fn gauge(pct: u8, width: usize) -> String {
 
 fn progress_cell(r: &RunRow) -> String {
     match &r.progress {
-        Progress::Unknown => format!("{} ? {}", gauge(0, 10), fmt_duration(r.elapsed)),
+        Progress::Unknown => format!("{}  ? ran {}", gauge(0, 10), fmt_duration(r.elapsed)),
         Progress::Known { pct, left, over } => format!(
             "{} {pct:>2}% {}{}",
             gauge(*pct, 10),
-            if *over { "+" } else { "-" },
+            if *over { "over " } else { "left " },
             fmt_duration(*left)
         ),
     }
