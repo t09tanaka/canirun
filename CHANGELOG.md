@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-12
+
 ### Added
 
 - `exec --label TEXT` (also `submit` and `estimate`, or
@@ -20,7 +22,12 @@ the minor version).
   budget as a bar with one colored segment per running entry, a running table
   (project, job, `weight/using` cores, progress against the learned wall time),
   a waiting table (why it waits, estimated start) and held entries. Adds the
-  `ratatui` dependency.
+  `ratatui` dependency. Runs past their expected time are drawn in red.
+
+### Notes
+
+- An older binary that rewrites the ledger drops the `label` of the entries
+  it rewrites; upgrade every caller to see labels reliably.
 
 ## [0.7.0] - 2026-11-11
 
