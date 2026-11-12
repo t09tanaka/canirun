@@ -40,6 +40,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Keep the status screen on the terminal, redrawn every few seconds (Ctrl-C to quit)
+    Top {
+        /// Seconds between redraws
+        #[arg(long, default_value_t = 2.0)]
+        interval: f64,
+    },
     /// Show measured runs and the weight that will be used next
     History {
         /// Only this explicit key (as given to `exec --key`)
@@ -151,6 +157,7 @@ fn run(cli: Cli) -> error::Result<i32> {
             command,
         } => cmd::exec::run(&ctx, &cfg, opts(weight, front, key, command)?),
         Cmd::Status { json } => cmd::status::run(&ctx, &cfg, json),
+        Cmd::Top { interval } => cmd::top::run(&ctx, &cfg, interval),
         Cmd::History {
             key,
             json,

@@ -7,6 +7,11 @@ the minor version).
 
 ## [Unreleased]
 
+### Added
+
+- `top`: the `status` screen redrawn in place every `--interval` seconds
+  (default 2) until Ctrl-C, for a human watching the queue.
+
 ## [0.7.0] - 2026-11-11
 
 This adds a field to `process::ChildIdentity`, which breaks code that builds

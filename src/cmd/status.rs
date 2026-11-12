@@ -8,15 +8,25 @@ use task_traffic_controller::ledger::Ledger;
 use task_traffic_controller::{exec, lock, managed, Context};
 
 pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
-    let ledger = lock::load_reaped(ctx)?;
-    let format = Ledger::file_format(&ctx.paths.ledger_file());
     if json {
+        let ledger = lock::load_reaped(ctx)?;
+        let format = Ledger::file_format(&ctx.paths.ledger_file());
         // `ledger_format` is additive: what the file on disk is written as.
         let mut v = serde_json::to_value(&ledger)?;
         v["ledger_format"] = format.into();
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(0);
     }
+    print!("{}", render(ctx, cfg)?);
+    Ok(0)
+}
+
+/// The human-readable status screen, shared by `status` and `top`.
+pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let ledger = lock::load_reaped(ctx)?;
+    let format = Ledger::file_format(&ctx.paths.ledger_file());
     let now = ctx.clock.now();
     let queue = ledger.queue_at(now);
     let used = admit::used_budget(&queue);
@@ -35,26 +45,28 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
             .unwrap_or_default()
     };
 
-    println!("budget {used}/{} used", cfg.budget);
+    let _ = writeln!(out, "budget {used}/{} used", cfg.budget);
     if format > task_traffic_controller::ledger::SCHEMA_VERSION {
-        println!(
+        let _ = writeln!(out,
             "ledger format v{format}: older task-traffic-controller binaries refuse it until every managed entry is settled (`task-traffic-controller resolve <id> [--force]`)"
         );
     }
     if let Some(s) = ctx.live.snapshot() {
-        println!(
+        let _ = writeln!(
+            out,
             "machine {} available, cpu {:.0}% busy",
             fmt_bytes(s.available_memory),
             s.cpu_busy * 100.0
         );
     }
-    println!();
-    println!("running ({})", running.len());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "running ({})", running.len());
     let mut any_idle = false;
     for e in &running {
         let elapsed = running_for(e, now);
         any_idle |= is_idle(e.using, elapsed);
-        println!(
+        let _ = writeln!(
+            out,
             "  {:>7}  {}{} {:>8}  {}{}{}",
             e.pid,
             weight_label(e.weight, e.using),
@@ -70,19 +82,20 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
         );
     }
     if any_idle {
-        println!(
+        let _ = writeln!(out,
             "  (idle: running {}+ and using under {IDLE_CORES} cores; a server or watch mode holds its weight until it exits)",
             fmt_duration(IDLE_AFTER)
         );
     }
-    println!();
-    println!("waiting ({})", order.len());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "waiting ({})", order.len());
     for q in &order {
         let Some(e) = ledger.find(&q.id) else {
             continue;
         };
         let waited = (now - e.enqueued_at).to_std().unwrap_or_default();
-        println!(
+        let _ = writeln!(
+            out,
             "  {:>7}  w{:<2} {:>8}  {}{}{}",
             e.pid,
             e.weight,
@@ -97,25 +110,29 @@ pub fn run(ctx: &Context, cfg: &Config, json: bool) -> Result<i32> {
         .filter(|v| v.quarantined)
         .collect();
     if !held.is_empty() {
-        println!();
-        println!("held, owner gone ({})", held.len());
+        let _ = writeln!(out);
+        let _ = writeln!(out, "held, owner gone ({})", held.len());
         for v in &held {
-            println!("  {}  {}  -> {}", v.command_id, v.reason, v.hint);
+            let _ = writeln!(out, "  {}  {}  -> {}", v.command_id, v.reason, v.hint);
         }
-        println!("  (still charged until their processes stop; `resolve` checks and releases)");
+        let _ = writeln!(
+            out,
+            "  (still charged until their processes stop; `resolve` checks and releases)"
+        );
     }
     if let Some(head) = order.first() {
         let decision = admit::admit(&queue, &head.id, 0, head.waited_secs, limits, None);
         if let Decision::Wait(Reason::Budget { used, budget }) = decision {
-            println!();
-            println!(
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
                 "the head needs w{}, {} of {budget} free; held by the running entries above",
                 head.weight.min(budget).max(1),
                 budget.saturating_sub(used)
             );
         }
     }
-    Ok(0)
+    Ok(out)
 }
 
 /// `w2`, or `w2 (using 5.1)` once the running tree has been measured.

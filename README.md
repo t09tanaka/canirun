@@ -10,6 +10,7 @@ weight. No daemon, no process supervision, one JSON ledger per user.
 task-traffic-controller exec -- npm test                 # waits for budget, then runs
 task-traffic-controller exec --front -- npm run lint     # a human is waiting: jump the queue
 task-traffic-controller status                           # who is running, who is waiting, why, and when
+task-traffic-controller top                              # the same screen, redrawn every 2 s until Ctrl-C
 task-traffic-controller history                          # what each command measured, next weight
 
 id=$(task-traffic-controller submit -- npm run test:e2e) # async: returns a job id and a rough ETA
@@ -161,6 +162,12 @@ argument containing spaces (`-- "npm run x"`), task-traffic-controller adds a hi
 the words separately (`-- npm run x`) or use `sh -c '...'`.
 
 Nothing is written to stdout by task-traffic-controller itself.
+
+### `task-traffic-controller top`
+
+Keeps the `status` screen on the terminal and redraws it in place every
+`--interval` seconds (default 2), with the time of the last redraw on top.
+It only reads and reaps like `status`; quit with Ctrl-C.
 
 ### `task-traffic-controller status`
 
