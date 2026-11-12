@@ -10,7 +10,7 @@ weight. No daemon, no process supervision, one JSON ledger per user.
 task-traffic-controller exec -- npm test                 # waits for budget, then runs
 task-traffic-controller exec --front -- npm run lint     # a human is waiting: jump the queue
 task-traffic-controller status                           # who is running, who is waiting, why, and when
-task-traffic-controller top                              # the same screen, redrawn every 2 s until Ctrl-C
+task-traffic-controller top                              # full-screen live view (q to quit)
 task-traffic-controller history                          # what each command measured, next weight
 
 id=$(task-traffic-controller submit -- npm run test:e2e) # async: returns a job id and a rough ETA
@@ -167,11 +167,28 @@ the words separately (`-- npm run x`) or use `sh -c '...'`.
 
 Nothing is written to stdout by task-traffic-controller itself.
 
-### `task-traffic-controller top`
+### `task-traffic-controller top [--interval SECS]`
 
-Keeps the `status` screen on the terminal and redraws it in place every
-`--interval` seconds (default 2), with the time of the last redraw on top.
-It only reads and reaps like `status`; quit with Ctrl-C.
+A full-screen live view of the queue (alternate screen, raw mode), refreshed
+every `--interval` seconds (default 1) and redrawn on resize. Quit with `q`,
+Esc or Ctrl-C; the terminal is restored on every exit path, a panic included.
+It needs a terminal (use `status` to pipe), and only reads and reaps like
+`status`.
+
+- **CPU budget used/total**: a bar of `budget` slots. Each running entry's
+  charged weight is a colored segment marked with the letter of its row in
+  the table; free slots are dim. Next to it: the machine's CPU busy share and
+  available memory.
+- **running**: letter, project (repo name, plus `/subdir`), job (the
+  `--label`, else the script's file name for `bash ... step.sh` commands,
+  else the command line), `cpu` as `weight/using` (`-` until measured), and
+  progress as elapsed over the learned wall time, held at 99% while the
+  command still runs, with the time left (`+` marks an overrun). Without a
+  learned time the gauge shows `?` and the elapsed time. `idle` and
+  `[backfill]` mark the same entries as in `status`.
+- **waiting**: project, job, weight, time waited, why it waits (for example
+  `needs w6, 3 free` or `behind 2`), and the estimated start.
+- **held, owner gone**: shown only when there is such an entry.
 
 ### `task-traffic-controller status`
 

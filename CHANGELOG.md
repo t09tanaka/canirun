@@ -15,8 +15,12 @@ the minor version).
   (`label`, omitted when unset), so the ledger stays format v1 and older
   binaries read it; it is not part of the history key. Breaking for code that
   builds `ledger::Entry`, `exec::Opts` or `jobs::Job` with a literal.
-- `top`: the `status` screen redrawn in place every `--interval` seconds
-  (default 2) until Ctrl-C, for a human watching the queue.
+- `top`: a full-screen terminal view (ratatui) refreshed every `--interval`
+  seconds (default 1) and on resize; `q`, Esc or Ctrl-C quits. It shows the CPU
+  budget as a bar with one colored segment per running entry, a running table
+  (project, job, `weight/using` cores, progress against the learned wall time),
+  a waiting table (why it waits, estimated start) and held entries. Adds the
+  `ratatui` dependency.
 
 ## [0.7.0] - 2026-11-11
 

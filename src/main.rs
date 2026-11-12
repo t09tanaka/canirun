@@ -43,10 +43,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Keep the status screen on the terminal, redrawn every few seconds (Ctrl-C to quit)
+    /// Full-screen live view of the queue and CPU budget (q, Esc or Ctrl-C to quit)
     Top {
         /// Seconds between redraws
-        #[arg(long, default_value_t = 2.0)]
+        #[arg(long, default_value_t = 1.0)]
         interval: f64,
     },
     /// Show measured runs and the weight that will be used next
