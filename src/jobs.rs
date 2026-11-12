@@ -19,6 +19,8 @@ pub struct Job {
     pub weight: Option<u32>,
     pub front: bool,
     pub key: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
     pub submitted_at: DateTime<Utc>,
     pub submitter_pid: u32,
     /// Keep running even when nobody is waiting.

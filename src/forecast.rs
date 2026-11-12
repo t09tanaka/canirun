@@ -1549,6 +1549,7 @@ mod tests {
                 started_at: Some(t0() - Cd::seconds(elapsed_s)),
                 using: None,
                 backfilled: false,
+                label: None,
             },
             suspect_dead: false,
         }

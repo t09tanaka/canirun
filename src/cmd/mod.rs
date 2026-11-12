@@ -9,3 +9,4 @@ pub mod inspect;
 pub mod job;
 pub mod resolve;
 pub mod status;
+pub mod top;

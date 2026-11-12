@@ -34,6 +34,9 @@ pub struct Opts {
     pub weight: Option<u32>,
     pub front: bool,
     pub key: Option<String>,
+    /// A human-readable name for the run, shown instead of the command line.
+    /// Not part of the history key.
+    pub label: Option<String>,
     pub argv: Vec<String>,
     /// Directory the command runs in; also what the history key is derived
     /// from.
@@ -604,6 +607,7 @@ mod tests {
                 started_at: Some(clock.now()),
                 using: None,
                 backfilled: false,
+                label: None,
             });
             ledger.save(&ctx.paths.ledger_file()).unwrap();
 

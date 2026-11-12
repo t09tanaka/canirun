@@ -540,6 +540,7 @@ fn a_plain_entry_keeps_the_old_ledger_readable() {
         started_at: None,
         using: None,
         backfilled: false,
+        label: None,
     });
     l.save(&ctx.paths.ledger_file()).unwrap();
     let old: old_ledger::Ledger =
