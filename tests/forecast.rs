@@ -54,6 +54,7 @@ fn entry(id: &str, state: task_traffic_controller::admit::State, seq: u64, key: 
         started_at: (state == task_traffic_controller::admit::State::Running).then(t0),
         using: None,
         backfilled: false,
+        label: None,
     }
 }
 

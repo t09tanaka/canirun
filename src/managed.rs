@@ -874,6 +874,7 @@ pub(crate) fn push_entry(
             started_at: None,
             using: None,
             backfilled: false,
+            label: opts.label.clone(),
         });
         ledger.save(&ctx.paths.ledger_file())?;
         return Ok(Pushed::New { seq });

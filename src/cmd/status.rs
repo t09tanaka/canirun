@@ -1,7 +1,7 @@
 use task_traffic_controller::admit::{self, Decision, Reason, State};
 use task_traffic_controller::config::Config;
 use task_traffic_controller::display::{
-    fmt_bytes, fmt_duration, is_idle, label, running_for, truncate, IDLE_AFTER, IDLE_CORES,
+    entry_label, fmt_bytes, fmt_duration, is_idle, running_for, truncate, IDLE_AFTER, IDLE_CORES,
 };
 use task_traffic_controller::error::Result;
 use task_traffic_controller::ledger::Ledger;
@@ -77,7 +77,7 @@ pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
             },
             fmt_duration(elapsed),
             if e.backfilled { "[backfill] " } else { "" },
-            truncate(&label(&e.repo, &e.subdir, &e.argv), 70),
+            truncate(&entry_label(e), 70),
             eta_of(&e.id)
         );
     }
@@ -101,7 +101,7 @@ pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
             e.weight,
             fmt_duration(waited),
             if e.front { "[front] " } else { "" },
-            truncate(&label(&e.repo, &e.subdir, &e.argv), 70),
+            truncate(&entry_label(e), 70),
             eta_of(&e.id)
         );
     }

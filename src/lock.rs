@@ -384,6 +384,7 @@ mod tests {
             started_at: Some(Utc::now()),
             using: None,
             backfilled: false,
+            label: None,
         }
     }
 

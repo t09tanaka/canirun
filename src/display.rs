@@ -64,7 +64,7 @@ pub fn holder(e: &Entry, now: DateTime<Utc>, max: usize) -> String {
         e.pid,
         e.weight,
         fmt_duration(elapsed),
-        truncate(&label(&e.repo, &e.subdir, &e.argv), max)
+        truncate(&entry_label(e), max)
     )
 }
 
@@ -74,6 +74,11 @@ pub fn label(repo: &str, subdir: &str, argv: &str) -> String {
     } else {
         format!("{}: {argv}", crate::key::project_label(repo, subdir))
     }
+}
+
+/// [`label`] for an entry: its `--label` stands in for the command line.
+pub fn entry_label(e: &Entry) -> String {
+    label(&e.repo, &e.subdir, e.label.as_deref().unwrap_or(&e.argv))
 }
 
 #[cfg(test)]
@@ -111,6 +116,7 @@ mod tests {
             started_at: Some(now - chrono::Duration::seconds(3130)),
             using: Some(0.0),
             backfilled: false,
+            label: None,
         };
         assert_eq!(holder(&e, now, 40), "48211 w2 idle 52:10 make api");
         e.using = Some(1.26);
@@ -118,6 +124,33 @@ mod tests {
         e.using = None;
         e.started_at = Some(now - chrono::Duration::seconds(5));
         assert_eq!(holder(&e, now, 4), "48211 w2 0:05 mak…");
+    }
+
+    #[test]
+    fn a_label_stands_in_for_the_command_line() {
+        let now = Utc::now();
+        let mut e = Entry {
+            id: "a".into(),
+            pid: 1,
+            state: State::Running,
+            front: false,
+            weight: 1,
+            predicted_rss: 0,
+            expected_secs: None,
+            repo: "/src/web".into(),
+            subdir: "api".into(),
+            argv: "npm run test".into(),
+            key: "k".into(),
+            seq: 1,
+            enqueued_at: now,
+            started_at: None,
+            using: None,
+            backfilled: false,
+            label: None,
+        };
+        assert_eq!(entry_label(&e), "web/api: npm run test");
+        e.label = Some("unit tests".into());
+        assert_eq!(entry_label(&e), "web/api: unit tests");
     }
 
     #[test]

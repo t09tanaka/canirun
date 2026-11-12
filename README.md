@@ -99,7 +99,7 @@ Intel) and Linux (x86_64 / arm64) are attached to each
 ### `task-traffic-controller exec`
 
 ```
-task-traffic-controller exec [--weight N] [--front] [--key K] -- <command> [args...]
+task-traffic-controller exec [--weight N] [--front] [--key K] [--label TEXT] -- <command> [args...]
 ```
 
 Waits until admitted, then runs `<command>` with inherited stdin/stdout/
@@ -115,6 +115,10 @@ if you need one.
 - `--key K` replaces the argv string as the history key, for commands
   whose arguments carry temp paths or timestamps. It wins over the
   automatic keys below.
+- `--label TEXT` (or `TASK_TRAFFIC_CONTROLLER_LABEL`; the flag wins) names
+  the run. `status` and `top` show it instead of the command line. It is
+  stored in the ledger as an optional field and is not part of the history
+  key. Also accepted by `submit` and `estimate`.
 
 Wrapped commands are keyed by the heavy command inside them, so a
 one-off shell line still learns from earlier runs:
@@ -213,7 +217,7 @@ webapp: npm run test:e2e
 ### `task-traffic-controller submit` / `wait` / `jobs` / `cancel`
 
 ```
-task-traffic-controller submit [--detach] [--weight N] [--front] [--key K] -- <command> [args...]
+task-traffic-controller submit [--detach] [--weight N] [--front] [--key K] [--label TEXT] -- <command> [args...]
 task-traffic-controller wait [--no-output] <job-id>...
 task-traffic-controller jobs [--json]
 task-traffic-controller cancel <job-id>...

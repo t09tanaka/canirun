@@ -27,6 +27,7 @@ pub fn submit(ctx: &Context, cfg: &Config, opts: Opts, detach: bool) -> Result<i
         weight: opts.weight,
         front: opts.front,
         key: opts.key,
+        label: opts.label,
         submitted_at: ctx.clock.now(),
         submitter_pid: std::process::id(),
         detach,
@@ -87,6 +88,7 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
         weight: job.weight,
         front: job.front,
         key: job.key.clone(),
+        label: job.label.clone(),
         argv: job.argv.clone(),
         cwd: job.cwd.clone(),
         ..Opts::default()

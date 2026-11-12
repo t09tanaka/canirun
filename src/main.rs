@@ -31,6 +31,9 @@ enum Cmd {
         /// Use K instead of the argv string as the history key
         #[arg(long)]
         key: Option<String>,
+        /// Name the run for `status` and `top` (or TASK_TRAFFIC_CONTROLLER_LABEL)
+        #[arg(long)]
+        label: Option<String>,
         /// Command and arguments (after `--`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -76,6 +79,9 @@ enum Cmd {
         front: bool,
         #[arg(long)]
         key: Option<String>,
+        /// Name the run for `status` and `top` (or TASK_TRAFFIC_CONTROLLER_LABEL)
+        #[arg(long)]
+        label: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
@@ -109,6 +115,9 @@ enum Cmd {
         front: bool,
         #[arg(long)]
         key: Option<String>,
+        /// Name the run for `status` and `top` (or TASK_TRAFFIC_CONTROLLER_LABEL)
+        #[arg(long)]
+        label: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
@@ -154,8 +163,9 @@ fn run(cli: Cli) -> error::Result<i32> {
             weight,
             front,
             key,
+            label,
             command,
-        } => cmd::exec::run(&ctx, &cfg, opts(weight, front, key, command)?),
+        } => cmd::exec::run(&ctx, &cfg, opts(weight, front, key, label, command)?),
         Cmd::Status { json } => cmd::status::run(&ctx, &cfg, json),
         Cmd::Top { interval } => cmd::top::run(&ctx, &cfg, interval),
         Cmd::History {
@@ -179,8 +189,9 @@ fn run(cli: Cli) -> error::Result<i32> {
             weight,
             front,
             key,
+            label,
             command,
-        } => cmd::estimate::run(&ctx, &cfg, opts(weight, front, key, command)?, json),
+        } => cmd::estimate::run(&ctx, &cfg, opts(weight, front, key, label, command)?, json),
         Cmd::Resolve { id, json, force } => cmd::resolve::run(&ctx, &id, json, force),
         Cmd::Config { path } => cmd::config::run(&ctx, &cfg, path),
         Cmd::Gc => cmd::gc::run(&ctx, &cfg),
@@ -189,8 +200,14 @@ fn run(cli: Cli) -> error::Result<i32> {
             weight,
             front,
             key,
+            label,
             command,
-        } => cmd::job::submit(&ctx, &cfg, opts(weight, front, key, command)?, detach),
+        } => cmd::job::submit(
+            &ctx,
+            &cfg,
+            opts(weight, front, key, label, command)?,
+            detach,
+        ),
         Cmd::Wait { no_output, ids } => cmd::job::wait(&ctx, &ids, no_output),
         Cmd::Jobs { json } => cmd::job::list(&ctx, &cfg, json),
         Cmd::Cancel { ids } => cmd::job::cancel(&ctx, &ids),
@@ -203,12 +220,15 @@ fn opts(
     weight: Option<u32>,
     front: bool,
     key: Option<String>,
+    label: Option<String>,
     argv: Vec<String>,
 ) -> error::Result<Opts> {
+    let label = label.or_else(|| env::var_text("TASK_TRAFFIC_CONTROLLER_LABEL"));
     Ok(Opts {
         weight,
         front,
         key,
+        label,
         argv,
         cwd: std::env::current_dir()?,
         ..Opts::default()

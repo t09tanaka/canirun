@@ -40,6 +40,10 @@ pub struct Entry {
     /// Started ahead of a waiting entry that did not fit the budget.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backfilled: bool,
+    /// A human-readable name for the run (`exec --label`), shown by `status`
+    /// and `top` instead of the command line. Never part of the history key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// The ledger. In memory (and in `status --json`) it is always `entries`;
@@ -227,6 +231,7 @@ mod tests {
             started_at: None,
             using: None,
             backfilled: false,
+            label: None,
         }
     }
 
@@ -291,6 +296,26 @@ mod tests {
         assert_eq!(old.entries.len(), 1);
         let json = save_with_sidecars(&Ledger::default(), d.path(), &[]);
         assert!(serde_json::from_slice::<old::Ledger>(&json).is_ok());
+    }
+
+    #[test]
+    fn a_label_is_additive_and_older_binaries_ignore_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut l = Ledger::default();
+        let mut e = entry("a", 1);
+        e.label = Some("web/api unit tests".into());
+        l.entries.push(e);
+        l.entries.push(entry("b", 2));
+        let json = save_with_sidecars(&l, d.path(), &[]);
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["version"], SCHEMA_VERSION);
+        assert_eq!(v["entries"][0]["label"], "web/api unit tests");
+        assert!(v["entries"][1].get("label").is_none());
+        let old: old::Ledger = serde_json::from_slice(&json).unwrap();
+        assert_eq!(old.entries.len(), 2);
+        // And a ledger written before labels existed still loads.
+        let back = Ledger::load(&d.path().join("ledger.json")).unwrap();
+        assert_eq!(back, l);
     }
 
     #[test]

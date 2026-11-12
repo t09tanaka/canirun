@@ -9,6 +9,12 @@ the minor version).
 
 ### Added
 
+- `exec --label TEXT` (also `submit` and `estimate`, or
+  `TASK_TRAFFIC_CONTROLLER_LABEL`): a name for the run that `status` shows
+  instead of the command line. Stored as an optional ledger entry field
+  (`label`, omitted when unset), so the ledger stays format v1 and older
+  binaries read it; it is not part of the history key. Breaking for code that
+  builds `ledger::Entry`, `exec::Opts` or `jobs::Job` with a literal.
 - `top`: the `status` screen redrawn in place every `--interval` seconds
   (default 2) until Ctrl-C, for a human watching the queue.
 

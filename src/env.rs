@@ -32,6 +32,11 @@ fn paths() -> Paths {
     Paths::new(state, config)
 }
 
+/// A non-empty UTF-8 environment variable.
+pub fn var_text(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
 pub fn context() -> Context {
     let mut ctx = Context::new(paths())
         .with_supervisor(Arc::new(ProcessSignals))
