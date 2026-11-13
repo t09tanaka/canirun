@@ -684,6 +684,19 @@ pub fn standing(
         return Standing::InitSession;
     }
     if sid == h.proc.pid {
+        // A session leader can also be an unrelated orphan that started
+        // in the child's wall-clock second. Only comparable monotonic
+        // marks prove it predates the child; missing or conflicting
+        // evidence must still keep a possible setsid escapee.
+        if session.leader_start == Some(start)
+            && child_mark
+                .zip(session.leader_mark.as_ref())
+                .is_some_and(|(child, leader)| {
+                    leader.boot == child.boot && leader.ticks < child.ticks
+                })
+        {
+            return Standing::OlderSession;
+        }
         return Standing::OwnSession;
     }
     // The wall clock first: it can only keep.
@@ -1266,7 +1279,8 @@ mod tests {
                 "setsid escapee",
                 orphan,
                 true,
-                ev(Some(50), Some(150)),
+                SessionEvidence::new(Some(50), Some(150))
+                    .with_leader_mark(Some(StartMark::new("b", 1001))),
                 OwnSession,
             ),
             (
@@ -1406,6 +1420,75 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn an_own_session_leader_is_cleared_only_when_proven_older_than_the_child() {
+        use Standing::*;
+        // Both processes started in the same wall-clock second. The
+        // monotonic marks can still prove that this orphan predates the child.
+        let orphan = hidden(50, Some(1), Some(100));
+        let mark = |boot: &str, ticks| Some(StartMark::new(boot, ticks));
+        let cases = [
+            (
+                "older",
+                mark("b", 1000),
+                mark("b", 999),
+                Some(100),
+                OlderSession,
+            ),
+            (
+                "equal",
+                mark("b", 1000),
+                mark("b", 1000),
+                Some(100),
+                OwnSession,
+            ),
+            (
+                "newer",
+                mark("b", 1000),
+                mark("b", 1001),
+                Some(100),
+                OwnSession,
+            ),
+            (
+                "other boot",
+                mark("b", 1000),
+                mark("c", 999),
+                Some(100),
+                OwnSession,
+            ),
+            ("no child mark", None, mark("b", 999), Some(100), OwnSession),
+            (
+                "no leader mark",
+                mark("b", 1000),
+                None,
+                Some(100),
+                OwnSession,
+            ),
+            (
+                "no leader start",
+                mark("b", 1000),
+                mark("b", 999),
+                None,
+                OwnSession,
+            ),
+            (
+                "different leader start",
+                mark("b", 1000),
+                mark("b", 999),
+                Some(99),
+                OwnSession,
+            ),
+        ];
+        for (name, child, leader, leader_start, expected) in cases {
+            let evidence = SessionEvidence::new(Some(50), leader_start).with_leader_mark(leader);
+            assert_eq!(
+                standing(&orphan, 100, None, 7, true, child.as_ref(), &evidence),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
