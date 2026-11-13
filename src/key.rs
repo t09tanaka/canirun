@@ -304,8 +304,11 @@ fn lex(text: &str) -> Vec<Vec<String>> {
                 let word = std::mem::take(&mut self.cur);
                 if self.redirect {
                     self.redirect = false;
-                } else if let Some(seg) = self.out.last_mut() {
-                    seg.push(word);
+                } else {
+                    self.out
+                        .last_mut()
+                        .expect("lexer always has a command segment")
+                        .push(word);
                 }
             }
             self.in_word = false;

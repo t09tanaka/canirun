@@ -7,6 +7,16 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-14
+
+### Fixed
+
+- Recovery no longer keeps an unrelated session leader solely because it
+  started in the same wall-clock second as a managed command. It is excluded
+  only when matching boot and monotonic start evidence proves it predates
+  the command. Missing, equal, newer, or conflicting evidence still keeps
+  a possible unrecorded descendant.
+
 ## [0.8.0] - 2026-11-12
 
 ### Added
