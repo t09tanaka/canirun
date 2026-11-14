@@ -1332,6 +1332,16 @@ pub struct Resolution {
     pub checked: String,
 }
 
+/// A resolution and the exact typed assessment made under the same ledger lock.
+/// `verdict` is `None` only when no entry needed checking. With force, this is
+/// the assessment before the override; `resolution.forced` records the override.
+/// The original [`Resolution`] and its serialized form remain unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedResolution {
+    pub resolution: Resolution,
+    pub verdict: Option<Verdict>,
+}
+
 fn describe(v: Verdict) -> &'static str {
     use reap::{Keep, Release};
     match v {
@@ -1386,6 +1396,18 @@ pub fn resolve_checked(ctx: &Context, id: &str) -> Result<Resolution> {
 /// leader whose start time cannot be compared, the group is taken to be the
 /// original one and the entry stays.
 pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Resolution> {
+    Ok(resolve_checked_typed_with(ctx, id, force)?.resolution)
+}
+
+/// [`resolve_checked`] with the typed assessment from that same operation.
+/// No second scan or interpretation of the human-readable verdict is needed.
+pub fn resolve_checked_typed(ctx: &Context, id: &str) -> Result<TypedResolution> {
+    resolve_checked_typed_with(ctx, id, false)
+}
+
+/// [`resolve_checked_typed`] with the same explicit override as
+/// [`resolve_checked_with`]. The typed verdict describes the pre-override checks.
+pub fn resolve_checked_typed_with(ctx: &Context, id: &str, force: bool) -> Result<TypedResolution> {
     check_id("command_id", id)?;
     let _guard = lock::ledger(ctx)?;
     let ledger = Ledger::load(&ctx.paths.ledger_file())?;
@@ -1398,18 +1420,25 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
         Loaded::Missing => false,
     };
     if ledger.find(id).is_none() && !stranded {
-        return Ok(Resolution {
-            command_id: id.to_string(),
-            phase: None,
-            lease_held: false,
-            found: false,
-            released: false,
-            forced: false,
-            verdict: "NoEntry".into(),
-            checked: "there is no ledger entry with this id".into(),
+        return Ok(TypedResolution {
+            resolution: Resolution {
+                command_id: id.to_string(),
+                phase: None,
+                lease_held: false,
+                found: false,
+                released: false,
+                forced: false,
+                verdict: "NoEntry".into(),
+                checked: "there is no ledger entry with this id".into(),
+            },
+            verdict: None,
         });
     }
     let (a, held_by) = assess_detailed(ctx, id, true, true, false);
+    let typed = |resolution| TypedResolution {
+        resolution,
+        verdict: Some(a.verdict),
+    };
     let phase = match &a.sidecar {
         Loaded::Ok(sc) => Some(sc.phase),
         _ => None,
@@ -1430,7 +1459,7 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
         r.released = true;
         r.forced = true;
         r.checked = detail;
-        return Ok(r);
+        return Ok(typed(r));
     }
     // A group number reused by an unrelated group: a different process leads
     // the recorded group, and nothing marked or recorded runs with the child
@@ -1460,7 +1489,7 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
             r.released = true;
             r.forced = true;
             r.checked = detail;
-            return Ok(r);
+            return Ok(typed(r));
         }
     }
     let Verdict::Release(why) = a.verdict else {
@@ -1470,7 +1499,7 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
                 r.checked
             );
         }
-        return Ok(r);
+        return Ok(typed(r));
     };
     let kind = match why {
         reap::Release::NeverLaunched => TerminalKind::Abandoned,
@@ -1492,7 +1521,7 @@ pub fn resolve_checked_with(ctx: &Context, id: &str, force: bool) -> Result<Reso
         _ => settle_by_hand(ctx, id, kind, &detail)?,
     }
     r.released = true;
-    Ok(r)
+    Ok(typed(r))
 }
 
 /// Trim the history to `keep` records per key, under the history lock so a

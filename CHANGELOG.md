@@ -7,6 +7,16 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-14
+
+### Added
+
+- Library callers can use `managed::resolve_checked_typed` and
+  `resolve_checked_typed_with` to obtain the exact typed verdict from the
+  same locked resolution operation. This avoids parsing diagnostic text or
+  performing a second process scan. The existing resolution JSON and API
+  remain unchanged; forced resolutions retain the pre-override verdict.
+
 ## [0.8.1] - 2026-11-14
 
 ### Fixed
