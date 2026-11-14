@@ -121,8 +121,38 @@ fn marker_script(dir: &Path, name: &str, secs: &str) -> String {
 fn gated_script(dir: &Path, name: &str) -> String {
     let p = dir.join(name);
     format!(
-        "i=0; while [ ! -e {p}.release ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done",
-        p = p.display()
+        "i=0; while [ -d {dir} ] && [ ! -e {p}.release ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done",
+        p = p.display(),
+        dir = dir.display()
+    )
+}
+
+/// Releases only this test's marker when unwinding, including before a child
+/// has started. The bounded gated script then exits without a lingering job.
+struct Gate(PathBuf);
+
+impl Gate {
+    fn new(dir: &Path, name: &str) -> Self {
+        Self(dir.join(format!("{name}.release")))
+    }
+
+    fn release(&self) {
+        fs::write(&self.0, "").unwrap();
+    }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "");
+    }
+}
+
+fn marked_gate(dir: &Path, name: &str) -> String {
+    format!(
+        "{}; {}; {}",
+        marker_script(dir, name, "0"),
+        gated_script(dir, name),
+        marker_script(dir, &format!("{name}.released"), "0")
     )
 }
 
@@ -257,6 +287,7 @@ fn short_command_backfills_behind_a_head_that_does_not_fit() {
     let env = TestEnv::new()
         .with_config("budget = 4\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     let dir = env.marker_dir();
+    let resident_gate = Gate::new(&dir, "resident");
     // Teach task-traffic-controller that `quick` is short (a run of at least 1 s counts).
     let learn = env.run(&["exec", "--key", "quick", "--", "sh", "-c", "sleep 1.1"]);
     assert!(learn.status.success());
@@ -264,11 +295,21 @@ fn short_command_backfills_behind_a_head_that_does_not_fit() {
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
-    let head = env.spawn_exec(
-        &["--front", "--weight", "4"],
-        &marker_script(&dir, "head", "0"),
-    );
-    assert!(wait_until(Duration::from_secs(5), || env.entries().len() == 2));
+    let head_log = dir.join("head.log");
+    let head = env
+        .cmd()
+        .arg("exec")
+        .args(["--front", "--weight", "4"])
+        .args(["--", "sh", "-c", &marker_script(&dir, "head", "0")])
+        .stderr(fs::File::create(&head_log).unwrap())
+        .spawn()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        env.entries().len() == 2
+            && fs::read_to_string(&head_log)
+                .unwrap()
+                .contains("; held by ")
+    }));
     let mut quick = env.spawn_exec(
         &["--weight", "1", "--key", "quick"],
         &marker_script(&dir, "quick", "0"),
@@ -279,7 +320,7 @@ fn short_command_backfills_behind_a_head_that_does_not_fit() {
         dir.join("quick.end").exists() && env.entries().len() == 2
     });
     let status = stdout(&env.run(&["status"]));
-    fs::write(dir.join("resident.release"), "").unwrap();
+    resident_gate.release();
     assert!(quick_done, "quick never ran next to the resident: {status}");
     assert!(
         status.contains("the head needs w4, 2 of 4 free"),
@@ -289,7 +330,7 @@ fn short_command_backfills_behind_a_head_that_does_not_fit() {
     assert!(resident.wait().unwrap().success());
     let out = head.wait_with_output().unwrap();
     assert!(out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = fs::read_to_string(&head_log).unwrap();
     assert!(
         err.contains("(budget)") && err.contains("; held by "),
         "{err}"
@@ -335,19 +376,26 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
 fn front_jumps_the_queue() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();
-    // `first` holds the only slot until released, so both others are still
-    // waiting when `status` runs, however slow the machine is.
+    let first_gate = Gate::new(&dir, "first");
+    let front_gate = Gate::new(&dir, "front");
+    // Keep the resident and front entry alive until status observes both.
+    // Front may already be running beyond the budget; normal must stay queued.
     let mut first = env.spawn_exec(&[], &gated_script(&dir, "first"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
     let mut normal = env.spawn_exec(&[], &marker_script(&dir, "normal", "0.2"));
     assert!(wait_until(Duration::from_secs(5), || env.entries().len() == 2));
-    let mut front = env.spawn_exec(&["--front"], &marker_script(&dir, "front", "0.2"));
+    let mut front = env.spawn_exec(&["--front"], &marked_gate(&dir, "front"));
     assert!(wait_until(Duration::from_secs(5), || env.entries().len() == 3));
     let status = stdout(&env.run(&["status"]));
-    fs::write(dir.join("first.release"), "").unwrap();
+    first_gate.release();
     assert!(status.contains("[front]"), "{status}");
+    assert!(wait_until(Duration::from_secs(5), || dir
+        .join("front.start")
+        .exists()));
+    assert!(!dir.join("normal.start").exists());
+    front_gate.release();
     for c in [&mut first, &mut normal, &mut front] {
         assert!(c.wait().unwrap().success());
     }
@@ -361,31 +409,42 @@ fn front_waits_briefly_on_an_overloaded_machine() {
         "budget = 2\nmemory_reserve_mib = 0\nfront_overload_factor = 0.0001\nfront_overload_max_wait_secs = 2\n",
     );
     let dir = env.marker_dir();
-    let mut first = env.spawn_exec(&["--weight", "1"], &marker_script(&dir, "first", "4"));
+    let first_gate = Gate::new(&dir, "first");
+    let mut first = env.spawn_exec(&["--weight", "1"], &marked_gate(&dir, "first"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
-    let queued = Instant::now();
+    let queued = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let front = env.spawn_exec(
         &["--front", "--weight", "1"],
         &marker_script(&dir, "front", "0"),
     );
     let out = front.wait_with_output().unwrap();
     assert!(out.status.success());
-    let waited = queued.elapsed();
+    let waited = Duration::from_nanos(
+        (read_ns(&dir.join("front.start")) - queued)
+            .try_into()
+            .unwrap(),
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("overloaded: load"), "{err}");
     assert!(waited >= Duration::from_millis(1900), "{waited:?}");
+    assert!(!dir.join("first.released.start").exists());
+    first_gate.release();
     assert!(first.wait().unwrap().success());
     // It gave up on the guard rather than waiting for `first` to finish.
-    assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("first.end")));
+    assert!(read_ns(&dir.join("front.start")) < read_ns(&dir.join("first.released.start")));
 }
 
 #[test]
 fn killed_waiting_head_is_reaped_and_queue_moves_on() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();
-    let mut running = env.spawn_exec(&[], &marker_script(&dir, "run", "1.5"));
+    let run_gate = Gate::new(&dir, "run");
+    let mut running = env.spawn_exec(&[], &gated_script(&dir, "run"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
@@ -398,8 +457,18 @@ fn killed_waiting_head_is_reaped_and_queue_moves_on() {
         libc::kill(doomed.id() as i32, libc::SIGKILL);
     }
     doomed.wait().unwrap();
+    run_gate.release();
     assert!(running.wait().unwrap().success());
+    // Measure queue recovery after the holder has stopped, separately from
+    // the release marker polling and holder shutdown latency.
     let t = Instant::now();
+    assert!(
+        wait_until(Duration::from_secs(4), || survivor
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "survivor blocked by dead head"
+    );
     assert!(survivor.wait().unwrap().success());
     assert!(
         t.elapsed() < Duration::from_secs(4),
@@ -588,7 +657,8 @@ fn status_reads_the_ledger_while_the_lock_is_busy() {
 fn sigint_while_waiting_removes_entry() {
     let env = TestEnv::new().with_config("budget = 1\n");
     let dir = env.marker_dir();
-    let mut hog = env.spawn_exec(&[], &marker_script(&dir, "hog", "1"));
+    let hog_gate = Gate::new(&dir, "hog");
+    let mut hog = env.spawn_exec(&[], &gated_script(&dir, "hog"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
@@ -601,6 +671,7 @@ fn sigint_while_waiting_removes_entry() {
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(status.signal(), Some(libc::SIGINT));
     assert!(wait_until(Duration::from_secs(2), || env.entries().len() == 1));
+    hog_gate.release();
     assert!(hog.wait().unwrap().success());
 }
 
@@ -621,29 +692,50 @@ fn progress_is_printed_while_waiting() {
     assert!(hog.wait().unwrap().success());
 }
 
-/// Wait behind a 3 s hog with stderr piped (not a terminal) and return
-/// the number of progress lines.
-fn progress_lines_behind_hog(config: &str) -> usize {
+/// Keep the budget occupied until the first progress line, then wait for a
+/// repeated line or observe two one-second intervals with an unchanged reason.
+fn progress_lines_behind_hog(config: &str, repeats: bool) -> usize {
     let env = TestEnv::new().with_config(config);
     let dir = env.marker_dir();
-    let mut hog = env.spawn_exec(&[], &marker_script(&dir, "hog", "3"));
+    let gate = Gate::new(&dir, "hog");
+    let mut hog = env.spawn_exec(&[], &gated_script(&dir, "hog"));
     assert!(wait_until(Duration::from_secs(5), || {
         env.entries().iter().any(|e| e["state"] == "running")
     }));
-    let waiter = env.spawn_exec(&[], "true");
-    let out = waiter.wait_with_output().unwrap();
-    assert!(out.status.success());
+    let log = dir.join("progress.log");
+    let mut waiter = env
+        .cmd()
+        .args(["exec", "--", "true"])
+        .stderr(fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let lines = || {
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("task-traffic-controller: waiting"))
+            .count()
+    };
+    assert!(wait_until(Duration::from_secs(5), || lines() >= 1));
+    let observed = Instant::now();
+    assert!(wait_until(Duration::from_secs(5), || {
+        if repeats {
+            lines() >= 2
+        } else {
+            observed.elapsed() >= Duration::from_secs(2)
+        }
+    }));
+    let n = lines();
+    gate.release();
+    assert!(waiter.wait().unwrap().success());
     assert!(hog.wait().unwrap().success());
-    String::from_utf8_lossy(&out.stderr)
-        .lines()
-        .filter(|l| l.starts_with("task-traffic-controller: waiting"))
-        .count()
+    n
 }
 
 #[test]
 fn non_tty_progress_prints_only_on_change() {
-    // The reason stays "budget" for ~3 s: one line, not one per second.
-    let n = progress_lines_behind_hog("budget = 1\nprogress_interval_secs = 1\n");
+    // The reason stays "budget" across two intervals: one line, not one per second.
+    let n = progress_lines_behind_hog("budget = 1\nprogress_interval_secs = 1\n", false);
     assert_eq!(n, 1);
 }
 
@@ -651,6 +743,7 @@ fn non_tty_progress_prints_only_on_change() {
 fn non_tty_progress_interval_is_configurable() {
     let n = progress_lines_behind_hog(
         "budget = 1\nprogress_interval_secs = 60\nprogress_interval_secs_non_tty = 1\n",
+        true,
     );
     assert!(n >= 2, "{n}");
 }
