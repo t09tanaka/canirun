@@ -1006,6 +1006,76 @@ fn resolve_checked_releases_only_what_the_checks_allow() {
 }
 
 #[test]
+fn typed_resolution_uses_one_locked_assessment_and_preserves_legacy_json() {
+    use std::sync::atomic::AtomicUsize;
+    use task_traffic_controller::reap::Release;
+    use task_traffic_controller::ProcessScan;
+    struct ChangingScan(AtomicUsize);
+    impl ProcessScan for ChangingScan {
+        fn scan(&self, _: &str, _: &str) -> Scan {
+            // One assessment conservatively retries an unknown scan three
+            // times. A second assessment would now see a clear process table.
+            let probe = if self.0.fetch_add(1, Ordering::SeqCst) < 4 {
+                Probe::Unknown
+            } else {
+                Probe::Gone
+            };
+            Scan::new(probe, vec![])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
+    dead_at_launch(dir.path(), &clock, "typed", false);
+    let scan = Arc::new(ChangingScan(AtomicUsize::new(0)));
+    let context = ctx_with_scan(dir.path(), clock.clone(), Probe::Gone).with_scan(scan.clone());
+    let unknown = managed::resolve_checked_typed(&context, "typed").unwrap();
+    assert_eq!(unknown.verdict, Some(Verdict::Keep(Keep::ProbeUnknown)));
+    assert!(unknown.resolution.found && !unknown.resolution.released);
+    assert_eq!(scan.0.load(Ordering::SeqCst), 4);
+    let done = managed::resolve_checked_typed(&context, "typed").unwrap();
+    assert_eq!(done.verdict, Some(Verdict::Release(Release::LaunchSettled)));
+    assert!(done.resolution.released && !done.resolution.forced);
+    assert_eq!(scan.0.load(Ordering::SeqCst), 6);
+    let absent = managed::resolve_checked_typed(&context, "typed").unwrap();
+    assert_eq!(absent.verdict, None);
+    assert!(!absent.resolution.found);
+    assert_eq!(scan.0.load(Ordering::SeqCst), 6);
+    let legacy = managed::resolve_checked(&context, "typed").unwrap();
+    assert_eq!(
+        serde_json::to_value(absent.resolution).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(done.resolution)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "command_id",
+            "phase",
+            "lease_held",
+            "found",
+            "released",
+            "forced",
+            "verdict",
+            "checked"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+
+    dead_at_launch(dir.path(), &clock, "forced", false);
+    let context = ctx_with_scan(dir.path(), clock, Probe::Unknown);
+    let forced = managed::resolve_checked_typed_with(&context, "forced", true).unwrap();
+    assert_eq!(forced.verdict, Some(Verdict::Keep(Keep::ProbeUnknown)));
+    assert!(forced.resolution.released && forced.resolution.forced);
+}
+
+#[test]
 fn resolve_checked_judges_an_unreadable_sidecar_by_the_scan() {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(FakeClock::new(chrono::Utc::now()));
